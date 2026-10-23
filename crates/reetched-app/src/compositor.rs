@@ -4,8 +4,8 @@
 use glam::{EulerRot, Mat3};
 use reetched_doc::export::ChannelData;
 use reetched_doc::{
-    Channel, MaskBackground, Node, NodeKind, Projection, ProjectionMode, ResourceId, Resources,
-    TextureSet,
+    Channel, MaskBackground, Node, NodeId, NodeKind, Projection, ProjectionMode, ResourceId,
+    Resources, TILE_BYTES, TILE_SIZE, TextureSet, TileMap,
 };
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -13,6 +13,20 @@ use wgpu::util::DeviceExt;
 pub const SET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Padding (in texels) grown around UV islands for display.
 const DISPLAY_DILATION: u32 = 8;
+
+/// Identifies a paint buffer: a paint layer's channel (slot = channel index) or a mask (slot 5).
+pub type PaintKey = (NodeId, u8);
+pub const MASK_SLOT: u8 = 5;
+pub const PAINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// GPU copy of one paint buffer, kept in sync with its tiles.
+pub struct PaintTexture {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    resolution: u32,
+    /// The tiles the texture currently holds.
+    synced: TileMap,
+}
 
 /// Composited channels of one texture set.
 pub struct ChannelSet {
@@ -56,6 +70,7 @@ struct Pipelines {
     init: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
     folder: wgpu::RenderPipeline,
+    paint: wgpu::RenderPipeline,
     finalize: wgpu::RenderPipeline,
     dilate: wgpu::RenderPipeline,
 }
@@ -72,6 +87,8 @@ pub struct Compositor {
     pool: Vec<ChannelSet>,
     /// 1×1 set bound where a pass reads nothing (a pass can't read its own target).
     dummy: ChannelSet,
+    /// Paint layers' and masks' painted texels on the GPU.
+    paint: HashMap<PaintKey, PaintTexture>,
 }
 
 impl Compositor {
@@ -104,7 +121,7 @@ impl Compositor {
                 count: None,
             },
         ];
-        entries.extend((2..8).map(|b| tex(b, true)));
+        entries.extend((2..9).map(|b| tex(b, true)));
         let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor params"),
             entries: &entries,
@@ -161,6 +178,7 @@ impl Compositor {
             init: pipeline("vs_uv", "fs_init", true),
             fill: pipeline("vs_uv", "fs_fill", true),
             folder: pipeline("vs_uv", "fs_folder", true),
+            paint: pipeline("vs_uv", "fs_paint", true),
             finalize: pipeline("vs_full", "fs_finalize", false),
             dilate: pipeline("vs_full", "fs_dilate", false),
         };
@@ -190,7 +208,47 @@ impl Compositor {
             bitmaps: HashMap::new(),
             pool: Vec::new(),
             dummy,
+            paint: HashMap::new(),
         }
+    }
+
+    /// The GPU texture for paint buffer `key`, created and synced with `map` as needed.
+    pub fn paint_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: PaintKey,
+        map: &TileMap,
+        res: u32,
+        resources: &Resources,
+    ) -> wgpu::TextureView {
+        let entry = self
+            .paint
+            .entry(key)
+            .or_insert_with(|| new_paint_texture(device, res));
+        if entry.resolution != res {
+            *entry = new_paint_texture(device, res);
+        }
+        if entry.synced != *map {
+            upload_tiles(queue, entry, map, resources);
+        }
+        entry.view.clone()
+    }
+
+    pub fn paint_texture(&self, key: PaintKey) -> Option<&PaintTexture> {
+        self.paint.get(&key)
+    }
+
+    /// After a stroke: the texture already holds `map`'s pixels, so don't re-upload.
+    pub fn mark_synced(&mut self, key: PaintKey, map: TileMap) {
+        if let Some(entry) = self.paint.get_mut(&key) {
+            entry.synced = map;
+        }
+    }
+
+    /// Drops every paint texture (when a different document is loaded).
+    pub fn clear_paint(&mut self) {
+        self.paint.clear();
     }
 
     pub fn new_set(&self, device: &wgpu::Device, resolution: u32) -> ChannelSet {
@@ -297,7 +355,7 @@ impl Compositor {
     ) -> ChannelSet {
         let res = cur.resolution;
         for node in nodes.iter().rev().filter(|n| n.visible) {
-            let (params, bitmaps) = self.node_params(device, queue, node, resources, warnings);
+            let (params, bitmaps) = self.node_params(device, queue, node, res, resources, warnings);
             let group = self.params(device, queue, &params, &bitmaps);
             let dst = self.take(device, res);
             match &node.kind {
@@ -305,6 +363,17 @@ impl Compositor {
                     self.mesh_pass(
                         enc,
                         &self.pipelines.fill,
+                        &group,
+                        &cur,
+                        &self.dummy,
+                        &dst,
+                        mesh,
+                    );
+                }
+                NodeKind::Paint(_) => {
+                    self.mesh_pass(
+                        enc,
+                        &self.pipelines.paint,
                         &group,
                         &cur,
                         &self.dummy,
@@ -340,11 +409,13 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         node: &Node,
+        res: u32,
         resources: &Resources,
         warnings: &mut Vec<String>,
-    ) -> (Params, [Option<wgpu::TextureView>; 6]) {
+    ) -> (Params, [Option<wgpu::TextureView>; 7]) {
         let mut p = Params::default();
-        let mut bitmaps: [Option<wgpu::TextureView>; 6] = Default::default();
+        // Slots 0–4: channel bitmaps or paint, 5: mask bitmap, 6: painted mask.
+        let mut bitmaps: [Option<wgpu::TextureView>; 7] = Default::default();
         for (i, c) in Channel::ALL.into_iter().enumerate() {
             let b = node.blend(c);
             p.blend[i] = [b.mode.index() as f32, b.opacity, 0.0, 0.0];
@@ -370,6 +441,21 @@ impl Compositor {
             }
             p.proj = proj_uniform(&fill.projection);
         }
+        if let NodeKind::Paint(paint) = &node.kind {
+            for (i, c) in Channel::ALL.into_iter().enumerate() {
+                if let Some(map) = paint.channels.get(&c).filter(|m| !m.tiles.is_empty()) {
+                    bitmaps[i] = Some(self.paint_view(
+                        device,
+                        queue,
+                        (node.id, i as u8),
+                        map,
+                        res,
+                        resources,
+                    ));
+                    p.blend[i][2] = 1.0;
+                }
+            }
+        }
         if let Some(mask) = &node.mask {
             p.mask = [
                 if mask.enabled { 1.0 } else { 0.0 },
@@ -386,8 +472,24 @@ impl Compositor {
                 p.mask[2] = if bitmaps[5].is_some() { 1.0 } else { 0.0 };
             }
             p.mask_proj = proj_uniform(&mask.projection);
+            if let Some(map) = mask.paint.as_ref().filter(|m| !m.tiles.is_empty()) {
+                bitmaps[6] =
+                    Some(self.paint_view(device, queue, (node.id, MASK_SLOT), map, res, resources));
+                p.misc[1] = 1.0;
+            }
         }
         (p, bitmaps)
+    }
+
+    /// A linear (non-sRGB) image resource as a texture, e.g. a brush alpha.
+    pub fn bitmap_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &Resources,
+        id: &ResourceId,
+    ) -> Option<wgpu::TextureView> {
+        self.bitmap(device, queue, resources, id, false, &mut Vec::new())
     }
 
     fn bitmap(
@@ -419,7 +521,7 @@ impl Compositor {
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
         params: &Params,
-        bitmaps: &[Option<wgpu::TextureView>; 6],
+        bitmaps: &[Option<wgpu::TextureView>; 7],
     ) -> wgpu::BindGroup {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("layer params"),
@@ -728,6 +830,108 @@ fn make_set(
         views,
         read,
     }
+}
+
+fn new_paint_texture(device: &wgpu::Device, res: u32) -> PaintTexture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("paint"),
+        size: wgpu::Extent3d {
+            width: res,
+            height: res,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: PAINT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    PaintTexture {
+        view: texture.create_view(&Default::default()),
+        texture,
+        resolution: res,
+        // New textures are zeroed: transparent everywhere.
+        synced: TileMap::new(res),
+    }
+}
+
+/// Brings a paint texture in line with `map`, uploading only tiles that changed.
+fn upload_tiles(queue: &wgpu::Queue, pt: &mut PaintTexture, map: &TileMap, resources: &Resources) {
+    let res = pt.resolution;
+    let zero = || std::sync::Arc::new(vec![0u8; TILE_BYTES]);
+    let write = |x: u32, y: u32, w: u32, h: u32, bytes: &[u8]| {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &pt.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 8),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    };
+
+    if map.resolution == res || map.tiles.is_empty() {
+        // Same size: tile-by-tile diff. A full rewrite if the texture held resampled data.
+        let full = pt.synced.resolution != res;
+        let tiles_per_side = res / TILE_SIZE;
+        for ty in 0..tiles_per_side {
+            for tx in 0..tiles_per_side {
+                let key = TileMap::key(tx, ty);
+                let (old, new) = (pt.synced.tiles.get(&key), map.tiles.get(&key));
+                if !full && old == new {
+                    continue;
+                }
+                let bytes = new
+                    .and_then(|id| resources.tiles.get(id).cloned())
+                    .unwrap_or_else(zero);
+                write(tx * TILE_SIZE, ty * TILE_SIZE, TILE_SIZE, TILE_SIZE, &bytes);
+            }
+        }
+    } else {
+        // Painted at another resolution: assemble, resample, upload everything.
+        let src_res = map.resolution;
+        let mut img = image::Rgba32FImage::new(src_res, src_res);
+        for (key, id) in &map.tiles {
+            let (Some((tx, ty)), Some(bytes)) = (TileMap::parse_key(key), resources.tiles.get(id))
+            else {
+                continue;
+            };
+            for (i, texel) in bytes.as_chunks::<8>().0.iter().enumerate() {
+                let (x, y) = (
+                    tx * TILE_SIZE + i as u32 % TILE_SIZE,
+                    ty * TILE_SIZE + i as u32 / TILE_SIZE,
+                );
+                if x < src_res && y < src_res {
+                    let h: [half::f16; 4] = bytemuck::pod_read_unaligned(texel);
+                    img.put_pixel(x, y, image::Rgba(h.map(f32::from)));
+                }
+            }
+        }
+        let resized =
+            image::imageops::resize(&img, res, res, image::imageops::FilterType::Triangle);
+        let bytes: Vec<u8> = resized
+            .pixels()
+            .flat_map(|p| p.0.map(half::f16::from_f32))
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        write(0, 0, res, res, &bytes);
+    }
+    pt.synced = map.clone();
 }
 
 /// End-to-end checks on a real GPU: a quad covering the whole UV tile is

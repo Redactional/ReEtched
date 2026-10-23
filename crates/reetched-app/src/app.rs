@@ -2,7 +2,9 @@
 //! The panels' contents live in `panels.rs`.
 
 use crate::{
+    brush::Brush,
     env::EnvImage,
+    paint_ui::ActiveStroke,
     preview::{PRESETS, PreviewEnv},
     theme,
     viewport::{FrameParams, ViewMode, Viewport},
@@ -63,7 +65,7 @@ impl Pane {
             Pane::TextureSets => "TEXTURE SET LIST",
             Pane::Layers => "LAYERS",
             Pane::TextureSetSettings => "TEXTURE SET SETTINGS",
-            Pane::Properties => "PROPERTIES - FILL",
+            Pane::Properties => "PROPERTIES",
             Pane::DisplaySettings => "DISPLAY SETTINGS",
             Pane::Log => "LOG",
         }
@@ -143,6 +145,16 @@ pub struct State {
     /// Which channel the layer stack's blend mode, opacity and thumbnails show.
     pub layer_channel: Channel,
     pub tool: Tool,
+    pub brush: Brush,
+    pub stroke: Option<ActiveStroke>,
+    /// Properties shows the tool (true) or the selected layer (false).
+    pub properties_tool: bool,
+    /// Latest pen pressure (1 with a mouse).
+    pub pressure: f32,
+    /// Where the last stroke ended (2D view?, screen point), for Shift+click lines.
+    pub last_stroke_end: Option<(bool, glam::Vec2)>,
+    /// Where the 3D view was drawn last frame.
+    pub view3d_rect: egui::Rect,
     pub asset_search: String,
     pub selected_preset: Option<usize>,
     pub preview_env: PreviewEnv,
@@ -224,6 +236,12 @@ impl App {
             uv_mode: ViewMode::Material,
             layer_channel: Channel::BaseColor,
             tool: Tool::Paint,
+            brush: Brush::default(),
+            stroke: None,
+            properties_tool: false,
+            pressure: 1.0,
+            last_stroke_end: None,
+            view3d_rect: egui::Rect::NOTHING,
             asset_search: String::new(),
             selected_preset: None,
             thumbs: Vec::new(),
@@ -262,6 +280,7 @@ impl App {
             self.state.open_any(&path);
         }
         self.state.shortcuts(&ctx);
+        self.state.paint_shortcuts(&ctx);
         // Panes report their size each frame; hidden ones stay at zero and skip rendering.
         self.state.viewport.view3d.requested_size = [0, 0];
         self.state.viewport.view2d.requested_size = [0, 0];
@@ -445,6 +464,10 @@ impl App {
         egui: &mut egui_wgpu::Renderer,
         encoder: &mut wgpu::CommandEncoder,
     ) {
+        let view_proj = {
+            let [w, h] = self.state.viewport.view3d.requested_size;
+            self.state.view_proj(w.max(1) as f32 / h.max(1) as f32)
+        };
         let s = &mut self.state;
         let warnings = s
             .viewport
@@ -452,11 +475,8 @@ impl App {
         for w in warnings {
             s.warn(w);
         }
-        let [w, h] = s.viewport.view3d.requested_size;
-        let aspect = w.max(1) as f32 / h.max(1) as f32;
-        let radius = (s.bounds.1 - s.bounds.0).length() * 0.5;
         let params = FrameParams {
-            view_proj: s.camera.view_proj(aspect, radius),
+            view_proj,
             eye: s.camera.eye(),
             exposure_ev: s.exposure_ev,
             env_rotation: s.env_rotation_deg.to_radians(),
@@ -707,6 +727,9 @@ impl State {
         });
         self.resources = Resources::default();
         self.history = History::new(&self.doc);
+        self.stroke = None;
+        self.viewport.clear_paint_cache();
+        self.select_top_layer();
         self.export.include = vec![true; self.doc.texture_sets.len()];
         self.mesh = mesh;
         self.info(format!("Loaded {}", self.mesh_label));
@@ -868,9 +891,13 @@ impl State {
     fn tool_strip_ui(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             for (tool, icon, name) in Tool::ALL {
-                let tip = format!("{name} — arrives with painting in Phase 2");
+                let tip = match tool {
+                    Tool::Paint | Tool::Eraser => name.to_string(),
+                    _ => format!("{name} — arrives in a later phase"),
+                };
                 if icon_button(ui, icon, self.tool == tool, &tip).clicked() {
                     self.tool = tool;
+                    self.properties_tool = true;
                 }
             }
         });
@@ -1021,7 +1048,7 @@ impl OrbitCamera {
         self.distance = radius / (self.fov_y_deg.to_radians() * 0.5).sin() * 1.1;
     }
 
-    fn view_proj(&self, aspect: f32, scene_radius: f32) -> Mat4 {
+    pub fn view_proj(&self, aspect: f32, scene_radius: f32) -> Mat4 {
         let near = (self.distance - scene_radius * 2.0).max(self.distance * 0.001);
         let far = self.distance * 20.0 + scene_radius * 20.0;
         let fov = self.fov_y_deg.to_radians();
@@ -1061,5 +1088,144 @@ impl UvCamera {
     pub fn to_screen(&self, rect: egui::Rect, uv: Vec2) -> egui::Pos2 {
         let d = (uv - self.center) * self.zoom;
         rect.center() + vec2(d.x, -d.y)
+    }
+}
+
+/// Drives the whole app headlessly with simulated input. Skipped without a GPU.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reetched_doc::NodeKind;
+
+    struct Harness {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        ctx: egui::Context,
+        renderer: egui_wgpu::Renderer,
+        app: App,
+    }
+
+    impl Harness {
+        fn new() -> Option<Self> {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut renderer = egui_wgpu::Renderer::new(
+                &device,
+                wgpu::TextureFormat::Rgba8Unorm,
+                Default::default(),
+            );
+            let app = App::new(
+                &device,
+                &queue,
+                &mut renderer,
+                &adapter.get_info(),
+                false,
+                None,
+            );
+            Some(Self {
+                device,
+                queue,
+                ctx,
+                renderer,
+                app,
+            })
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(1600.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let mut out = self.ctx.run_ui(input, |ui| app.ui(ui));
+            for (id, deltas) in out.textures_delta.set.drain() {
+                for d in &deltas {
+                    self.renderer
+                        .update_texture(&self.device, &self.queue, id, d);
+                }
+            }
+            out.textures_delta.clear();
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            self.app.render_viewport(&mut self.renderer, &mut enc);
+            self.queue.submit([enc.finish()]);
+        }
+
+        fn base_color_tiles(&self) -> usize {
+            let node = &self.app.state.doc.texture_sets[0].stack[0];
+            match &node.kind {
+                NodeKind::Paint(p) => p
+                    .channels
+                    .get(&Channel::BaseColor)
+                    .map_or(0, |m| m.tiles.len()),
+                _ => panic!("expected the default paint layer"),
+            }
+        }
+
+        fn stroke(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(from)]);
+            self.frame(vec![button(from, true)]);
+            for i in 1..=5 {
+                self.frame(vec![egui::Event::PointerMoved(
+                    from.lerp(to, i as f32 / 5.0),
+                )]);
+            }
+            self.frame(vec![button(to, false)]);
+            self.frame(vec![]);
+        }
+    }
+
+    #[test]
+    fn painting_on_the_sphere_creates_tiles_and_undoes() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            h.frame(vec![]); // let the layout settle
+        }
+        let rect = h.app.state.view3d_rect;
+        assert!(rect.width() > 100.0, "3D view laid out: {rect:?}");
+        assert!(h.app.state.selected.is_some(), "Layer 1 is selected");
+        assert_eq!(h.base_color_tiles(), 0);
+
+        h.stroke(
+            rect.center() - vec2(20.0, 0.0),
+            rect.center() + vec2(20.0, 10.0),
+        );
+        assert!(h.base_color_tiles() > 0, "the stroke painted Layer 1");
+        assert!(h.app.state.history.can_undo());
+
+        h.app.state.history.undo(&mut h.app.state.doc);
+        h.frame(vec![]);
+        assert_eq!(h.base_color_tiles(), 0, "undo removes the stroke");
+
+        h.app.state.history.redo(&mut h.app.state.doc);
+        h.frame(vec![]);
+        let painted = h.base_color_tiles();
+        assert!(painted > 0);
+
+        // A big eraser stroke over the same spot clears it again.
+        h.app.state.tool = Tool::Eraser;
+        h.app.state.brush.size = 150.0;
+        h.stroke(
+            rect.center() - vec2(40.0, 0.0),
+            rect.center() + vec2(40.0, 0.0),
+        );
+        assert!(h.base_color_tiles() < painted || h.base_color_tiles() == 0);
     }
 }

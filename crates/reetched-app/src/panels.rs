@@ -144,8 +144,11 @@ impl State {
             // The frame only senses hover, so the eye button keeps its clicks; drops still land.
             drops.push((row.response, i));
         }
-        if let Some(i) = select {
+        if let Some(i) = select
+            && i != self.selected_part
+        {
             self.selected_part = i;
+            self.select_top_layer();
         }
         for (resp, i) in drops {
             self.accept_preset_drop(&resp, Some(i));
@@ -229,6 +232,7 @@ impl State {
     pub fn view3d_ui(&mut self, ui: &mut Ui) {
         // Only the visible part of the pane; max_rect can extend past it.
         let rect = ui.max_rect().intersect(ui.clip_rect());
+        self.view3d_rect = rect;
         let ppp = ui.pixels_per_point();
         self.viewport.view3d.requested_size = [
             (rect.width() * ppp).round() as u32,
@@ -243,6 +247,7 @@ impl State {
         );
         self.accept_preset_drop(&response, None);
         drop_highlight(ui, &response);
+        self.paint_input(ui, &response, rect, false);
 
         // Painter's navigation: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, wheel zoom, F to frame.
         let (alt, scroll, frame_key) = ui.input(|i| {
@@ -297,6 +302,7 @@ impl State {
         );
         self.accept_preset_drop(&response, None);
         drop_highlight(ui, &response);
+        self.paint_input(ui, &response, rect, true);
 
         // UDIM 1001 outline.
         let painter = ui.painter_at(rect);

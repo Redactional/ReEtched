@@ -270,6 +270,12 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
 - Seam handling, plus jump-flood padding with 3D-neighbor mode.
 - Our own starter alpha and brush library.
 - **Exit:** paint across a UV seam with a tablet and get no visible seam. Undo 100 strokes on a 4K set with modest memory use.
+- **Status (done, first pass):**
+  - Built: paint layers and painted masks stored as 256² RGBA16F tiles (content-hashed, copy-on-write, so undo snapshots and `.retx` files share them; project format v2); a GPU brush (dabs accumulate into a stroke mask, so flow builds up but never exceeds stroke opacity); occlusion test against the 3D view's depth plus backface culling; eraser; image alphas; mirror and radial symmetry (copies paint hidden sides, like Painter); painting in the 2D view; lazy mouse; Shift+click lines; pen pressure on size/flow.
+  - Strokes are placed in 3D, so they cross UV seams without breaking; display dilation and export padding hide seams at island edges.
+  - **Not verified:** pen pressure comes from egui touch events (Windows Ink via winit 0.30); no tablet was available for testing. WinTab is not supported.
+  - **Deferred:** stencils, jitter, follow-path angle, tangent/UV alignment and object/texture size spaces (brushes are camera-aligned and sized in screen points), pressure curves, smart material/mask save and load, a starter alpha/brush library, Photoshop ABR import, and the "3D space neighbor" export padding mode.
+  - ponytail: brush hit testing is a brute-force ray cast over every triangle; add a BVH when large meshes make it slow. Undo keeps up to 200 snapshots; heavy repainting of 8K sets can use a lot of memory (tiles are shared, but each changed tile is kept).
 
 ### Phase 3: Baking and mesh-aware effects (≈3 months)
 **Goal:** smart-material workflows.

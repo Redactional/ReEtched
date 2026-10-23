@@ -2,7 +2,7 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 1 of 9 done).** You can texture a model with layers, save projects and export game-ready textures. Painting and Substance import are not there yet. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 2 of 9 done).** You can paint and texture a model with layers, save projects and export game-ready textures. Baking and Substance import are not there yet. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
@@ -10,7 +10,8 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - Painter-style interface: tool strip, Assets, 3D and 2D (UV) views, Texture Set List, Layers, Properties — every panel can be dragged, re-docked, closed and restored from the **Window** menu
 - PBR (metal/rough) 3D view with HDR image-based lighting, tone mapping, wireframe, perspective/orthographic cameras and solo-channel view modes
 - 2D UV view of the selected texture set
-- **Layer stack** like Painter's: fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image masks, drag to reorder
+- **Painting** on the model or in the 2D view: paint layers and paint inside masks, eraser, size/flow/stroke opacity/spacing/hardness/angle, image alphas, backface culling, mirror and radial symmetry, lazy mouse, Shift+click lines, pen pressure (**1** paint, **2** eraser, **[ ]** size)
+- **Layer stack** like Painter's: paint layers, fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image/painted masks, drag to reorder
 - Fill layers with a color or image per channel (base color, metallic, roughness, normal, height) and UV, tri-planar or planar projection
 - Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack to add a fill layer
 - **Projects** (`.retx`): save and reopen everything, including the mesh and images; undo/redo

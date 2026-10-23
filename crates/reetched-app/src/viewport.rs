@@ -2,11 +2,12 @@
 //! offscreen textures that egui displays.
 
 use crate::{
-    compositor::{ChannelSet, Compositor, MeshPart},
+    compositor::{ChannelSet, Compositor, MeshPart, PaintKey},
     env::EnvImage,
+    paint_gpu::{BrushShape, Camera, Dab, PaintGpu, StrokeTarget},
 };
 use glam::{Mat4, Vec3};
-use reetched_doc::{Resources, TextureSet, export::ChannelData};
+use reetched_doc::{ResourceId, Resources, TextureSet, TileMap, export::ChannelData};
 use reetched_io::{Mesh, Vertex};
 use std::ops::Range;
 use wgpu::util::DeviceExt;
@@ -160,6 +161,7 @@ pub struct Viewport {
     prefilter: wgpu::ComputePipeline,
     mesh: Option<(wgpu::Buffer, wgpu::Buffer)>,
     compositor: Compositor,
+    paint: PaintGpu,
     texture_sampler: wgpu::Sampler,
 }
 
@@ -330,6 +332,7 @@ impl Viewport {
             prefilter,
             mesh: None,
             compositor: Compositor::new(device, queue),
+            paint: PaintGpu::new(device, queue),
             texture_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("channel textures"),
                 mag_filter: wgpu::FilterMode::Linear,
@@ -374,6 +377,93 @@ impl Viewport {
     }
 
     /// Re-composites texture sets whose layer stack changed. Returns warnings.
+    /// Starts a brush stroke on `targets` in texture set `res`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_begin(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        targets: Vec<StrokeTarget>,
+        res: u32,
+        resources: &Resources,
+        erase: bool,
+        opacity: f32,
+    ) {
+        self.paint.begin(
+            device,
+            queue,
+            &mut self.compositor,
+            targets,
+            res,
+            resources,
+            erase,
+            opacity,
+        );
+    }
+
+    /// Stamps dabs on texture set `part`. `occlusion`: test against the 3D view's depth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_dabs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        part: usize,
+        camera: &Camera,
+        occlusion: bool,
+        shape: &BrushShape,
+        dabs: &[Dab],
+    ) {
+        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
+            return;
+        };
+        let mesh = MeshPart {
+            vertices,
+            indices,
+            range: p.indices.clone(),
+        };
+        let depth = (occlusion && self.view3d.size == self.view3d.requested_size)
+            .then_some(&self.targets.depth);
+        self.paint.dabs(
+            device,
+            queue,
+            &self.compositor,
+            &mesh,
+            camera,
+            depth,
+            shape,
+            dabs,
+        );
+        // The paint textures changed under the same document: re-composite.
+        p.composited = None;
+    }
+
+    /// Ends the stroke; returns each painted buffer's new tiles.
+    pub fn paint_end(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &mut Resources,
+    ) -> anyhow::Result<Vec<(PaintKey, TileMap)>> {
+        self.paint
+            .end(device, queue, &mut self.compositor, resources)
+    }
+
+    /// Brush alpha image as a GPU texture.
+    pub fn brush_alpha(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &Resources,
+        id: &ResourceId,
+    ) -> Option<wgpu::TextureView> {
+        self.compositor.bitmap_view(device, queue, resources, id)
+    }
+
+    /// Forgets GPU paint data (a different document was loaded).
+    pub fn clear_paint_cache(&mut self) {
+        self.compositor.clear_paint();
+    }
+
     pub fn sync(
         &mut self,
         device: &wgpu::Device,
@@ -528,7 +618,7 @@ impl Viewport {
                     view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -664,7 +754,8 @@ impl Targets {
         });
         Self {
             hdr,
-            depth: view(DEPTH_FORMAT, U::RENDER_ATTACHMENT),
+            // Kept and readable: brush strokes test occlusion against it.
+            depth: view(DEPTH_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
             display: display_texture(device, [width, height]),
             hdr_bind_group,
         }

@@ -5,8 +5,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod brush;
 mod compositor;
 mod env;
+mod paint_gpu;
+mod paint_ui;
 mod panels;
 mod preview;
 mod stack_ui;

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current `.retx` format version. Bump it and add a migration when the layout changes.
-pub const FORMAT_VERSION: u32 = 1;
+/// v2: paint layers and painted masks.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Texture channels of the metal/roughness workflow.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -222,10 +223,12 @@ pub struct ResourceInfo {
     pub name: String,
 }
 
-/// File bytes referenced by the document, keyed by content hash. Immutable, so cheap to share.
+/// File bytes and paint tiles referenced by the document, keyed by content hash.
+/// Immutable, so documents (and undo snapshots) share them cheaply.
 #[derive(Clone, Default)]
 pub struct Resources {
     pub files: BTreeMap<ResourceId, std::sync::Arc<Vec<u8>>>,
+    pub tiles: BTreeMap<TileId, std::sync::Arc<Vec<u8>>>,
 }
 
 impl Resources {
@@ -234,6 +237,56 @@ impl Resources {
         self.files.entry(id.clone()).or_insert_with(|| bytes.into());
         id
     }
+
+    /// Stores one tile (`TILE_BYTES` of RGBA f16) and returns its id.
+    pub fn add_tile(&mut self, bytes: Vec<u8>) -> TileId {
+        debug_assert_eq!(bytes.len(), TILE_BYTES);
+        let id = blake3::hash(&bytes).to_hex().to_string();
+        self.tiles.entry(id.clone()).or_insert_with(|| bytes.into());
+        id
+    }
+}
+
+/// Paint is stored in square tiles of this many texels.
+pub const TILE_SIZE: u32 = 256;
+/// Bytes per tile: RGBA, 16-bit float each.
+pub const TILE_BYTES: usize = (TILE_SIZE * TILE_SIZE * 8) as usize;
+
+/// Content hash of a tile's bytes (see [`Resources::tiles`]).
+pub type TileId = String;
+
+/// Painted texels of one channel: RGBA f16 tiles (color + coverage alpha).
+/// Tiles never painted are absent (fully transparent).
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct TileMap {
+    /// Texture size the tiles were painted at.
+    pub resolution: u32,
+    /// Keyed by "x,y" (tile column, row; row 0 = top of the texture).
+    pub tiles: BTreeMap<String, TileId>,
+}
+
+impl TileMap {
+    pub fn new(resolution: u32) -> Self {
+        Self {
+            resolution,
+            tiles: BTreeMap::new(),
+        }
+    }
+
+    pub fn key(x: u32, y: u32) -> String {
+        format!("{x},{y}")
+    }
+
+    pub fn parse_key(key: &str) -> Option<(u32, u32)> {
+        let (x, y) = key.split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
+    }
+}
+
+/// A paint layer: hand-painted texels per channel.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct Paint {
+    pub channels: BTreeMap<Channel, TileMap>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -348,6 +401,9 @@ pub struct Mask {
     pub bitmap: Option<ResourceId>,
     pub projection: Projection,
     pub invert: bool,
+    /// Painted mask texels (value in R, coverage in A) on top of the background/bitmap.
+    #[serde(default)]
+    pub paint: Option<TileMap>,
 }
 
 impl Mask {
@@ -358,6 +414,7 @@ impl Mask {
             bitmap: None,
             projection: Projection::default(),
             invert: false,
+            paint: None,
         }
     }
 }
@@ -365,6 +422,7 @@ impl Mask {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum NodeKind {
     Fill(Fill),
+    Paint(Paint),
     Folder { children: Vec<Node> },
 }
 
@@ -445,11 +503,12 @@ impl Document {
             next_id: 1,
         };
         for name in texture_set_names {
-            let fill = doc.new_fill("Fill layer 1".into(), Fill::new([0.214; 3], 0.0, 0.45));
+            // Like a new Painter project: one empty paint layer.
+            let layer = doc.new_paint("Layer 1".into());
             doc.texture_sets.push(TextureSet {
                 name: name.clone(),
                 resolution: 2048,
-                stack: vec![fill],
+                stack: vec![layer],
             });
         }
         doc
@@ -458,6 +517,36 @@ impl Document {
     pub fn new_fill(&mut self, name: String, fill: Fill) -> Node {
         let id = self.alloc_id();
         Node::new(id, name, NodeKind::Fill(fill))
+    }
+
+    pub fn new_paint(&mut self, name: String) -> Node {
+        let id = self.alloc_id();
+        Node::new(id, name, NodeKind::Paint(Paint::default()))
+    }
+
+    /// Every paint tile the document references (for saving).
+    pub fn tile_ids(&self) -> std::collections::BTreeSet<TileId> {
+        fn walk(nodes: &[Node], out: &mut std::collections::BTreeSet<TileId>) {
+            for n in nodes {
+                if let Some(p) = n.mask.as_ref().and_then(|m| m.paint.as_ref()) {
+                    out.extend(p.tiles.values().cloned());
+                }
+                match &n.kind {
+                    NodeKind::Paint(p) => {
+                        for map in p.channels.values() {
+                            out.extend(map.tiles.values().cloned());
+                        }
+                    }
+                    NodeKind::Folder { children } => walk(children, out),
+                    NodeKind::Fill(_) => {}
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        for set in &self.texture_sets {
+            walk(&set.stack, &mut out);
+        }
+        out
     }
 
     pub fn new_folder(&mut self, name: String) -> Node {
@@ -521,7 +610,7 @@ pub fn take_node(stack: &mut Vec<Node>, id: NodeId) -> Option<Node> {
     }
     stack.iter_mut().find_map(|n| match &mut n.kind {
         NodeKind::Folder { children } => take_node(children, id),
-        NodeKind::Fill(_) => None,
+        NodeKind::Fill(_) | NodeKind::Paint(_) => None,
     })
 }
 
@@ -588,7 +677,7 @@ pub fn move_node(stack: &mut Vec<Node>, id: NodeId, placement: Placement) -> boo
 fn contains(node: &Node, id: NodeId) -> bool {
     match &node.kind {
         NodeKind::Folder { children } => children.iter().any(|c| c.id == id || contains(c, id)),
-        NodeKind::Fill(_) => false,
+        NodeKind::Fill(_) | NodeKind::Paint(_) => false,
     }
 }
 

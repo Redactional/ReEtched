@@ -2,6 +2,7 @@
 //! - `project.json` — the [`Document`]
 //! - `mesh.json`, `mesh_vertices.bin`, `mesh_indices.bin` — the imported mesh
 //! - `resources/<hash>` — every file the document references (bitmaps, …)
+//! - `tiles/<hash>` — painted tiles (RGBA f16, 256×256)
 
 use crate::{Document, FORMAT_VERSION, Resources};
 use anyhow::{Context, Result, bail};
@@ -58,6 +59,13 @@ fn write_zip(path: &Path, doc: &Document, mesh: &Mesh, resources: &Resources) ->
             .with_context(|| format!("resource {id} is missing from memory"))?;
         put(&format!("resources/{id}"), bytes)?;
     }
+    for id in doc.tile_ids() {
+        let bytes = resources
+            .tiles
+            .get(&id)
+            .with_context(|| format!("paint tile {id} is missing from memory"))?;
+        put(&format!("tiles/{id}"), bytes)?;
+    }
     zip.finish()?;
     Ok(())
 }
@@ -75,14 +83,22 @@ pub fn load(path: &Path) -> Result<(Document, Mesh, Resources)> {
         Ok(bytes)
     };
 
-    let doc: Document =
-        serde_json::from_slice(&read("project.json")?).context("project.json is invalid")?;
-    if doc.format_version > FORMAT_VERSION {
+    // Check the version before parsing, so newer files get a clear message.
+    let json = read("project.json")?;
+    let version: serde_json::Value =
+        serde_json::from_slice(&json).context("project.json is invalid")?;
+    let version = version
+        .get("format_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if version > FORMAT_VERSION as u64 {
         bail!(
-            "this project was saved by a newer ReEtched (format {}, this version reads up to {FORMAT_VERSION})",
-            doc.format_version
+            "this project was saved by a newer ReEtched (format {version}, this version reads up to {FORMAT_VERSION})"
         );
     }
+    // v1 → v2 only added optional fields, so v1 files parse as they are.
+    let mut doc: Document = serde_json::from_slice(&json).context("project.json is invalid")?;
+    doc.format_version = FORMAT_VERSION;
 
     let info: MeshInfo = serde_json::from_slice(&read("mesh.json")?)?;
     let vertices: Vec<Vertex> = read("mesh_vertices.bin")?
@@ -119,6 +135,13 @@ pub fn load(path: &Path) -> Result<(Document, Mesh, Resources)> {
         let bytes = read(&format!("resources/{id}"))?;
         resources.files.insert(id.clone(), bytes.into());
     }
+    for id in doc.tile_ids() {
+        let bytes = read(&format!("tiles/{id}"))?;
+        if bytes.len() != crate::TILE_BYTES {
+            bail!("paint tile {id} is corrupt");
+        }
+        resources.tiles.insert(id, bytes.into());
+    }
     Ok((doc, mesh, resources))
 }
 
@@ -146,6 +169,16 @@ mod tests {
             .bitmap = Some(id.clone());
         let node = doc.new_fill("red".into(), fill);
         doc.texture_sets[0].stack.insert(0, node);
+        // A painted tile on the default paint layer.
+        let tile = resources.add_tile(vec![7; crate::TILE_BYTES]);
+        let Some(crate::NodeKind::Paint(paint)) =
+            doc.texture_sets[0].stack.last_mut().map(|n| &mut n.kind)
+        else {
+            panic!("new texture sets start with a paint layer");
+        };
+        let mut map = crate::TileMap::new(256);
+        map.tiles.insert(crate::TileMap::key(0, 0), tile.clone());
+        paint.channels.insert(crate::Channel::BaseColor, map);
 
         let dir = std::env::temp_dir().join("reetched-doc-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -157,6 +190,7 @@ mod tests {
         assert_eq!(mesh2.indices, mesh.indices);
         assert_eq!(mesh2.parts.len(), 1);
         assert_eq!(res2.files[&id].as_slice(), &[1, 2, 3]);
+        assert_eq!(res2.tiles[&tile].len(), crate::TILE_BYTES);
     }
 
     #[test]

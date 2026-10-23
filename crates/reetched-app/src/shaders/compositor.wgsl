@@ -26,7 +26,7 @@ struct Params {
     mask: vec4<f32>,
     proj: Proj,
     mask_proj: Proj,
-    // x: height-to-normal strength
+    // x: height-to-normal strength, y: has painted mask
     misc: vec4<f32>,
 };
 
@@ -38,6 +38,8 @@ struct Params {
 @group(0) @binding(5) var t_normal: texture_2d<f32>;
 @group(0) @binding(6) var t_height: texture_2d<f32>;
 @group(0) @binding(7) var t_mask: texture_2d<f32>;
+// Painted mask texels (value in r, coverage in a), same size as the texture set.
+@group(0) @binding(8) var t_mask_paint: texture_2d<f32>;
 
 // The stack so far.
 @group(1) @binding(0) var s0: texture_2d<f32>;
@@ -148,13 +150,17 @@ fn sample_proj(t: texture_2d<f32>, pr: Proj, uv: vec2<f32>, pos: vec3<f32>, n: v
     return x * w.x + y * w.y + z * w.z;
 }
 
-fn mask_value(uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>) -> f32 {
+fn mask_value(uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>, p: vec2<i32>) -> f32 {
     if P.mask.x < 0.5 {
         return 1.0;
     }
     var m = P.mask.y;
     if P.mask.z > 0.5 {
         m = sample_proj(t_mask, P.mask_proj, uv, pos, n).r;
+    }
+    if P.misc.y > 0.5 {
+        let painted = textureLoad(t_mask_paint, p, 0);
+        m = mix(m, painted.r, painted.a);
     }
     if P.mask.w > 0.5 {
         m = 1.0 - m;
@@ -280,7 +286,7 @@ fn fs_fill(in: VsOut) -> Out {
     let p = vec2<i32>(in.clip.xy);
     var c = load_s(p);
     let n = normalize(in.normal);
-    let m = mask_value(in.uv, in.world, n);
+    let m = mask_value(in.uv, in.world, n, p);
 
     if P.values[0].w > 0.5 {
         var v = P.values[0].xyz;
@@ -314,6 +320,39 @@ fn fs_fill(in: VsOut) -> Out {
     return pack(c);
 }
 
+// Paint layers: painted texels (color + coverage alpha) per channel, same size as the set.
+@fragment
+fn fs_paint(in: VsOut) -> Out {
+    let p = vec2<i32>(in.clip.xy);
+    var c = load_s(p);
+    let m = mask_value(in.uv, in.world, normalize(in.normal), p);
+    if P.blend[0].z > 0.5 {
+        let t = textureLoad(t_base, p, 0);
+        c.base = composite(mode_of(0u), c.base, t.rgb, t.a * P.blend[0].y * m, false);
+    }
+    if P.blend[1].z > 0.5 {
+        let t = textureLoad(t_metal, p, 0);
+        c.metal = composite(mode_of(1u), vec3(c.metal), vec3(t.r), t.a * P.blend[1].y * m, false).x;
+    }
+    if P.blend[2].z > 0.5 {
+        let t = textureLoad(t_rough, p, 0);
+        c.rough = composite(mode_of(2u), vec3(c.rough), vec3(t.r), t.a * P.blend[2].y * m, false).x;
+    }
+    if P.blend[3].z > 0.5 {
+        let t = textureLoad(t_normal, p, 0);
+        if t.a > 0.0 {
+            c.normal = composite(mode_of(3u), c.normal, normalize(t.xyz), t.a * P.blend[3].y * m, true);
+        }
+    }
+    if P.blend[4].z > 0.5 {
+        let t = textureLoad(t_height, p, 0);
+        c.height = composite(mode_of(4u), vec3(c.height), vec3(t.r), t.a * P.blend[4].y * m, false).x;
+    }
+    c.coverage = 1.0;
+    c.filled = 1.0;
+    return pack(c);
+}
+
 // Folders: children were composited on top of the layers below (`s`), giving `o`.
 // ponytail: Normal folders are not isolated (same as Passthrough); verify against Painter.
 fn folder_channel(i: u32, d: vec3<f32>, s: vec3<f32>, a: f32, is_normal: bool) -> vec3<f32> {
@@ -330,7 +369,7 @@ fn fs_folder(in: VsOut) -> Out {
     let p = vec2<i32>(in.clip.xy);
     var c = load_s(p);
     let o = load_o(p);
-    let m = mask_value(in.uv, in.world, normalize(in.normal));
+    let m = mask_value(in.uv, in.world, normalize(in.normal), p);
     c.base = folder_channel(0u, c.base, o.base, P.blend[0].y * m, false);
     c.metal = folder_channel(1u, vec3(c.metal), vec3(o.metal), P.blend[1].y * m, false).x;
     c.rough = folder_channel(2u, vec3(c.rough), vec3(o.rough), P.blend[2].y * m, false).x;

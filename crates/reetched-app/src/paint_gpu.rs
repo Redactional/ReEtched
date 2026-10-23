@@ -1,0 +1,826 @@
+//! Brush strokes on the GPU (see `shaders/paint.wgsl`): dabs accumulate into a
+//! stroke mask that is blended into the target paint textures; when the stroke
+//! ends, the touched tiles are read back into the document.
+
+use crate::compositor::{Compositor, MeshPart, PAINT_FORMAT, PaintKey};
+use glam::{Mat4, Vec3};
+use reetched_doc::{Resources, TILE_BYTES, TILE_SIZE, TileMap};
+use wgpu::util::DeviceExt;
+
+pub const MAX_DABS: usize = 64;
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+
+/// One brush stamp (layout matches `Dab` in paint.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Dab {
+    pub center_radius: [f32; 4],
+    pub right_flow: [f32; 4],
+    pub up_angle: [f32; 4],
+    pub view_flags: [f32; 4],
+    pub uv: [f32; 4],
+}
+
+/// `Dab::view_flags.w` bits.
+pub const DAB_DEPTH_TEST: u32 = 1;
+pub const DAB_UV_SPACE: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SplatUniform {
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    params: [f32; 4],
+    dabs: [Dab; MAX_DABS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ApplyUniform {
+    color: [f32; 4],
+    params: [f32; 4],
+}
+
+/// The view the dabs were placed from (for the occlusion test).
+pub struct Camera {
+    pub view_proj: Mat4,
+    pub eye: Vec3,
+}
+
+pub struct BrushShape {
+    /// 0 = soft, 1 = hard edge.
+    pub hardness: f32,
+    /// Texels facing away more than this are skipped; `None` paints backfaces too.
+    pub backface_cos: Option<f32>,
+    pub alpha: Option<wgpu::TextureView>,
+}
+
+/// A paint buffer a stroke writes into.
+pub struct StrokeTarget {
+    pub key: PaintKey,
+    /// Brush value for this buffer (linear color, normal, or scalar in x).
+    pub value: [f32; 3],
+    pub is_normal: bool,
+    /// The buffer's tiles when the stroke started.
+    pub old: TileMap,
+}
+
+struct Stroke {
+    res: u32,
+    erase: bool,
+    opacity: f32,
+    mask: wgpu::Texture,
+    mask_view: wgpu::TextureView,
+    targets: Vec<(StrokeTarget, wgpu::TextureView)>,
+}
+
+pub struct PaintGpu {
+    splat: wgpu::RenderPipeline,
+    apply: wgpu::RenderPipeline,
+    splat_layout: wgpu::BindGroupLayout,
+    apply_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Bound when there's no 3D view depth (2D-view painting).
+    no_depth: wgpu::TextureView,
+    white: wgpu::TextureView,
+    stroke: Option<Stroke>,
+}
+
+impl PaintGpu {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        use wgpu::{BindingType as B, ShaderStages as S};
+        let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty,
+            count: None,
+        };
+        let uniform = B::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let tex = |filterable| B::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let splat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("splat"),
+            entries: &[
+                entry(0, S::FRAGMENT, uniform),
+                entry(
+                    1,
+                    S::FRAGMENT,
+                    B::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(2, S::FRAGMENT, tex(true)),
+                entry(
+                    3,
+                    S::FRAGMENT,
+                    B::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        });
+        let apply_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("apply"),
+            entries: &[
+                entry(0, S::FRAGMENT, uniform),
+                entry(1, S::FRAGMENT, tex(false)),
+                entry(2, S::FRAGMENT, tex(false)),
+            ],
+        });
+        let module = device.create_shader_module(wgpu::include_wgsl!("shaders/paint.wgsl"));
+        let pipeline = |layout: &wgpu::BindGroupLayout,
+                        vs: &str,
+                        fs: &str,
+                        buffers: &[Option<wgpu::VertexBufferLayout>],
+                        target: wgpu::ColorTargetState| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(fs),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fs),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(target)],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let accumulate = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::OneMinusDst,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let splat = pipeline(
+            &splat_layout,
+            "vs_uv",
+            "fs_splat",
+            &[Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<reetched_io::Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+            })],
+            wgpu::ColorTargetState {
+                format: MASK_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: accumulate,
+                    alpha: accumulate,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            },
+        );
+        let apply = pipeline(
+            &apply_layout,
+            "vs_full",
+            "fs_apply",
+            &[],
+            PAINT_FORMAT.into(),
+        );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("brush alpha"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let no_depth = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no depth"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let white = device
+            .create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("white"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &[255; 4],
+            )
+            .create_view(&Default::default());
+        Self {
+            splat,
+            apply,
+            splat_layout,
+            apply_layout,
+            sampler,
+            no_depth,
+            white,
+            stroke: None,
+        }
+    }
+
+    /// Starts a stroke on `targets` (texture-set size `res`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &mut Compositor,
+        targets: Vec<StrokeTarget>,
+        res: u32,
+        resources: &Resources,
+        erase: bool,
+        opacity: f32,
+    ) {
+        let mut enc = device.create_command_encoder(&Default::default());
+        let targets = targets
+            .into_iter()
+            .map(|t| {
+                // Make sure the paint texture exists and holds the current tiles, then snapshot it.
+                comp.paint_view(device, queue, t.key, &t.old, res, resources);
+                let src = &comp.paint_texture(t.key).expect("just created").texture;
+                let before = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("stroke before"),
+                    size: src.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: PAINT_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                enc.copy_texture_to_texture(
+                    src.as_image_copy(),
+                    before.as_image_copy(),
+                    src.size(),
+                );
+                (t, before.create_view(&Default::default()))
+            })
+            .collect();
+        let mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("stroke mask"),
+            size: wgpu::Extent3d {
+                width: res,
+                height: res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: MASK_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mask_view = mask.create_view(&Default::default());
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear stroke mask"),
+            color_attachments: &[Some(attachment(
+                &mask_view,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            ))],
+            ..Default::default()
+        }));
+        queue.submit([enc.finish()]);
+        self.stroke = Some(Stroke {
+            res,
+            erase,
+            opacity,
+            mask,
+            mask_view,
+            targets,
+        });
+    }
+
+    /// Stamps `dabs` and updates the target paint textures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dabs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &Compositor,
+        mesh: &MeshPart,
+        camera: &Camera,
+        depth: Option<&wgpu::TextureView>,
+        shape: &BrushShape,
+        dabs: &[Dab],
+    ) {
+        let Some(stroke) = &self.stroke else { return };
+        if dabs.is_empty() {
+            return;
+        }
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat"),
+                color_attachments: &[Some(attachment(&stroke.mask_view, wgpu::LoadOp::Load))],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.splat);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            for chunk in dabs.chunks(MAX_DABS) {
+                let mut u: SplatUniform = bytemuck::Zeroable::zeroed();
+                u.view_proj = camera.view_proj.to_cols_array_2d();
+                u.inv_view_proj = camera.view_proj.inverse().to_cols_array_2d();
+                u.eye = camera.eye.extend(1.0).into();
+                u.params = [
+                    chunk.len() as f32,
+                    shape.hardness,
+                    shape.backface_cos.unwrap_or(-2.0),
+                    if shape.alpha.is_some() { 1.0 } else { 0.0 },
+                ];
+                for (dst, src) in u.dabs.iter_mut().zip(chunk) {
+                    *dst = *src;
+                    if depth.is_none() {
+                        // No depth to test against: skip the occlusion test.
+                        let flags = dst.view_flags[3] as u32 & !DAB_DEPTH_TEST;
+                        dst.view_flags[3] = flags as f32;
+                    }
+                }
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("dabs"),
+                    contents: bytemuck::bytes_of(&u),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.splat_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                depth.unwrap_or(&self.no_depth),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                shape.alpha.as_ref().unwrap_or(&self.white),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+                pass.set_bind_group(0, &group, &[]);
+                pass.draw_indexed(mesh.range.clone(), 0, 0..1);
+            }
+        }
+        for (target, before) in &stroke.targets {
+            let Some(dst) = comp.paint_texture(target.key) else {
+                continue;
+            };
+            let [r, g, b] = target.value;
+            let u = ApplyUniform {
+                color: [r, g, b, if target.is_normal { 1.0 } else { 0.0 }],
+                params: [
+                    stroke.opacity,
+                    if stroke.erase { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ],
+            };
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("apply"),
+                contents: bytemuck::bytes_of(&u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.apply_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(before),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&stroke.mask_view),
+                    },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("apply stroke"),
+                color_attachments: &[Some(attachment(&dst.view, wgpu::LoadOp::Load))],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.apply);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([enc.finish()]);
+    }
+
+    /// Ends the stroke: reads the touched tiles back and returns each target's new tiles.
+    pub fn end(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &mut Compositor,
+        resources: &mut Resources,
+    ) -> anyhow::Result<Vec<(PaintKey, TileMap)>> {
+        let Some(stroke) = self.stroke.take() else {
+            return Ok(Vec::new());
+        };
+        let res = stroke.res;
+        let per_side = res / TILE_SIZE;
+
+        // Which tiles did the stroke touch?
+        let mask_bytes = read_region(device, queue, &stroke.mask, 0, 0, res, res, 2)?;
+        let row = (res * 2) as usize;
+        let mut touched = Vec::new();
+        for ty in 0..per_side {
+            for tx in 0..per_side {
+                let hit = (0..TILE_SIZE).any(|y| {
+                    let start = (ty * TILE_SIZE + y) as usize * row + (tx * TILE_SIZE * 2) as usize;
+                    mask_bytes[start..start + (TILE_SIZE * 2) as usize]
+                        .iter()
+                        .any(|&b| b != 0)
+                });
+                if hit {
+                    touched.push((tx, ty));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (target, _) in &stroke.targets {
+            let mut map = target.old.clone();
+            map.resolution = res;
+            let Some(pt) = comp.paint_texture(target.key) else {
+                continue;
+            };
+            for &(tx, ty) in &touched {
+                let bytes = read_region(
+                    device,
+                    queue,
+                    &pt.texture,
+                    tx * TILE_SIZE,
+                    ty * TILE_SIZE,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                    8,
+                )?;
+                let key = TileMap::key(tx, ty);
+                // Alpha is the 4th half-float of every texel; ±0 means untouched.
+                let empty = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .all(|t| u16::from_le_bytes([t[6], t[7]]) & 0x7fff == 0);
+                if empty {
+                    map.tiles.remove(&key);
+                } else {
+                    debug_assert_eq!(bytes.len(), TILE_BYTES);
+                    map.tiles.insert(key, resources.add_tile(bytes));
+                }
+            }
+            comp.mark_synced(target.key, map.clone());
+            out.push((target.key, map));
+        }
+        Ok(out)
+    }
+}
+
+fn attachment(
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load,
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
+/// Copies a texture region to the CPU, rows tightly packed.
+#[allow(clippy::too_many_arguments)]
+fn read_region(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    bytes_per_texel: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let row = w * bytes_per_texel;
+    let padded =
+        row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("paint readback"),
+        size: (padded * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([enc.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let mapped = buffer
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| anyhow::anyhow!("could not read GPU data: {e:?}"))?;
+    let mut out = Vec::with_capacity((row * h) as usize);
+    for r in 0..h as usize {
+        let start = r * padded as usize;
+        out.extend_from_slice(&mapped[start..start + row as usize]);
+    }
+    Ok(out)
+}
+
+/// Strokes on a real GPU against a quad covering the UV tile (z = 0, facing +z).
+/// Skipped when no adapter is available.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reetched_doc::{Channel, Document, NodeKind, TextureSet};
+    use reetched_io::Vertex;
+
+    const RES: u32 = 256;
+
+    struct Gpu {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        vb: wgpu::Buffer,
+        ib: wgpu::Buffer,
+    }
+
+    fn gpu() -> Option<Gpu> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+        let v = |u: f32, w: f32| Vertex {
+            position: [u, w, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [u, w],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        };
+        let vertices = [v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)];
+        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        let buf = |bytes: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytes,
+                usage,
+            })
+        };
+        Some(Gpu {
+            vb: buf(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX),
+            ib: buf(bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX),
+            device,
+            queue,
+        })
+    }
+
+    fn uv_dab(u: f32, v: f32, radius: f32) -> Dab {
+        Dab {
+            right_flow: [0.0, 0.0, 0.0, 1.0],
+            view_flags: [0.0, 0.0, 0.0, DAB_UV_SPACE as f32],
+            uv: [u, v, radius, 0.0],
+            ..Default::default()
+        }
+    }
+
+    fn world_dab(center: [f32; 3], radius: f32, view_dir: [f32; 3]) -> Dab {
+        let [x, y, z] = center;
+        let [a, b, c] = view_dir;
+        Dab {
+            center_radius: [x, y, z, radius],
+            right_flow: [1.0, 0.0, 0.0, 1.0],
+            up_angle: [0.0, 1.0, 0.0, 0.0],
+            view_flags: [a, b, c, 0.0],
+            uv: [0.0; 4],
+        }
+    }
+
+    /// One stroke of `dabs` on paint buffer `old`; returns the new tiles.
+    fn stroke(
+        g: &Gpu,
+        comp: &mut Compositor,
+        res: &mut Resources,
+        old: TileMap,
+        erase: bool,
+        backface: Option<f32>,
+        dabs: &[Dab],
+    ) -> TileMap {
+        let mut pg = PaintGpu::new(&g.device, &g.queue);
+        let target = StrokeTarget {
+            key: (7, 0),
+            value: [1.0, 0.0, 0.0],
+            is_normal: false,
+            old,
+        };
+        pg.begin(
+            &g.device,
+            &g.queue,
+            comp,
+            vec![target],
+            RES,
+            res,
+            erase,
+            1.0,
+        );
+        let mesh = MeshPart {
+            vertices: &g.vb,
+            indices: &g.ib,
+            range: 0..6,
+        };
+        let camera = Camera {
+            view_proj: Mat4::IDENTITY,
+            eye: Vec3::Z,
+        };
+        let shape = BrushShape {
+            hardness: 1.0,
+            backface_cos: backface,
+            alpha: None,
+        };
+        pg.dabs(
+            &g.device, &g.queue, comp, &mesh, &camera, None, &shape, dabs,
+        );
+        let mut out = pg.end(&g.device, &g.queue, comp, res).unwrap();
+        assert_eq!(out.len(), 1);
+        out.remove(0).1
+    }
+
+    #[test]
+    fn paint_composite_and_erase() {
+        let Some(g) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut comp = Compositor::new(&g.device, &g.queue);
+        let mut resources = Resources::default();
+        let painted = stroke(
+            &g,
+            &mut comp,
+            &mut resources,
+            TileMap::new(RES),
+            false,
+            None,
+            &[uv_dab(0.5, 0.5, 0.25)],
+        );
+        assert_eq!(
+            painted.tiles.len(),
+            1,
+            "one 256² tile covers the whole texture"
+        );
+
+        // Composite a stack with that paint layer.
+        let mut doc = Document::new(None, &["quad".to_string()]);
+        let set = &mut doc.texture_sets[0];
+        set.resolution = RES;
+        let NodeKind::Paint(paint) = &mut set.stack[0].kind else {
+            panic!("new sets start with a paint layer")
+        };
+        paint.channels.insert(Channel::BaseColor, painted.clone());
+        let id = set.stack[0].id;
+        let set: TextureSet = set.clone();
+        // The compositor caches paint by node id; this layer's texture is key (id, 0).
+        let mesh = MeshPart {
+            vertices: &g.vb,
+            indices: &g.ib,
+            range: 0..6,
+        };
+        let mut fresh = Compositor::new(&g.device, &g.queue);
+        let mut out = None;
+        assert!(
+            fresh
+                .composite(&g.device, &g.queue, &mesh, &set, &resources, &mut out)
+                .is_empty()
+        );
+        let d = fresh
+            .read_back(&g.device, &g.queue, out.as_ref().unwrap())
+            .unwrap();
+        let px = |x: u32, y: u32| d.base_color[(y * RES + x) as usize];
+        assert!(
+            (px(128, 128)[0] - 1.0).abs() < 0.01 && px(128, 128)[1] < 0.01,
+            "center is red: {:?}",
+            px(128, 128)
+        );
+        assert!(
+            (px(5, 5)[0] - 0.214).abs() < 0.01,
+            "corner untouched: {:?}",
+            px(5, 5)
+        );
+        let _ = id;
+
+        // Erasing the same spot leaves nothing, so the tile is dropped.
+        let erased = stroke(
+            &g,
+            &mut comp,
+            &mut resources,
+            painted,
+            true,
+            None,
+            &[uv_dab(0.5, 0.5, 0.3)],
+        );
+        assert!(erased.tiles.is_empty(), "{erased:?}");
+    }
+
+    #[test]
+    fn world_dabs_respect_backface_culling() {
+        let Some(g) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut comp = Compositor::new(&g.device, &g.queue);
+        let mut resources = Resources::default();
+        // Looking at the front (down -z): paints.
+        let front = stroke(
+            &g,
+            &mut comp,
+            &mut resources,
+            TileMap::new(RES),
+            false,
+            Some(0.0),
+            &[world_dab([0.5, 0.5, 0.0], 0.2, [0.0, 0.0, -1.0])],
+        );
+        assert_eq!(front.tiles.len(), 1);
+        // Looking from behind with culling on: nothing.
+        let mut comp = Compositor::new(&g.device, &g.queue);
+        let back = stroke(
+            &g,
+            &mut comp,
+            &mut resources,
+            TileMap::new(RES),
+            false,
+            Some(0.0),
+            &[world_dab([0.5, 0.5, 0.0], 0.2, [0.0, 0.0, 1.0])],
+        );
+        assert!(back.tiles.is_empty());
+    }
+}

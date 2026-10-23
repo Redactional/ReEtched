@@ -101,9 +101,12 @@ impl State {
                     .response
                     .on_hover_text("Add mask");
                 });
+                if icon_button(ui, ic::ICON_BRUSH, false, "Add paint layer").clicked() {
+                    let n = self.stack().map_or(0, |s| s.len()) + 1;
+                    let node = self.doc.new_paint(format!("Layer {n}"));
+                    self.add_node(node);
+                }
                 ui.add_enabled_ui(false, |ui| {
-                    icon_button(ui, ic::ICON_BRUSH, false, "Add paint layer")
-                        .on_disabled_hover_text("Paint layers arrive in Phase 2");
                     icon_button(ui, ic::ICON_AUTO_FIX_HIGH, false, "Add effect")
                         .on_disabled_hover_text("Effects arrive in Phase 3");
                 });
@@ -145,7 +148,10 @@ impl State {
         let actions = std::mem::take(&mut ctx.actions);
         for action in actions {
             match action {
-                StackAction::Select(sel) => self.selected = (sel.node != 0).then_some(sel),
+                StackAction::Select(sel) => {
+                    self.selected = (sel.node != 0).then_some(sel);
+                    self.properties_tool = false;
+                }
                 StackAction::Move(id, placement) => {
                     if let Some(stack) = self.stack_mut() {
                         move_node(stack, id, placement);
@@ -243,6 +249,15 @@ impl State {
     }
 
     pub fn properties_ui(&mut self, ui: &mut Ui) {
+        if self.properties_tool
+            && matches!(
+                self.tool,
+                crate::app::Tool::Paint | crate::app::Tool::Eraser
+            )
+        {
+            self.brush_ui(ui);
+            return;
+        }
         let Some(sel) = self.selected else {
             ui.label(RichText::new("Select a layer to edit its properties").color(theme::WEAK));
             return;
@@ -250,6 +265,7 @@ impl State {
         let names = self.doc.resources.clone();
         let mut pick: Option<BitmapSlot> = None;
         let mut clear: Option<BitmapSlot> = None;
+        let mut show_brush = false;
         let Some(node) = self.stack_mut().and_then(|s| find_node_mut(s, sel.node)) else {
             self.selected = None;
             return;
@@ -316,6 +332,7 @@ impl State {
 
                 ui.label(theme::header(match node.kind {
                     NodeKind::Fill(_) => "FILL",
+                    NodeKind::Paint(_) => "PAINT",
                     NodeKind::Folder { .. } => "FOLDER",
                 }));
                 egui::Grid::new("layer")
@@ -327,12 +344,15 @@ impl State {
                         ui.end_row();
                     });
                 let NodeKind::Fill(fill) = &mut node.kind else {
-                    ui.label(
-                        RichText::new(
-                            "Set a folder's blend mode and opacity per channel in the layer stack.",
-                        )
-                        .color(theme::WEAK),
-                    );
+                    let hint = if matches!(node.kind, NodeKind::Paint(_)) {
+                        "Paint on this layer with the Paint tool (1) and erase with the Eraser (2), in the 3D or 2D view. Blend mode and opacity per channel are in the layer stack."
+                    } else {
+                        "Set a folder's blend mode and opacity per channel in the layer stack."
+                    };
+                    ui.label(RichText::new(hint).color(theme::WEAK));
+                    if matches!(node.kind, NodeKind::Paint(_)) && ui.button("Brush settings").clicked() {
+                        show_brush = true;
+                    }
                     return;
                 };
                 ui.add_space(8.0);
@@ -376,6 +396,15 @@ impl State {
                     });
             });
 
+        if show_brush {
+            self.properties_tool = true;
+            if !matches!(
+                self.tool,
+                crate::app::Tool::Paint | crate::app::Tool::Eraser
+            ) {
+                self.tool = crate::app::Tool::Paint;
+            }
+        }
         if let Some(slot) = clear {
             self.set_bitmap(sel.node, slot, None);
         }
@@ -776,12 +805,19 @@ fn node_row(ui: &mut Ui, node: &mut Node, depth: usize, ctx: &mut RowCtx) {
                         ui.painter()
                             .rect_filled(thumb, 2.0, swatch(fill, ctx.channel));
                     }
-                    NodeKind::Folder { .. } => {
+                    NodeKind::Paint(_) | NodeKind::Folder { .. } => {
+                        let icon = if folder {
+                            ic::ICON_FOLDER
+                        } else {
+                            ic::ICON_BRUSH
+                        };
+                        ui.painter()
+                            .rect_filled(thumb, 2.0, Color32::from_gray(0x3a));
                         ui.painter().text(
                             thumb.center(),
                             egui::Align2::CENTER_CENTER,
-                            ic::ICON_FOLDER.codepoint,
-                            egui::FontId::new(20.0, ic::ICON_FOLDER.font_family()),
+                            icon.codepoint,
+                            egui::FontId::new(18.0, icon.font_family()),
                             theme::WEAK,
                         );
                     }
@@ -945,7 +981,7 @@ fn swatch(fill: &Fill, channel: Channel) -> Color32 {
     }
 }
 
-fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
+pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
     match c {
         Channel::BaseColor => {
             let mut rgba = egui::Rgba::from_rgb(value[0], value[1], value[2]);
