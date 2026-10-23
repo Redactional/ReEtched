@@ -247,6 +247,13 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
   - bundled presets for PBR MR/SG, Unreal, Unity HDRP/URP, glTF, Blender and Godot.
 - Read and write `.spexp` export presets (route A).
 - **Exit:** a user can make a rust-over-paint material with two fills and a mask, save, reopen, and export Unreal-packed textures.
+- **Status (done):** built as planned, with these differences:
+  - Tiled storage moved to Phase 2: fill layers and masks cover every texel, so tiles only pay off once brush strokes exist. Phase 1 composites full-resolution textures.
+  - The `.retx` project stores the mesh plus imported images; there are no layer tiles to store yet.
+  - Folders in Normal mode are not isolated (they behave like Passthrough with the folder's opacity and mask). Blend mode formulas follow the W3C/Photoshop definitions. Both must be checked against Painter golden exports.
+  - `.spexp` uses the JSON layout of Painter's Python export API; not yet confirmed against real `.spexp` files.
+  - EXR export is 32-bit float only; 16-bit float EXR and padding "diffusion" are not done.
+  - Normal/AO mixing settings are not exposed yet (normal uses Painter's defaults: height-to-normal, then detail blend).
 
 ### Phase 2: Painting (≈3–4 months)
 **Goal:** it feels like a painter.

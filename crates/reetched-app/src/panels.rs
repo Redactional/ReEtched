@@ -4,7 +4,7 @@ use crate::{
     app::{PresetDrag, State, icon_button},
     preview::PRESETS,
     theme,
-    viewport::{Material, ViewMode},
+    viewport::ViewMode,
 };
 use egui::{
     Align, Color32, CornerRadius, Frame, Layout, PointerButton, Rect, RichText, Sense, Stroke,
@@ -12,9 +12,6 @@ use egui::{
 };
 use egui_material_icons::icons as ic;
 use glam::Vec2;
-
-const LAYER_CHANNELS: [ViewMode; 3] =
-    [ViewMode::BaseColor, ViewMode::Roughness, ViewMode::Metallic];
 
 impl State {
     pub fn assets_ui(&mut self, ui: &mut Ui) {
@@ -156,175 +153,6 @@ impl State {
         if self.viewport.parts.is_empty() {
             ui.label(RichText::new("No mesh loaded").color(theme::WEAK));
         }
-    }
-
-    pub fn layers_ui(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("layer_channel")
-                .selected_text(self.layer_channel.label())
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    for m in LAYER_CHANNELS {
-                        ui.selectable_value(&mut self.layer_channel, m, m.label());
-                    }
-                });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(false, |ui| {
-                    for (icon, name) in [
-                        (ic::ICON_DELETE, "Delete layer"),
-                        (ic::ICON_FOLDER, "Add folder"),
-                        (ic::ICON_FORMAT_COLOR_FILL, "Add fill layer"),
-                        (ic::ICON_BRUSH, "Add paint layer"),
-                        (ic::ICON_MASKED_TRANSITIONS, "Add mask"),
-                        (ic::ICON_AUTO_FIX_HIGH, "Add effect"),
-                    ] {
-                        icon_button(ui, icon, false, name).on_disabled_hover_text(format!(
-                            "{name} — the full layer stack arrives in Phase 1"
-                        ));
-                    }
-                });
-            });
-        });
-        ui.separator();
-
-        let channel = self.layer_channel;
-        let Some(part) = self.viewport.parts.get_mut(self.selected_part) else {
-            ui.label(RichText::new("No texture set selected").color(theme::WEAK));
-            return;
-        };
-        let layer = &mut part.layer;
-        row_frame(true).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let eye = if layer.visible {
-                    ic::ICON_VISIBILITY
-                } else {
-                    ic::ICON_VISIBILITY_OFF
-                };
-                if icon_button(ui, eye, false, "Show / hide layer").clicked() {
-                    layer.visible = !layer.visible;
-                }
-                let (swatch, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(swatch, 2.0, channel_color(&layer.material, channel));
-                ui.painter().rect_stroke(
-                    swatch,
-                    2.0,
-                    Stroke::new(1.0, theme::GAP),
-                    StrokeKind::Inside,
-                );
-                ui.label(&layer.name);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut percent = layer.opacity * 100.0;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut percent)
-                                .range(0.0..=100.0)
-                                .speed(0.5)
-                                .max_decimals(0),
-                        )
-                        .on_hover_text("Layer opacity")
-                        .changed()
-                    {
-                        layer.opacity = percent / 100.0;
-                    }
-                    ui.label(RichText::new("Norm").small().color(theme::WEAK))
-                        .on_hover_text("Blend mode: Normal (all blend modes arrive in Phase 1)");
-                });
-            });
-        });
-        let rest = ui.allocate_rect(ui.available_rect_before_wrap(), Sense::hover());
-        self.accept_preset_drop(&rest, None);
-    }
-
-    pub fn texture_set_settings_ui(&mut self, ui: &mut Ui) {
-        let Some(part) = self.viewport.parts.get(self.selected_part) else {
-            ui.label(RichText::new("No texture set selected").color(theme::WEAK));
-            return;
-        };
-        egui::Grid::new("tss")
-            .num_columns(2)
-            .spacing(vec2(12.0, 6.0))
-            .show(ui, |ui| {
-                ui.label("Texture set");
-                ui.label(RichText::new(&part.name).strong());
-                ui.end_row();
-                ui.label("Triangles");
-                ui.label(part.triangles.to_string());
-                ui.end_row();
-                ui.label("UV tiles");
-                ui.label("1001");
-                ui.end_row();
-                ui.label("Size");
-                ui.label(RichText::new("2048 × 2048  (editable in Phase 1)").color(theme::WEAK));
-                ui.end_row();
-                ui.label("Normal map format");
-                ui.label("OpenGL");
-                ui.end_row();
-            });
-        ui.add_space(8.0);
-        ui.label(theme::header("CHANNELS"));
-        egui::Grid::new("channels")
-            .num_columns(2)
-            .spacing(vec2(12.0, 4.0))
-            .show(ui, |ui| {
-                for (name, format) in [
-                    ("Base color", "sRGB8"),
-                    ("Roughness", "L8"),
-                    ("Metallic", "L8"),
-                    ("Normal", "RGB16F"),
-                    ("Height", "L16F"),
-                ] {
-                    ui.label(name);
-                    ui.label(RichText::new(format).color(theme::WEAK));
-                    ui.end_row();
-                }
-            });
-    }
-
-    pub fn properties_ui(&mut self, ui: &mut Ui) {
-        let Some(part) = self.viewport.parts.get_mut(self.selected_part) else {
-            ui.label(RichText::new("No layer selected").color(theme::WEAK));
-            return;
-        };
-        let layer = &mut part.layer;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(theme::header("FILL"));
-            ui.add_space(4.0);
-            egui::Grid::new("fill")
-                .num_columns(2)
-                .spacing(vec2(12.0, 6.0))
-                .show(ui, |ui| {
-                    ui.label("Layer name");
-                    ui.text_edit_singleline(&mut layer.name);
-                    ui.end_row();
-                    ui.label("Projection");
-                    ui.label(RichText::new("UV projection").color(theme::WEAK));
-                    ui.end_row();
-                });
-            ui.add_space(8.0);
-            ui.label(theme::header("MATERIAL"));
-            ui.add_space(4.0);
-            let m = &mut layer.material;
-            egui::Grid::new("material")
-                .num_columns(2)
-                .spacing(vec2(12.0, 6.0))
-                .show(ui, |ui| {
-                    ui.label("Base color");
-                    egui::color_picker::color_edit_button_rgba(
-                        ui,
-                        &mut m.base_color,
-                        egui::color_picker::Alpha::Opaque,
-                    );
-                    ui.end_row();
-                    ui.label("Roughness");
-                    ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0));
-                    ui.end_row();
-                    ui.label("Metallic");
-                    ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0));
-                    ui.end_row();
-                });
-        });
     }
 
     pub fn display_settings_ui(&mut self, ui: &mut Ui) {
@@ -581,15 +409,6 @@ fn drop_highlight(ui: &Ui, response: &egui::Response) {
             Stroke::new(2.0, theme::ACCENT),
             StrokeKind::Inside,
         );
-    }
-}
-
-/// Swatch color for one channel of a flat material (data channels shown as grey values).
-fn channel_color(m: &Material, channel: ViewMode) -> Color32 {
-    match channel {
-        ViewMode::Roughness => Color32::from_gray((m.roughness * 255.0) as u8),
-        ViewMode::Metallic => Color32::from_gray((m.metallic * 255.0) as u8),
-        _ => m.base_color.into(),
     }
 }
 

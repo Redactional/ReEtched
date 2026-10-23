@@ -1,13 +1,15 @@
 //! ReEtched entry point: window, GPU setup, and the frame loop.
-//! Usage: `reetched [mesh-file]`
+//! Usage: `reetched [project.retx | mesh-file]`
 
 // Release builds are a normal GUI app on Windows (no console window).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod compositor;
 mod env;
 mod panels;
 mod preview;
+mod stack_ui;
 mod theme;
 mod viewport;
 

@@ -2,7 +2,7 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 0 of 9).** You can load a mesh and look at it in a PBR viewport. Painting, layers and Substance import are not there yet. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 1 of 9 done).** You can texture a model with layers, save projects and export game-ready textures. Painting and Substance import are not there yet. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
@@ -10,7 +10,11 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - Painter-style interface: tool strip, Assets, 3D and 2D (UV) views, Texture Set List, Layers, Properties — every panel can be dragged, re-docked, closed and restored from the **Window** menu
 - PBR (metal/rough) 3D view with HDR image-based lighting, tone mapping, wireframe, perspective/orthographic cameras and solo-channel view modes
 - 2D UV view of the selected texture set
-- Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack
+- **Layer stack** like Painter's: fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image masks, drag to reorder
+- Fill layers with a color or image per channel (base color, metallic, roughness, normal, height) and UV, tri-planar or planar projection
+- Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack to add a fill layer
+- **Projects** (`.retx`): save and reopen everything, including the mesh and images; undo/redo
+- **Texture export** with presets for Unreal, Unity HDRP/URP, glTF, Blender and Godot; channel packing, padding, PNG/TGA/TIFF/EXR; import and save Painter export presets (`.spexp`)
 - Load your own **.hdr / .exr** environment maps
 - Painter-style navigation: **Alt+LMB** orbit, **Alt+MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame
 
@@ -37,13 +41,14 @@ cargo test --workspace
 ```
 crates/
   reetched-io/     mesh import (FBX, OBJ, glTF), tangent generation
-  reetched-app/    the application: UI, viewport renderer, shaders
+  reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, texture export
+  reetched-app/    the application: UI, GPU layer compositor, viewport renderer, shaders
 docs/
   PLAN.md          architecture, phases and the Substance compatibility strategy
   research/        sourced research on Painter's features, file formats and the Rust ecosystem
 ```
 
-More crates (document model, procedural graphs, baking, Substance formats) arrive with their phases — see the plan.
+More crates (procedural graphs, baking, Substance formats) arrive with their phases — see the plan.
 
 ## Substance Painter compatibility
 

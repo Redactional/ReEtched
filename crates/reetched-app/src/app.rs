@@ -11,8 +11,16 @@ use egui::{Frame, RichText, vec2};
 use egui_material_icons::icons as ic;
 use egui_tiles::{Container, Tile, TileId, Tiles};
 use glam::{Mat4, Vec2, Vec3};
+use reetched_doc::{
+    Channel, Document, Node, NodeId, Placement, Resources,
+    export::{ExportPreset, ExportSettings, builtin_presets},
+    find_node,
+    history::History,
+    insert_node, project, take_node,
+};
 use reetched_io::Mesh;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -108,7 +116,22 @@ pub struct State {
     pub uv_camera: UvCamera,
     pub bounds: (Vec3, Vec3),
     pub mesh_label: String,
+    /// The imported mesh, kept for saving projects.
+    pub mesh: Mesh,
+    pub doc: Document,
+    pub resources: Resources,
+    pub history: History,
+    /// Where the project was last saved or opened from.
+    pub project_path: Option<PathBuf>,
+    /// Selected texture set.
     pub selected_part: usize,
+    pub selected: Option<Selected>,
+    /// Folders collapsed in the layer stack.
+    pub collapsed: HashSet<NodeId>,
+    pub export: ExportUi,
+    /// Set by the export window; handled after it draws (file dialogs block).
+    pub pending_preset_import: bool,
+    pub pending_preset_save: bool,
     pub exposure_ev: f32,
     pub env_rotation_deg: f32,
     pub background_blur: f32,
@@ -117,8 +140,8 @@ pub struct State {
     pub show_uv_wireframe: bool,
     pub view_mode: ViewMode,
     pub uv_mode: ViewMode,
-    /// Which channel the layer thumbnails show.
-    pub layer_channel: ViewMode,
+    /// Which channel the layer stack's blend mode, opacity and thumbnails show.
+    pub layer_channel: Channel,
     pub tool: Tool,
     pub asset_search: String,
     pub selected_preset: Option<usize>,
@@ -128,6 +151,24 @@ pub struct State {
     started: Instant,
     adapter: String,
     quit: bool,
+}
+
+/// A selected layer (or its mask).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Selected {
+    pub node: NodeId,
+    pub mask: bool,
+}
+
+/// State of the Export Textures window.
+pub struct ExportUi {
+    pub open: bool,
+    pub dir: String,
+    pub presets: Vec<ExportPreset>,
+    pub preset: usize,
+    pub settings: ExportSettings,
+    /// Which texture sets to export.
+    pub include: Vec<bool>,
 }
 
 pub struct LogLine {
@@ -155,7 +196,24 @@ impl App {
             uv_camera: UvCamera::default(),
             bounds: (Vec3::splat(-1.0), Vec3::ONE),
             mesh_label: String::new(),
+            mesh: Mesh::uv_sphere(1.0, 4, 2),
+            doc: Document::new(None, &[]),
+            resources: Resources::default(),
+            history: History::new(&Document::new(None, &[])),
+            project_path: None,
             selected_part: 0,
+            selected: None,
+            collapsed: HashSet::new(),
+            pending_preset_import: false,
+            pending_preset_save: false,
+            export: ExportUi {
+                open: false,
+                dir: String::new(),
+                presets: builtin_presets(),
+                preset: 0,
+                settings: ExportSettings::default(),
+                include: Vec::new(),
+            },
             exposure_ev: 0.0,
             env_rotation_deg: 0.0,
             background_blur: 0.6,
@@ -164,7 +222,7 @@ impl App {
             show_uv_wireframe: true,
             view_mode: ViewMode::Material,
             uv_mode: ViewMode::Material,
-            layer_channel: ViewMode::BaseColor,
+            layer_channel: Channel::BaseColor,
             tool: Tool::Paint,
             asset_search: String::new(),
             selected_preset: None,
@@ -174,9 +232,9 @@ impl App {
             adapter: format!("{} ({:?})", adapter.name, adapter.backend),
             quit: false,
         };
-        state.set_mesh(Mesh::uv_sphere(1.0, 64, 32), "Preview sphere".into());
+        state.set_mesh(Mesh::uv_sphere(1.0, 64, 32), "Preview sphere".into(), None);
         if let Some(path) = startup_mesh {
-            state.load_mesh(&path);
+            state.open_any(&path);
         }
         Self {
             tree: default_layout(),
@@ -203,6 +261,7 @@ impl App {
         for path in dropped {
             self.state.open_any(&path);
         }
+        self.state.shortcuts(&ctx);
         // Panes report their size each frame; hidden ones stay at zero and skip rendering.
         self.state.viewport.view3d.requested_size = [0, 0];
         self.state.viewport.view2d.requested_size = [0, 0];
@@ -254,6 +313,12 @@ impl App {
         egui::CentralPanel::no_frame()
             .frame(Frame::new().fill(theme::GAP))
             .show(ui, |ui| self.tree.ui(&mut self.state, ui));
+        self.state.export_window(&ctx);
+
+        // A whole drag or text edit becomes one undo step.
+        let interacting =
+            ctx.input(|i| i.pointer.any_down()) || ctx.memory(|m| m.focused().is_some());
+        self.state.history.observe(&self.state.doc, interacting);
     }
 
     fn tile(&self, pane: Pane) -> Option<TileId> {
@@ -277,13 +342,26 @@ impl App {
     }
 
     fn menu_ui(&mut self, ui: &mut egui::Ui) {
+        let shortcut = |ui: &mut egui::Ui, label: &str, keys: &str| {
+            ui.add(egui::Button::new(label).shortcut_text(keys))
+                .clicked()
+        };
         ui.menu_button("File", |ui| {
-            if ui.button("Open mesh…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Meshes", MESH_EXTENSIONS)
-                    .pick_file()
-            {
-                self.state.load_mesh(&path);
+            if shortcut(ui, "New project from mesh…", "Ctrl+N") {
+                self.state.pick_mesh();
+            }
+            if shortcut(ui, "Open project…", "Ctrl+O") {
+                self.state.pick_project();
+            }
+            if shortcut(ui, "Save", "Ctrl+S") {
+                self.state.save(false);
+            }
+            if shortcut(ui, "Save as…", "Ctrl+Shift+S") {
+                self.state.save(true);
+            }
+            ui.separator();
+            if shortcut(ui, "Export textures…", "Ctrl+Shift+E") {
+                self.state.export.open = true;
             }
             if ui.button("Load environment…").clicked() {
                 self.state.pick_environment();
@@ -291,6 +369,17 @@ impl App {
             ui.separator();
             if ui.button("Quit").clicked() {
                 self.state.quit = true;
+            }
+        });
+        ui.menu_button("Edit", |ui| {
+            let s = &mut self.state;
+            let undo = egui::Button::new("Undo").shortcut_text("Ctrl+Z");
+            if ui.add_enabled(s.history.can_undo(), undo).clicked() {
+                s.history.undo(&mut s.doc);
+            }
+            let redo = egui::Button::new("Redo").shortcut_text("Ctrl+Y");
+            if ui.add_enabled(s.history.can_redo(), redo).clicked() {
+                s.history.redo(&mut s.doc);
             }
         });
         ui.menu_button("Window", |ui| {
@@ -357,6 +446,12 @@ impl App {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let s = &mut self.state;
+        let warnings = s
+            .viewport
+            .sync(&s.device, &s.queue, &s.doc.texture_sets, &s.resources);
+        for w in warnings {
+            s.warn(w);
+        }
         let [w, h] = s.viewport.view3d.requested_size;
         let aspect = w.max(1) as f32 / h.max(1) as f32;
         let radius = (s.bounds.1 - s.bounds.0).length() * 0.5;
@@ -377,6 +472,13 @@ impl App {
         s.viewport
             .render(&s.device, &s.queue, egui, encoder, &params);
     }
+}
+
+pub fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 fn pane_name(pane: Pane) -> String {
@@ -435,7 +537,8 @@ pub fn icon_button(
 }
 
 impl State {
-    fn open_any(&mut self, path: &Path) {
+    /// Opens a project, mesh or environment, by extension.
+    pub fn open_any(&mut self, path: &Path) {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -443,8 +546,124 @@ impl State {
             .to_ascii_lowercase();
         if ENV_EXTENSIONS.contains(&ext.as_str()) {
             self.load_environment(path);
+        } else if ext == project::EXTENSION {
+            self.open_project(path);
         } else {
             self.load_mesh(path);
+        }
+    }
+
+    pub fn pick_mesh(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Meshes", MESH_EXTENSIONS)
+            .pick_file()
+        {
+            self.load_mesh(&path);
+        }
+    }
+
+    pub fn pick_project(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("ReEtched project", &[project::EXTENSION])
+            .pick_file()
+        {
+            self.open_project(&path);
+        }
+    }
+
+    pub fn open_project(&mut self, path: &Path) {
+        match project::load(path) {
+            Ok((doc, mesh, resources)) => {
+                let name = file_name(path);
+                if doc.texture_sets.len() != mesh.parts.len() {
+                    self.error(format!("{name}: texture sets don't match the mesh"));
+                    return;
+                }
+                self.set_mesh(mesh, name.clone(), Some(doc));
+                self.resources = resources;
+                self.project_path = Some(path.to_owned());
+                self.info(format!("Opened project {name}"));
+            }
+            Err(e) => self.error(format!("Could not open project: {e:#}")),
+        }
+    }
+
+    /// Saves to the current path, or asks for one (`ask`, or never saved).
+    pub fn save(&mut self, ask: bool) {
+        let path = match (&self.project_path, ask) {
+            (Some(p), false) => p.clone(),
+            _ => {
+                let default = format!("{}.{}", self.project_name(), project::EXTENSION);
+                let Some(p) = rfd::FileDialog::new()
+                    .add_filter("ReEtched project", &[project::EXTENSION])
+                    .set_file_name(default)
+                    .save_file()
+                else {
+                    return;
+                };
+                p
+            }
+        };
+        match project::save(&path, &self.doc, &self.mesh, &self.resources) {
+            Ok(()) => {
+                self.info(format!("Saved {}", path.display()));
+                self.project_path = Some(path);
+            }
+            Err(e) => self.error(format!("Could not save: {e:#}")),
+        }
+    }
+
+    pub fn project_name(&self) -> String {
+        let stem = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().into_owned());
+        self.project_path
+            .as_deref()
+            .and_then(stem)
+            .or_else(|| {
+                self.doc
+                    .mesh_source
+                    .as_deref()
+                    .map(Path::new)
+                    .and_then(stem)
+            })
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let cmd = Modifiers::COMMAND;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let pressed = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        // Shifted versions first so Ctrl+S doesn't swallow Ctrl+Shift+S.
+        let redo = pressed(cmd_shift, Key::Z) || pressed(cmd, Key::Y);
+        let save_as = pressed(cmd_shift, Key::S);
+        let export = pressed(cmd_shift, Key::E);
+        let undo = pressed(cmd, Key::Z);
+        let save = pressed(cmd, Key::S);
+        let open = pressed(cmd, Key::O);
+        let new = pressed(cmd, Key::N);
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if redo && !typing {
+            self.history.redo(&mut self.doc);
+        }
+        if undo && !typing {
+            self.history.undo(&mut self.doc);
+        }
+        if save_as {
+            self.save(true);
+        } else if save {
+            self.save(false);
+        }
+        if export {
+            self.export.open = true;
+        }
+        if open {
+            self.pick_project();
+        }
+        if new {
+            self.pick_mesh();
+        }
+        if !typing && ctx.input(|i| i.key_pressed(Key::Delete)) {
+            self.delete_selected();
         }
     }
 
@@ -460,24 +679,120 @@ impl State {
                         "{name} has no UVs; painting will need UVs (auto-unwrap arrives in Phase 6)"
                     ));
                 }
-                self.set_mesh(mesh, name);
+                self.set_mesh(mesh, name, None);
+                self.doc.mesh_source = Some(path.display().to_string());
+                self.history = History::new(&self.doc);
+                self.project_path = None;
             }
             Err(e) => self.error(format!("Could not open mesh: {e:#}")),
         }
     }
 
-    fn set_mesh(&mut self, mesh: Mesh, name: String) {
+    /// Shows `mesh` with `doc`, or a fresh document (one texture set per material).
+    fn set_mesh(&mut self, mesh: Mesh, name: String, doc: Option<Document>) {
         self.bounds = mesh.bounds();
         self.camera.frame(self.bounds);
         self.uv_camera.zoom = 0.0;
         self.viewport.set_mesh(&self.device, &mesh);
         self.selected_part = 0;
+        self.selected = None;
         self.mesh_label = format!(
             "{name} — {} vertices, {} triangles",
             mesh.vertices.len(),
             mesh.triangle_count()
         );
+        self.doc = doc.unwrap_or_else(|| {
+            let names: Vec<String> = mesh.parts.iter().map(|p| p.material.clone()).collect();
+            Document::new(None, &names)
+        });
+        self.resources = Resources::default();
+        self.history = History::new(&self.doc);
+        self.export.include = vec![true; self.doc.texture_sets.len()];
+        self.mesh = mesh;
         self.info(format!("Loaded {}", self.mesh_label));
+    }
+
+    pub fn stack(&self) -> Option<&Vec<Node>> {
+        self.doc
+            .texture_sets
+            .get(self.selected_part)
+            .map(|s| &s.stack)
+    }
+
+    pub fn stack_mut(&mut self) -> Option<&mut Vec<Node>> {
+        self.doc
+            .texture_sets
+            .get_mut(self.selected_part)
+            .map(|s| &mut s.stack)
+    }
+
+    /// Inserts a new layer above the selected one (or at the top) and selects it.
+    pub fn add_node(&mut self, node: Node) {
+        let id = node.id;
+        let above = self.selected.map(|s| s.node);
+        let Some(stack) = self.stack_mut() else {
+            return;
+        };
+        let leftover = match above {
+            Some(target) => insert_node(stack, node, Placement::Above(target)).err(),
+            None => Some(node),
+        };
+        if let Some(node) = leftover {
+            stack.insert(0, node);
+        }
+        self.selected = Some(Selected {
+            node: id,
+            mask: false,
+        });
+    }
+
+    pub fn delete_selected(&mut self) {
+        let Some(sel) = self.selected else { return };
+        let Some(stack) = self.stack_mut() else {
+            return;
+        };
+        if sel.mask {
+            if let Some(node) = reetched_doc::find_node_mut(stack, sel.node) {
+                node.mask = None;
+            }
+            self.selected = Some(Selected { mask: false, ..sel });
+        } else {
+            take_node(stack, sel.node);
+            self.selected = None;
+        }
+    }
+
+    pub fn duplicate_selected(&mut self) {
+        let Some(sel) = self.selected else { return };
+        let Some(mut copy) = self.stack().and_then(|s| find_node(s, sel.node)).cloned() else {
+            return;
+        };
+        copy.name = format!("{} copy", copy.name);
+        self.doc.reassign_ids(&mut copy);
+        self.add_node(copy);
+    }
+
+    /// Adds an image file to the project; returns its resource id.
+    pub fn import_resource(&mut self, path: &Path) -> Option<reetched_doc::ResourceId> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.error(format!("Could not read {}: {e}", path.display()));
+                return None;
+            }
+        };
+        if let Err(e) = image::load_from_memory(&bytes) {
+            self.error(format!("{} isn't a readable image: {e}", file_name(path)));
+            return None;
+        }
+        let id = self.resources.add(bytes);
+        self.doc.resources.insert(
+            id.clone(),
+            reetched_doc::ResourceInfo {
+                name: file_name(path),
+            },
+        );
+        Some(id)
     }
 
     pub fn pick_environment(&mut self) {
@@ -506,24 +821,20 @@ impl State {
         self.thumbs = PRESETS
             .iter()
             .map(|p| {
-                let img = self.preview_env.render(&p.material(), THUMB_SIZE);
+                let img = self.preview_env.render(&p.look(), THUMB_SIZE);
                 ctx.load_texture(p.name, img, egui::TextureOptions::LINEAR)
             })
             .collect();
     }
 
-    /// Applies a preset to the selected texture set's fill layer.
+    /// Adds a fill layer with a material preset to the selected texture set (like dropping
+    /// a material onto Painter's layer stack).
     pub fn apply_preset(&mut self, index: usize) {
-        let (Some(preset), Some(part)) = (
-            PRESETS.get(index),
-            self.viewport.parts.get_mut(self.selected_part),
-        ) else {
+        let Some(preset) = PRESETS.get(index) else {
             return;
         };
-        part.layer.material = preset.material();
-        part.layer.name = preset.name.to_owned();
-        let msg = format!("Applied {} to {}", preset.name, part.name);
-        self.info(msg);
+        let node = self.doc.new_fill(preset.name.to_owned(), preset.fill());
+        self.add_node(node);
     }
 
     fn push_log(&mut self, text: String, error: bool) {
@@ -535,17 +846,17 @@ impl State {
         });
     }
 
-    fn info(&mut self, text: String) {
+    pub fn info(&mut self, text: String) {
         log::info!("{text}");
         self.push_log(text, false);
     }
 
-    fn warn(&mut self, text: String) {
+    pub fn warn(&mut self, text: String) {
         log::warn!("{text}");
         self.push_log(text, false);
     }
 
-    fn error(&mut self, text: String) {
+    pub fn error(&mut self, text: String) {
         log::error!("{text}");
         self.push_log(text, true);
     }

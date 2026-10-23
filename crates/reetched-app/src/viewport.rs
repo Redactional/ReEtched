@@ -1,8 +1,12 @@
 //! The 3D viewport and the 2D UV view: PBR + image-based lighting rendered into
 //! offscreen textures that egui displays.
 
-use crate::env::EnvImage;
+use crate::{
+    compositor::{ChannelSet, Compositor, MeshPart},
+    env::EnvImage,
+};
 use glam::{Mat4, Vec3};
+use reetched_doc::{Resources, TextureSet, export::ChannelData};
 use reetched_io::{Mesh, Vertex};
 use std::ops::Range;
 use wgpu::util::DeviceExt;
@@ -27,13 +31,6 @@ struct Globals {
     view: [f32; 4],
     uv_xform: [f32; 4],
     sh: [[f32; 4]; 9],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MaterialUniform {
-    base_color: [f32; 4],
-    rough_metal: [f32; 4],
 }
 
 #[repr(C)]
@@ -78,61 +75,17 @@ impl ViewMode {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct Material {
-    /// Linear RGB.
-    pub base_color: egui::Rgba,
-    pub roughness: f32,
-    pub metallic: f32,
-}
-
-impl Material {
-    /// What a texture set shows with no layers, like Painter's empty stack.
-    pub const EMPTY: Material = Material {
-        base_color: egui::Rgba::from_rgba_premultiplied(0.214, 0.214, 0.214, 1.0),
-        roughness: 0.5,
-        metallic: 0.0,
-    };
-
-    fn lerp(a: Material, b: Material, t: f32) -> Material {
-        let mix = |x: f32, y: f32| x + (y - x) * t;
-        Material {
-            base_color: egui::Rgba::from_rgb(
-                mix(a.base_color.r(), b.base_color.r()),
-                mix(a.base_color.g(), b.base_color.g()),
-                mix(a.base_color.b(), b.base_color.b()),
-            ),
-            roughness: mix(a.roughness, b.roughness),
-            metallic: mix(a.metallic, b.metallic),
-        }
-    }
-}
-
-/// Phase-0 stand-in for the layer stack: one fill layer per texture set.
-pub struct FillLayer {
-    pub name: String,
-    pub visible: bool,
-    /// 0..=1
-    pub opacity: f32,
-    pub material: Material,
-}
-
-impl FillLayer {
-    fn result(&self) -> Material {
-        let t = if self.visible { self.opacity } else { 0.0 };
-        Material::lerp(Material::EMPTY, self.material, t)
-    }
-}
-
 pub struct Part {
     pub name: String,
     /// Texture set visibility in the 3D view.
     pub visible: bool,
-    pub layer: FillLayer,
     pub triangles: u32,
     indices: Range<u32>,
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    /// Composited channels; `None` until the first composite.
+    set: Option<ChannelSet>,
+    bind_group: Option<wgpu::BindGroup>,
+    /// The texture set as last composited, to detect changes.
+    composited: Option<TextureSet>,
 }
 
 pub struct FrameParams {
@@ -206,6 +159,8 @@ pub struct Viewport {
     env_sh: [[f32; 4]; 9],
     prefilter: wgpu::ComputePipeline,
     mesh: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    compositor: Compositor,
+    texture_sampler: wgpu::Sampler,
 }
 
 impl Viewport {
@@ -228,7 +183,18 @@ impl Viewport {
                 ),
             ],
         );
-        let material_layout = bind_group_layout(device, &[(S::FRAGMENT, uniform_binding())]);
+        let material_layout = bind_group_layout(
+            device,
+            &[
+                (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, texture_binding(true)),
+                (
+                    S::FRAGMENT,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        );
         let hdr_layout = bind_group_layout(device, &[(S::FRAGMENT, texture_binding(false))]);
 
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/viewport.wgsl"));
@@ -363,6 +329,14 @@ impl Viewport {
             env_sh,
             prefilter,
             mesh: None,
+            compositor: Compositor::new(device, queue),
+            texture_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("channel textures"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                anisotropy_clamp: 1,
+                ..Default::default()
+            }),
         }
     }
 
@@ -387,41 +361,88 @@ impl Viewport {
         self.parts = mesh
             .parts
             .iter()
-            .map(|p| {
-                let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&p.material),
-                    size: size_of::<MaterialUniform>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.material_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    }],
-                });
-                Part {
-                    name: p.material.clone(),
-                    visible: true,
-                    layer: FillLayer {
-                        name: "Fill layer 1".into(),
-                        visible: true,
-                        opacity: 1.0,
-                        // Painter's neutral grey (sRGB 128).
-                        material: Material {
-                            roughness: 0.45,
-                            ..Material::EMPTY
-                        },
-                    },
-                    triangles: (p.indices.end - p.indices.start) / 3,
-                    indices: p.indices.clone(),
-                    uniform,
-                    bind_group,
-                }
+            .map(|p| Part {
+                name: p.material.clone(),
+                visible: true,
+                triangles: (p.indices.end - p.indices.start) / 3,
+                indices: p.indices.clone(),
+                set: None,
+                bind_group: None,
+                composited: None,
             })
             .collect();
+    }
+
+    /// Re-composites texture sets whose layer stack changed. Returns warnings.
+    pub fn sync(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sets: &[TextureSet],
+        resources: &Resources,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Some((vertices, indices)) = &self.mesh else {
+            return warnings;
+        };
+        for (part, set) in self.parts.iter_mut().zip(sets) {
+            if part.composited.as_ref() == Some(set) {
+                continue;
+            }
+            let mesh = MeshPart {
+                vertices,
+                indices,
+                range: part.indices.clone(),
+            };
+            warnings.extend(self.compositor.composite(
+                device,
+                queue,
+                &mesh,
+                set,
+                resources,
+                &mut part.set,
+            ));
+            let views = &part.set.as_ref().expect("composite creates the set").views;
+            part.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("texture set"),
+                layout: &self.material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&views[0]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&views[1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&views[2]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                    },
+                ],
+            }));
+            part.composited = Some(set.clone());
+        }
+        warnings
+    }
+
+    /// Reads texture set `index` back from the GPU (for export).
+    pub fn read_back(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        index: usize,
+    ) -> anyhow::Result<ChannelData> {
+        let set = self
+            .parts
+            .get(index)
+            .and_then(|p| p.set.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("texture set {index} hasn't been composited yet"))?;
+        self.compositor.read_back(device, queue, set)
     }
 
     pub fn set_environment(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, env: EnvImage) {
@@ -486,14 +507,6 @@ impl Viewport {
             sh: self.env_sh,
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
-        for part in &self.parts {
-            let m = part.layer.result();
-            let uniform = MaterialUniform {
-                base_color: m.base_color.to_array(),
-                rough_metal: [m.roughness, m.metallic, 0.0, 0.0],
-            };
-            queue.write_buffer(&part.uniform, 0, bytemuck::bytes_of(&uniform));
-        }
 
         if self.view3d.visible() {
             self.render_3d(encoder, p);
@@ -527,10 +540,14 @@ impl Viewport {
             if let Some((vertices, indices)) = &self.mesh {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                let visible = || self.parts.iter().filter(|part| part.visible);
+                let visible = || {
+                    self.parts
+                        .iter()
+                        .filter(|part| part.visible && part.bind_group.is_some())
+                };
                 pass.set_pipeline(&self.pipelines.pbr);
                 for part in visible() {
-                    pass.set_bind_group(1, &part.bind_group, &[]);
+                    pass.set_bind_group(1, part.bind_group.as_ref(), &[]);
                     pass.draw_indexed(part.indices.clone(), 0, 0..1);
                 }
                 if p.show_wireframe
@@ -574,8 +591,11 @@ impl Viewport {
         else {
             return;
         };
+        let Some(bind_group) = &part.bind_group else {
+            return;
+        };
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &part.bind_group, &[]);
+        pass.set_bind_group(1, bind_group, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_pipeline(&self.pipelines.uv_fill);

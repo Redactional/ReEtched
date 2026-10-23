@@ -11,6 +11,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 reetched-io = { path = "crates/reetched-io" }
+reetched-doc = { path = "crates/reetched-doc" }
 anyhow = "1"
 glam = { version = "0.34", features = ["bytemuck"] }
 log = "0.4"

@@ -81,11 +81,27 @@ fn solo(mode: u32, base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, uv: ve
 
 // ---------------------------------------------------------------- mesh
 
-struct Material {
-    base_color: vec4<f32>,   // linear
-    rough_metal: vec4<f32>,  // x: roughness, y: metallic
+// Composited texture set (see compositor.wgsl): t0 = base rgb + metallic,
+// t1 = tangent normal xyz + roughness, t2 = height, coverage, filled.
+@group(1) @binding(0) var set_t0: texture_2d<f32>;
+@group(1) @binding(1) var set_t1: texture_2d<f32>;
+@group(1) @binding(2) var set_t2: texture_2d<f32>;
+@group(1) @binding(3) var set_smp: sampler;
+
+struct Surface {
+    base: vec3<f32>,
+    metal: f32,
+    rough: f32,
+    normal_ts: vec3<f32>,
 };
-@group(1) @binding(0) var<uniform> mat: Material;
+
+fn surface(uv: vec2<f32>) -> Surface {
+    // Texture row 0 holds v = 1.
+    let t = vec2(uv.x, 1.0 - uv.y);
+    let a = textureSample(set_t0, set_smp, t);
+    let b = textureSample(set_t1, set_smp, t);
+    return Surface(a.rgb, a.a, b.a, normalize(b.xyz));
+}
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -99,6 +115,7 @@ struct VsOut {
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) tangent: vec4<f32>,
 };
 
 @vertex
@@ -108,20 +125,27 @@ fn vs_mesh(v: VsIn) -> VsOut {
     o.world = v.pos;
     o.normal = v.normal;
     o.uv = v.uv;
+    o.tangent = v.tangent;
     return o;
 }
 
 @fragment
 fn fs_pbr(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    var n = normalize(in.normal);
+    let s = surface(in.uv);
+    // MikkTSpace frame: bitangent = sign * cross(normal, tangent).
+    var geo_n = normalize(in.normal);
+    var t = in.tangent.xyz - geo_n * dot(geo_n, in.tangent.xyz);
+    t = select(normalize(t), vec3(1.0, 0.0, 0.0), dot(t, t) < 1e-8);
+    let b = cross(geo_n, t) * in.tangent.w;
+    var n = normalize(t * s.normal_ts.x + b * s.normal_ts.y + geo_n * s.normal_ts.z);
     if !front { n = -n; }
-    let base = mat.base_color.rgb;
-    let rough = clamp(mat.rough_metal.x, 0.02, 1.0);
-    let metal = mat.rough_metal.y;
+    let base = s.base;
+    let rough = clamp(s.rough, 0.02, 1.0);
+    let metal = s.metal;
 
     let mode = u32(g.view.x);
     if mode != MODE_MATERIAL {
-        return vec4(solo(mode, base, mat.rough_metal.x, metal, n, in.uv), 1.0);
+        return vec4(solo(mode, base, s.rough, metal, n, in.uv), 1.0);
     }
 
     let v = normalize(g.eye.xyz - in.world);
@@ -205,6 +229,7 @@ fn vs_uv(v: VsIn) -> VsOut {
     o.world = v.pos;
     o.normal = v.normal;
     o.uv = v.uv;
+    o.tangent = v.tangent;
     return o;
 }
 
@@ -212,7 +237,9 @@ fn vs_uv(v: VsIn) -> VsOut {
 fn fs_uv(in: VsOut) -> @location(0) vec4<f32> {
     // Unlit: "Material" mode shows base color, like Painter's 2D view.
     let mode = u32(g.view.z);
-    let c = solo(mode, mat.base_color.rgb, mat.rough_metal.x, mat.rough_metal.y, normalize(in.normal), in.uv);
+    let s = surface(in.uv);
+    // The 2D view shows the tangent-space normal map itself.
+    let c = solo(mode, s.base, s.rough, s.metal, s.normal_ts, in.uv);
     return vec4(linear_to_srgb(c), 1.0);
 }
 

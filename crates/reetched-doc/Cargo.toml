@@ -1,0 +1,18 @@
+[package]
+name = "reetched-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reetched-io.workspace = true
+anyhow.workspace = true
+bytemuck = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+blake3 = "1"
+half = "2"
+image = { version = "0.25", default-features = false, features = ["png", "tga", "tiff", "exr", "jpeg"] }

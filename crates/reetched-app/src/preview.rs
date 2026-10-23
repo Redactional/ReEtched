@@ -1,10 +1,8 @@
 //! Built-in material presets and their sphere thumbnails (shaded on the CPU).
 
-use crate::{
-    env::{EnvImage, eval_sh},
-    viewport::Material,
-};
+use crate::env::{EnvImage, eval_sh};
 use glam::Vec3;
+use reetched_doc::Fill;
 
 pub struct Preset {
     pub name: &'static str,
@@ -14,14 +12,29 @@ pub struct Preset {
     pub metallic: f32,
 }
 
+/// A flat PBR material: what a thumbnail shows.
+pub struct Look {
+    /// Linear RGB.
+    pub base: [f32; 3],
+    pub roughness: f32,
+    pub metallic: f32,
+}
+
 impl Preset {
-    pub fn material(&self) -> Material {
+    pub fn look(&self) -> Look {
         let [r, g, b] = self.base_srgb;
-        Material {
-            base_color: egui::Color32::from_rgb(r, g, b).into(),
+        let c = egui::Rgba::from(egui::Color32::from_rgb(r, g, b));
+        Look {
+            base: [c.r(), c.g(), c.b()],
             roughness: self.roughness,
             metallic: self.metallic,
         }
+    }
+
+    /// A fill layer's content for this preset.
+    pub fn fill(&self) -> Fill {
+        let l = self.look();
+        Fill::new(l.base, l.metallic, l.roughness)
     }
 }
 
@@ -70,8 +83,8 @@ impl PreviewEnv {
     }
 
     /// Lit sphere on a transparent background, viewed from +Z.
-    pub fn render(&self, m: &Material, size: usize) -> egui::ColorImage {
-        let base = Vec3::new(m.base_color.r(), m.base_color.g(), m.base_color.b());
+    pub fn render(&self, m: &Look, size: usize) -> egui::ColorImage {
+        let base = Vec3::from(m.base);
         let rough = m.roughness.clamp(0.02, 1.0);
         let f0 = Vec3::splat(0.04).lerp(base, m.metallic);
         let mut rgba = Vec::with_capacity(size * size * 4);
@@ -141,7 +154,7 @@ mod tests {
     #[test]
     fn thumbnail_is_round_with_transparent_corners() {
         let env = PreviewEnv::new(&EnvImage::procedural_sky());
-        let img = env.render(&PRESETS[0].material(), 32);
+        let img = env.render(&PRESETS[0].look(), 32);
         assert_eq!(img.size, [32, 32]);
         assert_eq!(img.pixels[0].a(), 0, "corner should be transparent");
         assert_eq!(img.pixels[16 * 32 + 16].a(), 255, "center should be opaque");
