@@ -7,10 +7,12 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 ## What works today
 
 - Load **FBX, OBJ, glTF/GLB** meshes; each material becomes a texture set, like in Painter
-- PBR (metal/rough) viewport with HDR image-based lighting, tone mapping, grid and wireframe
+- Painter-style interface: tool strip, Assets, 3D and 2D (UV) views, Texture Set List, Layers, Properties — every panel can be dragged, re-docked, closed and restored from the **Window** menu
+- PBR (metal/rough) 3D view with HDR image-based lighting, tone mapping, wireframe, perspective/orthographic cameras and solo-channel view modes
+- 2D UV view of the selected texture set
+- Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack
 - Load your own **.hdr / .exr** environment maps
 - Painter-style navigation: **Alt+LMB** orbit, **Alt+MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame
-- Dockable panels (drag tabs to rearrange)
 
 ## Building
 

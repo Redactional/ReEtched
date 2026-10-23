@@ -8,6 +8,7 @@ use std::{f32::consts::PI, path::Path};
 /// Larger HDRIs are box-downsampled to this width; the viewport never needs more.
 const MAX_WIDTH: u32 = 2048;
 
+#[derive(Clone)]
 pub struct EnvImage {
     pub width: u32,
     pub height: u32,
@@ -49,11 +50,11 @@ impl EnvImage {
                     (y as f32 + 0.5) / height as f32,
                 );
                 let up = d.y.max(0.0).sqrt();
-                let sky = Vec3::new(1.0, 1.0, 1.05).lerp(Vec3::new(0.35, 0.5, 0.85), up);
-                let ground = Vec3::splat(0.12);
+                let sky = Vec3::new(0.85, 0.83, 0.8).lerp(Vec3::new(0.45, 0.48, 0.52), up);
+                let ground = Vec3::new(0.08, 0.075, 0.07);
                 let horizon = ((d.y + 0.03) / 0.06).clamp(0.0, 1.0);
                 let c = ground.lerp(sky, horizon)
-                    + Vec3::splat(25.0) * ((d.dot(sun) - 1.0) * 300.0).exp();
+                    + Vec3::new(60.0, 57.0, 52.0) * ((d.dot(sun) - 1.0) * 250.0).exp();
                 pixels.push([c.x, c.y, c.z, 1.0]);
             }
         }
@@ -89,6 +90,36 @@ impl EnvImage {
             height: h,
             pixels,
         }
+    }
+
+    /// A copy no wider than `max_width` (box-downsampled).
+    pub fn shrunk(&self, max_width: u32) -> EnvImage {
+        let mut env = if self.width > max_width {
+            self.half()
+        } else {
+            self.clone()
+        };
+        while env.width > max_width {
+            env = env.half();
+        }
+        env
+    }
+
+    /// Bilinear lookup in the direction `d` (equirect convention above).
+    pub fn sample(&self, d: Vec3) -> Vec3 {
+        let u = d.z.atan2(d.x) / (2.0 * PI) + 0.5;
+        let v = d.y.clamp(-1.0, 1.0).acos() / PI;
+        let (x, y) = (u * self.width as f32 - 0.5, v * self.height as f32 - 0.5);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |x: f32, y: f32| {
+            let xi = (x as i32).rem_euclid(self.width as i32) as u32;
+            let yi = (y as i32).clamp(0, self.height as i32 - 1) as u32;
+            Vec3::from_slice(&self.pixels[(yi * self.width + xi) as usize])
+        };
+        let top = at(x0, y0).lerp(at(x0 + 1.0, y0), fx);
+        let bottom = at(x0, y0 + 1.0).lerp(at(x0 + 1.0, y0 + 1.0), fx);
+        top.lerp(bottom, fy)
     }
 
     pub fn mip_chain(self) -> Vec<EnvImage> {
@@ -144,6 +175,14 @@ impl EnvImage {
 }
 
 /// Real SH basis, bands 0–2. The shader's `sh_irradiance` uses the same order and constants.
+/// Diffuse radiance factor for normal `n` from `EnvImage::diffuse_sh` coefficients.
+pub fn eval_sh(sh: &[[f32; 4]; 9], n: Vec3) -> Vec3 {
+    sh.iter()
+        .zip(sh_basis(n))
+        .map(|(c, b)| Vec3::from_slice(c) * b)
+        .sum()
+}
+
 fn sh_basis(d: Vec3) -> [f32; 9] {
     let Vec3 { x, y, z } = d;
     [
@@ -163,13 +202,6 @@ fn sh_basis(d: Vec3) -> [f32; 9] {
 mod tests {
     use super::*;
 
-    fn eval(sh: &[[f32; 4]; 9], n: Vec3) -> Vec3 {
-        sh.iter()
-            .zip(sh_basis(n))
-            .map(|(c, b)| Vec3::from_slice(c) * b)
-            .sum()
-    }
-
     #[test]
     fn constant_environment_gives_unit_diffuse() {
         let env = EnvImage {
@@ -185,9 +217,9 @@ mod tests {
             Vec3::new(1.0, -1.0, 1.0).normalize(),
         ] {
             assert!(
-                eval(&sh, n).abs_diff_eq(Vec3::ONE, 0.01),
+                eval_sh(&sh, n).abs_diff_eq(Vec3::ONE, 0.01),
                 "{n}: {}",
-                eval(&sh, n)
+                eval_sh(&sh, n)
             );
         }
     }
@@ -195,7 +227,7 @@ mod tests {
     #[test]
     fn sky_is_brighter_from_above() {
         let sh = EnvImage::procedural_sky().diffuse_sh();
-        assert!(eval(&sh, Vec3::Y).x > eval(&sh, -Vec3::Y).x);
+        assert!(eval_sh(&sh, Vec3::Y).x > eval_sh(&sh, -Vec3::Y).x);
     }
 
     #[test]

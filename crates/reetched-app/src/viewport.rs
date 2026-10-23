@@ -1,5 +1,5 @@
-//! The 3D viewport: renders the mesh with PBR + image-based lighting into an
-//! offscreen texture that egui displays.
+//! The 3D viewport and the 2D UV view: PBR + image-based lighting rendered into
+//! offscreen textures that egui displays.
 
 use crate::env::EnvImage;
 use glam::{Mat4, Vec3};
@@ -9,10 +9,13 @@ use wgpu::util::DeviceExt;
 
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// egui displays these as-is, so shaders write sRGB-encoded values into a plain UNORM target.
+const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Prefiltered env mips; level i holds roughness i / (ENV_LEVELS - 1).
 const ENV_LEVELS: u32 = 6;
 const PREFILTER_SAMPLES: u32 = 128;
+/// Viewport background (#262626), display-encoded. BACKGROUND in viewport.wgsl is the linear twin.
+const BACKGROUND: f64 = 0x26 as f64 / 255.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -21,7 +24,8 @@ struct Globals {
     inv_view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     params: [f32; 4],
-    grid: [f32; 4],
+    view: [f32; 4],
+    uv_xform: [f32; 4],
     sh: [[f32; 4]; 9],
 }
 
@@ -41,7 +45,40 @@ struct PrefilterParams {
     _pad: u32,
 }
 
-/// Flat material per texture set. Replaced by the layer stack in Phase 1.
+/// What the views display. Keep in sync with the MODE_* constants in viewport.wgsl.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    Material,
+    BaseColor,
+    Roughness,
+    Metallic,
+    Normal,
+    Uv,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 6] = [
+        ViewMode::Material,
+        ViewMode::BaseColor,
+        ViewMode::Roughness,
+        ViewMode::Metallic,
+        ViewMode::Normal,
+        ViewMode::Uv,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Material => "Material",
+            ViewMode::BaseColor => "Base color",
+            ViewMode::Roughness => "Roughness",
+            ViewMode::Metallic => "Metallic",
+            ViewMode::Normal => "Normal (mesh)",
+            ViewMode::Uv => "UV coordinates",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Material {
     /// Linear RGB.
     pub base_color: egui::Rgba,
@@ -49,19 +86,49 @@ pub struct Material {
     pub metallic: f32,
 }
 
-impl Default for Material {
-    fn default() -> Self {
-        Self {
-            base_color: egui::Rgba::from_rgb(0.6, 0.6, 0.6),
-            roughness: 0.45,
-            metallic: 0.0,
+impl Material {
+    /// What a texture set shows with no layers, like Painter's empty stack.
+    pub const EMPTY: Material = Material {
+        base_color: egui::Rgba::from_rgba_premultiplied(0.214, 0.214, 0.214, 1.0),
+        roughness: 0.5,
+        metallic: 0.0,
+    };
+
+    fn lerp(a: Material, b: Material, t: f32) -> Material {
+        let mix = |x: f32, y: f32| x + (y - x) * t;
+        Material {
+            base_color: egui::Rgba::from_rgb(
+                mix(a.base_color.r(), b.base_color.r()),
+                mix(a.base_color.g(), b.base_color.g()),
+                mix(a.base_color.b(), b.base_color.b()),
+            ),
+            roughness: mix(a.roughness, b.roughness),
+            metallic: mix(a.metallic, b.metallic),
         }
+    }
+}
+
+/// Phase-0 stand-in for the layer stack: one fill layer per texture set.
+pub struct FillLayer {
+    pub name: String,
+    pub visible: bool,
+    /// 0..=1
+    pub opacity: f32,
+    pub material: Material,
+}
+
+impl FillLayer {
+    fn result(&self) -> Material {
+        let t = if self.visible { self.opacity } else { 0.0 };
+        Material::lerp(Material::EMPTY, self.material, t)
     }
 }
 
 pub struct Part {
     pub name: String,
-    pub material: Material,
+    /// Texture set visibility in the 3D view.
+    pub visible: bool,
+    pub layer: FillLayer,
     pub triangles: u32,
     indices: Range<u32>,
     uniform: wgpu::Buffer,
@@ -75,11 +142,35 @@ pub struct FrameParams {
     pub env_rotation: f32,
     /// 0 = sharp background, 1 = fully blurred.
     pub background_blur: f32,
-    pub show_grid: bool,
+    /// How much of the environment shows behind the model (0 = flat background).
+    pub env_opacity: f32,
     pub show_wireframe: bool,
-    pub grid_height: f32,
-    pub grid_cell: f32,
-    pub grid_extent: f32,
+    /// UV island edges in the 2D view.
+    pub show_uv_wireframe: bool,
+    pub view_mode: ViewMode,
+    pub uv_mode: ViewMode,
+    /// 2D view transform: ndc = uv * xy + zw.
+    pub uv_xform: [f32; 4],
+    /// Texture set shown in the 2D view.
+    pub uv_part: Option<usize>,
+}
+
+/// An offscreen texture egui displays, resized to whatever the UI asks for.
+pub struct ViewTarget {
+    pub texture_id: egui::TextureId,
+    /// Size in physical pixels the UI wants; applied at the next render. Zero = hidden.
+    pub requested_size: [u32; 2],
+    size: [u32; 2],
+}
+
+impl ViewTarget {
+    fn needs_resize(&self) -> bool {
+        self.visible() && self.size != self.requested_size
+    }
+
+    fn visible(&self) -> bool {
+        self.requested_size[0] > 0 && self.requested_size[1] > 0
+    }
 }
 
 struct Targets {
@@ -93,18 +184,18 @@ struct Pipelines {
     sky: wgpu::RenderPipeline,
     pbr: wgpu::RenderPipeline,
     wire: Option<wgpu::RenderPipeline>,
-    grid: wgpu::RenderPipeline,
     tonemap: wgpu::RenderPipeline,
+    uv_fill: wgpu::RenderPipeline,
+    uv_wire: Option<wgpu::RenderPipeline>,
 }
 
 pub struct Viewport {
-    pub texture_id: egui::TextureId,
-    /// Size in physical pixels the UI wants; applied at the next render.
-    pub requested_size: [u32; 2],
+    pub view3d: ViewTarget,
+    pub view2d: ViewTarget,
     pub parts: Vec<Part>,
     pub wireframe_supported: bool,
-    size: [u32; 2],
     targets: Targets,
+    uv_display: wgpu::TextureView,
     pipelines: Pipelines,
     globals: wgpu::Buffer,
     globals_layout: wgpu::BindGroupLayout,
@@ -123,6 +214,7 @@ impl Viewport {
         queue: &wgpu::Queue,
         egui: &mut egui_wgpu::Renderer,
         wireframe_supported: bool,
+        env: EnvImage,
     ) -> Self {
         use wgpu::ShaderStages as S;
         let globals_layout = bind_group_layout(
@@ -159,6 +251,14 @@ impl Viewport {
             blend: None,
             format: HDR_FORMAT,
         };
+        let mesh = PipelineDesc {
+            buffers: &mesh_buffers,
+            ..base
+        };
+        let lines = PipelineDesc {
+            polygon_mode: wgpu::PolygonMode::Line,
+            ..mesh
+        };
         let pipelines = Pipelines {
             sky: base
                 .with(
@@ -168,49 +268,44 @@ impl Viewport {
                     depth(false, wgpu::CompareFunction::Always),
                 )
                 .build(device),
-            pbr: PipelineDesc {
-                buffers: &mesh_buffers,
-                ..base
-            }
-            .with(
-                "vs_mesh",
-                "fs_pbr",
-                &scene_layout,
-                depth(true, wgpu::CompareFunction::Less),
-            )
-            .build(device),
-            wire: wireframe_supported.then(|| {
-                PipelineDesc {
-                    buffers: &mesh_buffers,
-                    polygon_mode: wgpu::PolygonMode::Line,
-                    ..base
-                }
+            pbr: mesh
                 .with(
-                    "vs_wire",
-                    "fs_wire",
-                    &globals_only,
-                    depth(false, wgpu::CompareFunction::LessEqual),
+                    "vs_mesh",
+                    "fs_pbr",
+                    &scene_layout,
+                    depth(true, wgpu::CompareFunction::Less),
                 )
-                .build(device)
+                .build(device),
+            wire: wireframe_supported.then(|| {
+                lines
+                    .with(
+                        "vs_wire",
+                        "fs_wire",
+                        &globals_only,
+                        depth(false, wgpu::CompareFunction::LessEqual),
+                    )
+                    .build(device)
             }),
-            grid: PipelineDesc {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                ..base
-            }
-            .with(
-                "vs_grid",
-                "fs_grid",
-                &globals_only,
-                depth(false, wgpu::CompareFunction::Less),
-            )
-            .build(device),
             tonemap: PipelineDesc {
                 format: DISPLAY_FORMAT,
                 ..base
             }
             .with("vs_fullscreen", "fs_tonemap", &tonemap_layout, None)
             .build(device),
+            uv_fill: PipelineDesc {
+                format: DISPLAY_FORMAT,
+                ..mesh
+            }
+            .with("vs_uv", "fs_uv", &scene_layout, None)
+            .build(device),
+            uv_wire: wireframe_supported.then(|| {
+                PipelineDesc {
+                    format: DISPLAY_FORMAT,
+                    ..lines
+                }
+                .with("vs_uv_wire", "fs_uv_wire", &globals_only, None)
+                .build(device)
+            }),
         };
 
         let prefilter = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -238,21 +333,26 @@ impl Viewport {
         });
 
         let targets = Targets::new(device, &hdr_layout, [64, 64]);
-        let texture_id =
-            egui.register_native_texture(device, &targets.display, wgpu::FilterMode::Linear);
-        let env = EnvImage::procedural_sky();
+        let uv_display = display_texture(device, [64, 64]);
+        let mut target = |view: &wgpu::TextureView| ViewTarget {
+            texture_id: egui.register_native_texture(device, view, wgpu::FilterMode::Linear),
+            requested_size: [64, 64],
+            size: [64, 64],
+        };
+        let view3d = target(&targets.display);
+        let view2d = target(&uv_display);
         let env_sh = env.diffuse_sh();
         let env_view = prefilter_env(device, queue, &prefilter, &env_sampler, env);
         let globals_bind_group =
             globals_bind_group(device, &globals_layout, &globals, &env_view, &env_sampler);
 
         Self {
-            texture_id,
-            requested_size: [64, 64],
+            view3d,
+            view2d,
             parts: Vec::new(),
             wireframe_supported,
-            size: [64, 64],
             targets,
+            uv_display,
             pipelines,
             globals,
             globals_layout,
@@ -304,7 +404,17 @@ impl Viewport {
                 });
                 Part {
                     name: p.material.clone(),
-                    material: Material::default(),
+                    visible: true,
+                    layer: FillLayer {
+                        name: "Fill layer 1".into(),
+                        visible: true,
+                        opacity: 1.0,
+                        // Painter's neutral grey (sRGB 128).
+                        material: Material {
+                            roughness: 0.45,
+                            ..Material::EMPTY
+                        },
+                    },
                     triangles: (p.indices.end - p.indices.start) / 3,
                     indices: p.indices.clone(),
                     uniform,
@@ -334,19 +444,25 @@ impl Viewport {
         encoder: &mut wgpu::CommandEncoder,
         p: &FrameParams,
     ) {
-        let [w, h] = self.requested_size;
-        if w == 0 || h == 0 {
-            return;
-        }
-        if self.size != [w, h] {
-            self.targets = Targets::new(device, &self.hdr_layout, [w, h]);
+        if self.view3d.needs_resize() {
+            self.targets = Targets::new(device, &self.hdr_layout, self.view3d.requested_size);
             egui.update_egui_texture_from_wgpu_texture(
                 device,
                 &self.targets.display,
                 wgpu::FilterMode::Linear,
-                self.texture_id,
+                self.view3d.texture_id,
             );
-            self.size = [w, h];
+            self.view3d.size = self.view3d.requested_size;
+        }
+        if self.view2d.needs_resize() {
+            self.uv_display = display_texture(device, self.view2d.requested_size);
+            egui.update_egui_texture_from_wgpu_texture(
+                device,
+                &self.uv_display,
+                wgpu::FilterMode::Linear,
+                self.view2d.texture_id,
+            );
+            self.view2d.size = self.view2d.requested_size;
         }
 
         let max_lod = (ENV_LEVELS - 1) as f32;
@@ -360,12 +476,18 @@ impl Viewport {
                 max_lod,
                 p.background_blur * max_lod,
             ],
-            grid: [p.grid_height, p.grid_cell, p.grid_extent, 0.0],
+            view: [
+                p.view_mode as u32 as f32,
+                p.env_opacity,
+                p.uv_mode as u32 as f32,
+                0.0,
+            ],
+            uv_xform: p.uv_xform,
             sh: self.env_sh,
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         for part in &self.parts {
-            let m = &part.material;
+            let m = part.layer.result();
             let uniform = MaterialUniform {
                 base_color: m.base_color.to_array(),
                 rough_metal: [m.roughness, m.metallic, 0.0, 0.0],
@@ -373,10 +495,22 @@ impl Viewport {
             queue.write_buffer(&part.uniform, 0, bytemuck::bytes_of(&uniform));
         }
 
+        if self.view3d.visible() {
+            self.render_3d(encoder, p);
+        }
+        if self.view2d.visible() {
+            self.render_2d(encoder, p);
+        }
+    }
+
+    fn render_3d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
-                color_attachments: &[Some(color_attachment(&self.targets.hdr))],
+                color_attachments: &[Some(color_attachment(
+                    &self.targets.hdr,
+                    wgpu::Color::TRANSPARENT,
+                ))],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
@@ -393,8 +527,9 @@ impl Viewport {
             if let Some((vertices, indices)) = &self.mesh {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                let visible = || self.parts.iter().filter(|part| part.visible);
                 pass.set_pipeline(&self.pipelines.pbr);
-                for part in &self.parts {
+                for part in visible() {
                     pass.set_bind_group(1, &part.bind_group, &[]);
                     pass.draw_indexed(part.indices.clone(), 0, 0..1);
                 }
@@ -402,28 +537,75 @@ impl Viewport {
                     && let Some(wire) = &self.pipelines.wire
                 {
                     pass.set_pipeline(wire);
-                    for part in &self.parts {
+                    for part in visible() {
                         pass.draw_indexed(part.indices.clone(), 0, 0..1);
                     }
                 }
             }
-            if p.show_grid {
-                pass.set_pipeline(&self.pipelines.grid);
-                pass.draw(0..4, 0..1);
-            }
         }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("tonemap"),
+            color_attachments: &[Some(color_attachment(
+                &self.targets.display,
+                wgpu::Color::BLACK,
+            ))],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipelines.tonemap);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.targets.hdr_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn render_2d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
+        let bg = wgpu::Color {
+            r: BACKGROUND,
+            g: BACKGROUND,
+            b: BACKGROUND,
+            a: 1.0,
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("uv view"),
+            color_attachments: &[Some(color_attachment(&self.uv_display, bg))],
+            ..Default::default()
+        });
+        let (Some((vertices, indices)), Some(part)) =
+            (&self.mesh, p.uv_part.and_then(|i| self.parts.get(i)))
+        else {
+            return;
+        };
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_bind_group(1, &part.bind_group, &[]);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_pipeline(&self.pipelines.uv_fill);
+        pass.draw_indexed(part.indices.clone(), 0, 0..1);
+        if p.show_uv_wireframe
+            && let Some(wire) = &self.pipelines.uv_wire
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tonemap"),
-                color_attachments: &[Some(color_attachment(&self.targets.display))],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.pipelines.tonemap);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            pass.set_bind_group(1, &self.targets.hdr_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            pass.set_pipeline(wire);
+            pass.draw_indexed(part.indices.clone(), 0, 0..1);
         }
     }
+}
+
+fn display_texture(device: &wgpu::Device, [width, height]: [u32; 2]) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("view display"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DISPLAY_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
 }
 
 impl Targets {
@@ -463,7 +645,7 @@ impl Targets {
         Self {
             hdr,
             depth: view(DEPTH_FORMAT, U::RENDER_ATTACHMENT),
-            display: view(DISPLAY_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
+            display: display_texture(device, [width, height]),
             hdr_bind_group,
         }
     }
@@ -606,13 +788,16 @@ fn globals_bind_group(
     })
 }
 
-fn color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+fn color_attachment(
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) -> wgpu::RenderPassColorAttachment<'_> {
     wgpu::RenderPassColorAttachment {
         view,
         depth_slice: None,
         resolve_target: None,
         ops: wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            load: wgpu::LoadOp::Clear(clear),
             store: wgpu::StoreOp::Store,
         },
     }

@@ -1,8 +1,14 @@
 //! ReEtched entry point: window, GPU setup, and the frame loop.
 //! Usage: `reetched [mesh-file]`
 
+// Release builds are a normal GUI app on Windows (no console window).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod env;
+mod panels;
+mod preview;
+mod theme;
 mod viewport;
 
 use anyhow::{Context, Result};
@@ -20,9 +26,10 @@ use std::{
 };
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,reetched_app=info,reetched_io=info"),
-    )
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        // The Vulkan loader warns about third-party overlay layers (OBS, Medal…); not our problem.
+        "warn,wgpu_hal::vulkan::instance=error,reetched_app=info,reetched_io=info",
+    ))
     .init();
     let event_loop = EventLoop::new()?;
     let mut runner = Runner {
@@ -156,6 +163,7 @@ impl Gfx {
         surface.configure(&device, &config);
 
         let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let egui_state = egui_winit::State::new(
             ctx,
             egui::ViewportId::ROOT,

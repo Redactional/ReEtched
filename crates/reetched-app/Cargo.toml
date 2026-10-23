@@ -19,6 +19,7 @@ egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
 egui_tiles = "0.18"
+egui_material_icons = "0.9"
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"

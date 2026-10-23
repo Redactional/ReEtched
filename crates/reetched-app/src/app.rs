@@ -1,46 +1,139 @@
-//! Editor UI: docked panels around the 3D viewport.
+//! Editor shell: menus, toolbars and the dockable panel layout (modelled on Substance Painter).
+//! The panels' contents live in `panels.rs`.
 
 use crate::{
     env::EnvImage,
-    viewport::{FrameParams, Viewport},
+    preview::{PRESETS, PreviewEnv},
+    theme,
+    viewport::{FrameParams, ViewMode, Viewport},
 };
-use egui::{Color32, PointerButton, Rect, Sense, pos2};
-use glam::{Mat4, Vec3};
+use egui::{Frame, RichText, vec2};
+use egui_material_icons::icons as ic;
+use egui_tiles::{Container, Tile, TileId, Tiles};
+use glam::{Mat4, Vec2, Vec3};
 use reetched_io::Mesh;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
-const MESH_EXTENSIONS: &[&str] = &["fbx", "obj", "gltf", "glb"];
-const ENV_EXTENSIONS: &[&str] = &["hdr", "exr"];
+pub const MESH_EXTENSIONS: &[&str] = &["fbx", "obj", "gltf", "glb"];
+pub const ENV_EXTENSIONS: &[&str] = &["hdr", "exr"];
+const THUMB_SIZE: usize = 96;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    Assets,
+    View3d,
+    View2d,
+    TextureSets,
+    Layers,
+    TextureSetSettings,
+    Properties,
+    DisplaySettings,
+    Log,
+}
+
+impl Pane {
+    const ALL: [Pane; 9] = [
+        Pane::Assets,
+        Pane::View3d,
+        Pane::View2d,
+        Pane::TextureSets,
+        Pane::Layers,
+        Pane::TextureSetSettings,
+        Pane::Properties,
+        Pane::DisplaySettings,
+        Pane::Log,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Pane::Assets => "ASSETS",
+            Pane::View3d => "3D VIEW",
+            Pane::View2d => "2D VIEW",
+            Pane::TextureSets => "TEXTURE SET LIST",
+            Pane::Layers => "LAYERS",
+            Pane::TextureSetSettings => "TEXTURE SET SETTINGS",
+            Pane::Properties => "PROPERTIES - FILL",
+            Pane::DisplaySettings => "DISPLAY SETTINGS",
+            Pane::Log => "LOG",
+        }
+    }
+}
+
+/// Painting tools (shown now, working from Phase 2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Paint,
+    Eraser,
+    Projection,
+    PolygonFill,
+    Smudge,
+    Clone,
+    Picker,
+    Path,
+}
+
+impl Tool {
+    const ALL: [(Tool, egui_material_icons::MaterialIcon, &'static str); 8] = [
+        (Tool::Paint, ic::ICON_BRUSH, "Paint (1)"),
+        (Tool::Eraser, ic::ICON_INK_ERASER, "Eraser (2)"),
+        (
+            Tool::Projection,
+            ic::ICON_CENTER_FOCUS_STRONG,
+            "Projection (3)",
+        ),
+        (Tool::PolygonFill, ic::ICON_PENTAGON, "Polygon fill (4)"),
+        (Tool::Smudge, ic::ICON_GESTURE, "Smudge (5)"),
+        (Tool::Clone, ic::ICON_CONTENT_COPY, "Clone (6)"),
+        (Tool::Picker, ic::ICON_COLORIZE, "Material picker (P)"),
+        (Tool::Path, ic::ICON_POLYLINE, "Path"),
+    ];
+}
+
+/// Payload when dragging a material preset out of the Assets panel.
+pub struct PresetDrag(pub usize);
 
 pub struct App {
     tree: egui_tiles::Tree<Pane>,
     state: State,
 }
 
-enum Pane {
-    Viewport,
-    Assets,
-    TextureSets,
-    LayerStack,
-    Properties,
-}
-
-struct State {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    viewport: Viewport,
-    camera: OrbitCamera,
-    bounds: (Vec3, Vec3),
-    mesh_label: String,
-    selected_part: usize,
-    exposure_ev: f32,
-    env_rotation_deg: f32,
-    background_blur: f32,
-    show_grid: bool,
-    show_wireframe: bool,
-    status: String,
+pub struct State {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub viewport: Viewport,
+    pub camera: OrbitCamera,
+    pub uv_camera: UvCamera,
+    pub bounds: (Vec3, Vec3),
+    pub mesh_label: String,
+    pub selected_part: usize,
+    pub exposure_ev: f32,
+    pub env_rotation_deg: f32,
+    pub background_blur: f32,
+    pub env_opacity: f32,
+    pub show_wireframe: bool,
+    pub show_uv_wireframe: bool,
+    pub view_mode: ViewMode,
+    pub uv_mode: ViewMode,
+    /// Which channel the layer thumbnails show.
+    pub layer_channel: ViewMode,
+    pub tool: Tool,
+    pub asset_search: String,
+    pub selected_preset: Option<usize>,
+    pub preview_env: PreviewEnv,
+    pub thumbs: Vec<egui::TextureHandle>,
+    pub log: Vec<LogLine>,
+    started: Instant,
     adapter: String,
     quit: bool,
+}
+
+pub struct LogLine {
+    pub time: String,
+    pub text: String,
+    pub error: bool,
 }
 
 impl App {
@@ -52,20 +145,32 @@ impl App {
         wireframe: bool,
         startup_mesh: Option<PathBuf>,
     ) -> Self {
+        let env = EnvImage::procedural_sky();
         let mut state = State {
             device: device.clone(),
             queue: queue.clone(),
-            viewport: Viewport::new(device, queue, egui, wireframe),
+            preview_env: PreviewEnv::new(&env),
+            viewport: Viewport::new(device, queue, egui, wireframe, env),
             camera: OrbitCamera::default(),
+            uv_camera: UvCamera::default(),
             bounds: (Vec3::splat(-1.0), Vec3::ONE),
             mesh_label: String::new(),
             selected_part: 0,
             exposure_ev: 0.0,
             env_rotation_deg: 0.0,
             background_blur: 0.6,
-            show_grid: true,
+            env_opacity: 0.0,
             show_wireframe: false,
-            status: String::new(),
+            show_uv_wireframe: true,
+            view_mode: ViewMode::Material,
+            uv_mode: ViewMode::Material,
+            layer_channel: ViewMode::BaseColor,
+            tool: Tool::Paint,
+            asset_search: String::new(),
+            selected_preset: None,
+            thumbs: Vec::new(),
+            log: Vec::new(),
+            started: Instant::now(),
             adapter: format!("{} ({:?})", adapter.name, adapter.backend),
             quit: false,
         };
@@ -84,6 +189,10 @@ impl App {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.state.thumbs.is_empty() {
+            self.state.refresh_thumbnails(&ctx);
+        }
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
@@ -94,18 +203,152 @@ impl App {
         for path in dropped {
             self.state.open_any(&path);
         }
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| self.state.menu_ui(ui));
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.state.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(&self.state.adapter)
+        // Panes report their size each frame; hidden ones stay at zero and skip rendering.
+        self.state.viewport.view3d.requested_size = [0, 0];
+        self.state.viewport.view2d.requested_size = [0, 0];
+
+        egui::Panel::top("menu")
+            .frame(
+                Frame::new()
+                    .fill(theme::HEADER)
+                    .inner_margin(vec2(6.0, 2.0)),
+            )
+            .show(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| self.menu_ui(ui));
+            });
+        egui::Panel::top("toolbar")
+            .frame(Frame::new().fill(theme::STRIP).inner_margin(vec2(6.0, 3.0)))
+            .show(ui, |ui| self.toolbar_ui(ui));
+        egui::Panel::bottom("status")
+            .frame(
+                Frame::new()
+                    .fill(theme::HEADER)
+                    .inner_margin(vec2(8.0, 3.0)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.state.status_line()).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  |  Version: {}",
+                                self.state.adapter,
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .small()
+                            .color(theme::WEAK),
+                        );
+                    });
                 });
             });
+        egui::Panel::left("tools")
+            .resizable(false)
+            .default_size(38.0)
+            .frame(Frame::new().fill(theme::STRIP).inner_margin(vec2(4.0, 6.0)))
+            .show(ui, |ui| self.state.tool_strip_ui(ui));
+        egui::Panel::right("side_strip")
+            .resizable(false)
+            .default_size(38.0)
+            .frame(Frame::new().fill(theme::STRIP).inner_margin(vec2(4.0, 6.0)))
+            .show(ui, |ui| self.side_strip_ui(ui));
+        egui::CentralPanel::no_frame()
+            .frame(Frame::new().fill(theme::GAP))
+            .show(ui, |ui| self.tree.ui(&mut self.state, ui));
+    }
+
+    fn tile(&self, pane: Pane) -> Option<TileId> {
+        self.tree.tiles.find_pane(&pane)
+    }
+
+    fn pane_visible(&self, pane: Pane) -> bool {
+        self.tile(pane)
+            .is_some_and(|id| self.tree.tiles.is_visible(id))
+    }
+
+    fn set_pane_visible(&mut self, pane: Pane, visible: bool) {
+        let Some(id) = self.tile(pane) else { return };
+        self.tree.tiles.set_visible(id, visible);
+        if visible
+            && let Some(parent) = self.tree.tiles.parent_of(id)
+            && let Some(Tile::Container(Container::Tabs(tabs))) = self.tree.tiles.get_mut(parent)
+        {
+            tabs.set_active(id);
+        }
+    }
+
+    fn menu_ui(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("Open mesh…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Meshes", MESH_EXTENSIONS)
+                    .pick_file()
+            {
+                self.state.load_mesh(&path);
+            }
+            if ui.button("Load environment…").clicked() {
+                self.state.pick_environment();
+            }
+            ui.separator();
+            if ui.button("Quit").clicked() {
+                self.state.quit = true;
+            }
         });
-        egui::CentralPanel::no_frame().show(ui, |ui| self.tree.ui(&mut self.state, ui));
+        ui.menu_button("Window", |ui| {
+            for pane in Pane::ALL {
+                let mut visible = self.pane_visible(pane);
+                if ui.checkbox(&mut visible, pane_name(pane)).changed() {
+                    self.set_pane_visible(pane, visible);
+                }
+            }
+            ui.separator();
+            if ui.button("Reset layout").clicked() {
+                self.tree = default_layout();
+            }
+        });
+    }
+
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (show3d, show2d) = (
+                self.pane_visible(Pane::View3d),
+                self.pane_visible(Pane::View2d),
+            );
+            let layouts = [
+                (ic::ICON_SPLITSCREEN_LEFT, "3D / 2D view", true, true),
+                (ic::ICON_VIEW_IN_AR, "3D view only", true, false),
+                (ic::ICON_CROP_SQUARE, "2D view only", false, true),
+            ];
+            for (icon, tip, want3d, want2d) in layouts {
+                let on = show3d == want3d && show2d == want2d;
+                if icon_button(ui, icon, on, tip).clicked() {
+                    self.set_pane_visible(Pane::View3d, want3d);
+                    self.set_pane_visible(Pane::View2d, want2d);
+                }
+            }
+            ui.separator();
+            if icon_button(ui, ic::ICON_CENTER_FOCUS_STRONG, false, "Fit view (F)").clicked() {
+                self.state.camera.frame(self.state.bounds);
+                self.state.uv_camera.zoom = 0.0;
+            }
+            ui.add_enabled_ui(false, |ui| {
+                icon_button(ui, ic::ICON_FLIP, false, "Symmetry")
+                    .on_disabled_hover_text("Symmetry — arrives with painting in Phase 2");
+            });
+        });
+    }
+
+    fn side_strip_ui(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            let items = [
+                (ic::ICON_TUNE, Pane::DisplaySettings, "Display settings"),
+                (ic::ICON_ARTICLE, Pane::Log, "Log"),
+            ];
+            for (icon, pane, tip) in items {
+                if icon_button(ui, icon, self.pane_visible(pane), tip).clicked() {
+                    self.set_pane_visible(pane, true);
+                }
+            }
+        });
     }
 
     pub fn render_viewport(
@@ -114,7 +357,7 @@ impl App {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let s = &mut self.state;
-        let [w, h] = s.viewport.requested_size;
+        let [w, h] = s.viewport.view3d.requested_size;
         let aspect = w.max(1) as f32 / h.max(1) as f32;
         let radius = (s.bounds.1 - s.bounds.0).length() * 0.5;
         let params = FrameParams {
@@ -123,42 +366,72 @@ impl App {
             exposure_ev: s.exposure_ev,
             env_rotation: s.env_rotation_deg.to_radians(),
             background_blur: s.background_blur,
-            show_grid: s.show_grid,
+            env_opacity: s.env_opacity,
             show_wireframe: s.show_wireframe,
-            grid_height: s.bounds.0.y,
-            grid_cell: 10f32.powf(radius.max(1e-4).log10().floor()) * 0.1,
-            grid_extent: radius * 10.0 + s.camera.distance * 3.0,
+            show_uv_wireframe: s.show_uv_wireframe,
+            view_mode: s.view_mode,
+            uv_mode: s.uv_mode,
+            uv_xform: s.uv_camera.xform,
+            uv_part: Some(s.selected_part),
         };
         s.viewport
             .render(&s.device, &s.queue, egui, encoder, &params);
     }
 }
 
+fn pane_name(pane: Pane) -> String {
+    let t = pane.title().trim_end_matches(" - FILL").to_lowercase();
+    let mut c = t.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
+/// Painter's default arrangement: assets | 3D + 2D views | texture sets, layers, properties.
 fn default_layout() -> egui_tiles::Tree<Pane> {
-    let mut tiles = egui_tiles::Tiles::default();
-    let mut pane = |p| tiles.insert_pane(p);
-    let (viewport, assets) = (pane(Pane::Viewport), pane(Pane::Assets));
-    let (sets, layers, props) = (
-        pane(Pane::TextureSets),
-        pane(Pane::LayerStack),
-        pane(Pane::Properties),
+    let mut tiles = Tiles::default();
+    let tabs = |tiles: &mut Tiles<Pane>, panes: &[Pane]| {
+        let ids = panes.iter().map(|&p| tiles.insert_pane(p)).collect();
+        tiles.insert_tab_tile(ids)
+    };
+    let assets = tabs(&mut tiles, &[Pane::Assets]);
+    let view3d = tabs(&mut tiles, &[Pane::View3d]);
+    let view2d = tabs(&mut tiles, &[Pane::View2d]);
+    let sets = tabs(&mut tiles, &[Pane::TextureSets]);
+    let layers = tabs(&mut tiles, &[Pane::Layers, Pane::TextureSetSettings]);
+    let props = tabs(
+        &mut tiles,
+        &[Pane::Properties, Pane::DisplaySettings, Pane::Log],
     );
-    let left = tiles.insert_vertical_tile(vec![viewport, assets]);
+    let views = tiles.insert_horizontal_tile(vec![view3d, view2d]);
     let right = tiles.insert_vertical_tile(vec![sets, layers, props]);
-    let root = tiles.insert_horizontal_tile(vec![left, right]);
-    let mut share = |container, shares: &[(egui_tiles::TileId, f32)]| {
-        if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(l))) =
-            tiles.get_mut(container)
-        {
+    let root = tiles.insert_horizontal_tile(vec![assets, views, right]);
+    let mut share = |container, shares: &[(TileId, f32)]| {
+        if let Some(Tile::Container(Container::Linear(l))) = tiles.get_mut(container) {
             for &(id, s) in shares {
                 l.shares.set_share(id, s);
             }
         }
     };
-    share(left, &[(viewport, 4.0), (assets, 1.0)]);
-    share(right, &[(sets, 1.0), (layers, 2.0), (props, 2.0)]);
-    share(root, &[(left, 3.0), (right, 1.0)]);
+    share(right, &[(sets, 1.0), (layers, 2.0), (props, 2.6)]);
+    share(root, &[(assets, 1.2), (views, 4.6), (right, 1.7)]);
     egui_tiles::Tree::new(egui::Id::unique("main_layout"), root, tiles)
+}
+
+/// Square, frameless icon button that lights up when `selected`.
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    icon: egui_material_icons::MaterialIcon,
+    selected: bool,
+    tip: &str,
+) -> egui::Response {
+    let color = if selected { theme::ACCENT } else { theme::TEXT };
+    ui.add(
+        egui::Button::new(icon.rich_text().size(18.0).color(color))
+            .frame(false)
+            .min_size(vec2(26.0, 26.0)),
+    )
+    .on_hover_text(tip)
 }
 
 impl State {
@@ -175,7 +448,7 @@ impl State {
         }
     }
 
-    fn load_mesh(&mut self, path: &Path) {
+    pub fn load_mesh(&mut self, path: &Path) {
         match reetched_io::load_mesh(path) {
             Ok(mesh) => {
                 let name = path.file_name().map_or_else(
@@ -183,9 +456,9 @@ impl State {
                     |n| n.to_string_lossy().into_owned(),
                 );
                 if !mesh.has_uvs {
-                    log::warn!(
+                    self.warn(format!(
                         "{name} has no UVs; painting will need UVs (auto-unwrap arrives in Phase 6)"
-                    );
+                    ));
                 }
                 self.set_mesh(mesh, name);
             }
@@ -196,6 +469,7 @@ impl State {
     fn set_mesh(&mut self, mesh: Mesh, name: String) {
         self.bounds = mesh.bounds();
         self.camera.frame(self.bounds);
+        self.uv_camera.zoom = 0.0;
         self.viewport.set_mesh(&self.device, &mesh);
         self.selected_part = 0;
         self.mesh_label = format!(
@@ -203,204 +477,134 @@ impl State {
             mesh.vertices.len(),
             mesh.triangle_count()
         );
-        self.status = self.mesh_label.clone();
-        log::info!("loaded {}", self.mesh_label);
+        self.info(format!("Loaded {}", self.mesh_label));
+    }
+
+    pub fn pick_environment(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("HDR images", ENV_EXTENSIONS)
+            .pick_file()
+        {
+            self.load_environment(&path);
+        }
     }
 
     fn load_environment(&mut self, path: &Path) {
         match EnvImage::load(path) {
             Ok(env) => {
+                self.preview_env = PreviewEnv::new(&env);
+                self.thumbs.clear(); // regenerated next frame with the new lighting
                 self.viewport
                     .set_environment(&self.device, &self.queue, env);
-                self.status = format!("Environment: {}", path.display());
+                self.info(format!("Environment: {}", path.display()));
             }
             Err(e) => self.error(format!("Could not open environment: {e:#}")),
         }
     }
 
-    fn error(&mut self, msg: String) {
-        log::error!("{msg}");
-        self.status = msg;
+    fn refresh_thumbnails(&mut self, ctx: &egui::Context) {
+        self.thumbs = PRESETS
+            .iter()
+            .map(|p| {
+                let img = self.preview_env.render(&p.material(), THUMB_SIZE);
+                ctx.load_texture(p.name, img, egui::TextureOptions::LINEAR)
+            })
+            .collect();
     }
 
-    fn menu_ui(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("File", |ui| {
-            if ui.button("Open mesh…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Meshes", MESH_EXTENSIONS)
-                    .pick_file()
-            {
-                self.load_mesh(&path);
-            }
-            if ui.button("Load environment…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("HDR images", ENV_EXTENSIONS)
-                    .pick_file()
-            {
-                self.load_environment(&path);
-            }
-            ui.separator();
-            if ui.button("Quit").clicked() {
-                self.quit = true;
-            }
+    /// Applies a preset to the selected texture set's fill layer.
+    pub fn apply_preset(&mut self, index: usize) {
+        let (Some(preset), Some(part)) = (
+            PRESETS.get(index),
+            self.viewport.parts.get_mut(self.selected_part),
+        ) else {
+            return;
+        };
+        part.layer.material = preset.material();
+        part.layer.name = preset.name.to_owned();
+        let msg = format!("Applied {} to {}", preset.name, part.name);
+        self.info(msg);
+    }
+
+    fn push_log(&mut self, text: String, error: bool) {
+        let secs = self.started.elapsed().as_secs();
+        self.log.push(LogLine {
+            time: format!("{:02}:{:02}", secs / 60, secs % 60),
+            text,
+            error,
         });
-        ui.menu_button("View", |ui| self.display_ui(ui));
     }
 
-    fn display_ui(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.show_grid, "Grid");
-        ui.add_enabled(
-            self.viewport.wireframe_supported,
-            egui::Checkbox::new(&mut self.show_wireframe, "Wireframe"),
-        )
-        .on_disabled_hover_text("This GPU doesn't support line rasterization");
-        ui.add(egui::Slider::new(&mut self.camera.fov_y_deg, 10.0..=90.0).text("Field of view"));
+    fn info(&mut self, text: String) {
+        log::info!("{text}");
+        self.push_log(text, false);
     }
 
-    fn viewport_ui(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
-        let ppp = ui.pixels_per_point();
-        self.viewport.requested_size = [
-            (rect.width() * ppp).round() as u32,
-            (rect.height() * ppp).round() as u32,
-        ];
-        let response = ui.allocate_rect(rect, Sense::click_and_drag());
-        ui.painter().image(
-            self.viewport.texture_id,
-            rect,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-
-        // Painter's navigation: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, wheel zoom, F to frame.
-        let (alt, scroll, frame_key) = ui.input(|i| {
-            (
-                i.modifiers.alt,
-                i.smooth_scroll_delta.y,
-                i.key_pressed(egui::Key::F),
-            )
-        });
-        let d = response.drag_delta();
-        let cam = &mut self.camera;
-        if alt && response.dragged_by(PointerButton::Primary) {
-            cam.yaw -= d.x * 0.008;
-            cam.pitch = (cam.pitch + d.y * 0.008).clamp(-1.55, 1.55);
-        }
-        if response.dragged_by(PointerButton::Middle) {
-            let (right, up) = cam.right_up();
-            let scale = cam.distance * cam.fov_y_deg.to_radians() / rect.height().max(1.0);
-            cam.target += (-right * d.x + up * d.y) * scale;
-        }
-        if alt && response.dragged_by(PointerButton::Secondary) {
-            cam.distance *= (d.y * 0.01).exp();
-        }
-        if response.hovered() && scroll != 0.0 {
-            cam.distance *= (-scroll * 0.0015).exp();
-        }
-        if response.hovered() && frame_key {
-            cam.frame(self.bounds);
-        }
+    fn warn(&mut self, text: String) {
+        log::warn!("{text}");
+        self.push_log(text, false);
     }
 
-    fn texture_sets_ui(&mut self, ui: &mut egui::Ui) {
-        ui.weak(&self.mesh_label);
-        ui.separator();
-        for (i, part) in self.viewport.parts.iter().enumerate() {
-            let label = format!("{}  ({} tris)", part.name, part.triangles);
-            if ui
-                .selectable_label(self.selected_part == i, label)
-                .clicked()
-            {
-                self.selected_part = i;
+    fn error(&mut self, text: String) {
+        log::error!("{text}");
+        self.push_log(text, true);
+    }
+
+    fn status_line(&self) -> &str {
+        self.log.last().map_or("", |l| l.text.as_str())
+    }
+
+    fn tool_strip_ui(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            for (tool, icon, name) in Tool::ALL {
+                let tip = format!("{name} — arrives with painting in Phase 2");
+                if icon_button(ui, icon, self.tool == tool, &tip).clicked() {
+                    self.tool = tool;
+                }
             }
-        }
-    }
-
-    fn properties_ui(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if let Some(part) = self.viewport.parts.get_mut(self.selected_part) {
-                ui.heading(&part.name);
-                ui.weak("Flat material (the layer stack replaces this in Phase 1)");
-                egui::Grid::new("material").num_columns(2).show(ui, |ui| {
-                    let m = &mut part.material;
-                    ui.label("Base color");
-                    egui::color_picker::color_edit_button_rgba(
-                        ui,
-                        &mut m.base_color,
-                        egui::color_picker::Alpha::Opaque,
-                    );
-                    ui.end_row();
-                    ui.label("Roughness");
-                    ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0));
-                    ui.end_row();
-                    ui.label("Metallic");
-                    ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0));
-                    ui.end_row();
-                });
-                ui.separator();
-            }
-            ui.heading("Environment");
-            if ui.button("Load HDRI…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("HDR images", ENV_EXTENSIONS)
-                    .pick_file()
-            {
-                self.load_environment(&path);
-            }
-            egui::Grid::new("environment")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Exposure (EV)");
-                    ui.add(egui::Slider::new(&mut self.exposure_ev, -6.0..=6.0));
-                    ui.end_row();
-                    ui.label("Rotation");
-                    ui.add(
-                        egui::Slider::new(&mut self.env_rotation_deg, -180.0..=180.0).suffix("°"),
-                    );
-                    ui.end_row();
-                    ui.label("Background blur");
-                    ui.add(egui::Slider::new(&mut self.background_blur, 0.0..=1.0));
-                    ui.end_row();
-                });
-            ui.separator();
-            ui.heading("Display");
-            self.display_ui(ui);
         });
     }
 }
 
 impl egui_tiles::Behavior<Pane> for State {
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
-        match pane {
-            Pane::Viewport => "3D View",
-            Pane::Assets => "Assets",
-            Pane::TextureSets => "Texture Sets",
-            Pane::LayerStack => "Layers",
-            Pane::Properties => "Properties",
-        }
-        .into()
+        theme::header(pane.title()).into()
     }
 
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
-        _tile: egui_tiles::TileId,
+        _tile: TileId,
         pane: &mut Pane,
     ) -> egui_tiles::UiResponse {
-        if let Pane::Viewport = pane {
-            self.viewport_ui(ui);
-            return egui_tiles::UiResponse::None;
+        ui.painter().rect_filled(ui.max_rect(), 0.0, theme::PANEL);
+        match pane {
+            Pane::View3d => self.view3d_ui(ui),
+            Pane::View2d => self.view2d_ui(ui),
+            pane => {
+                Frame::new().inner_margin(6.0).show(ui, |ui| match pane {
+                    Pane::Assets => self.assets_ui(ui),
+                    Pane::TextureSets => self.texture_sets_ui(ui),
+                    Pane::Layers => self.layers_ui(ui),
+                    Pane::TextureSetSettings => self.texture_set_settings_ui(ui),
+                    Pane::Properties => self.properties_ui(ui),
+                    Pane::DisplaySettings => self.display_settings_ui(ui),
+                    Pane::Log => self.log_ui(ui),
+                    Pane::View3d | Pane::View2d => {}
+                });
+            }
         }
-        egui::Frame::new()
-            .inner_margin(8.0)
-            .show(ui, |ui| match pane {
-                Pane::TextureSets => self.texture_sets_ui(ui),
-                Pane::Properties => self.properties_ui(ui),
-                _ => {
-                    ui.weak("Arrives in Phase 1.");
-                }
-            });
         egui_tiles::UiResponse::None
+    }
+
+    fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile_id: TileId) -> bool {
+        true
+    }
+
+    /// Closing hides the panel; the Window menu brings it back.
+    fn on_tab_close(&mut self, tiles: &mut Tiles<Pane>, tile_id: TileId) -> bool {
+        tiles.set_visible(tile_id, false);
+        false
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
@@ -409,42 +613,98 @@ impl egui_tiles::Behavior<Pane> for State {
             ..Default::default()
         }
     }
+
+    fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
+        26.0
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        3.0
+    }
+
+    fn tab_bar_color(&self, _visuals: &egui::Visuals) -> egui::Color32 {
+        theme::HEADER
+    }
+
+    fn tab_bg_color(
+        &self,
+        _visuals: &egui::Visuals,
+        _tiles: &Tiles<Pane>,
+        _tile_id: TileId,
+        state: &egui_tiles::TabState,
+    ) -> egui::Color32 {
+        if state.active {
+            theme::PANEL
+        } else {
+            theme::HEADER
+        }
+    }
+
+    fn tab_outline_stroke(
+        &self,
+        _visuals: &egui::Visuals,
+        _tiles: &Tiles<Pane>,
+        _tile_id: TileId,
+        _state: &egui_tiles::TabState,
+    ) -> egui::Stroke {
+        egui::Stroke::NONE
+    }
+
+    fn tab_bar_hline_stroke(&self, _visuals: &egui::Visuals) -> egui::Stroke {
+        egui::Stroke::NONE
+    }
+
+    fn tab_text_color(
+        &self,
+        _visuals: &egui::Visuals,
+        _tiles: &Tiles<Pane>,
+        _tile_id: TileId,
+        state: &egui_tiles::TabState,
+    ) -> egui::Color32 {
+        if state.active {
+            theme::TEXT
+        } else {
+            theme::WEAK
+        }
+    }
 }
 
-struct OrbitCamera {
-    target: Vec3,
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
-    fov_y_deg: f32,
+pub struct OrbitCamera {
+    pub target: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub fov_y_deg: f32,
+    pub orthographic: bool,
 }
 
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self {
             target: Vec3::ZERO,
-            yaw: 0.6,
-            pitch: 0.25,
+            yaw: 0.0,
+            pitch: 0.1,
             distance: 4.0,
             fov_y_deg: 40.0,
+            orthographic: false,
         }
     }
 }
 
 impl OrbitCamera {
-    fn eye(&self) -> Vec3 {
+    pub fn eye(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         self.target + Vec3::new(cp * sy, sp, cp * cy) * self.distance
     }
 
-    fn right_up(&self) -> (Vec3, Vec3) {
+    pub fn right_up(&self) -> (Vec3, Vec3) {
         let forward = (self.target - self.eye()).normalize();
         let right = forward.cross(Vec3::Y).normalize();
         (right, right.cross(forward))
     }
 
-    fn frame(&mut self, (lo, hi): (Vec3, Vec3)) {
+    pub fn frame(&mut self, (lo, hi): (Vec3, Vec3)) {
         let radius = ((hi - lo).length() * 0.5).max(1e-4);
         self.target = (lo + hi) * 0.5;
         self.distance = radius / (self.fov_y_deg.to_radians() * 0.5).sin() * 1.1;
@@ -453,13 +713,42 @@ impl OrbitCamera {
     fn view_proj(&self, aspect: f32, scene_radius: f32) -> Mat4 {
         let near = (self.distance - scene_radius * 2.0).max(self.distance * 0.001);
         let far = self.distance * 20.0 + scene_radius * 20.0;
+        let fov = self.fov_y_deg.to_radians();
         // wgpu clip space: z in [0, 1], y up — glam's "directx" convention.
-        let proj = glam::camera::rh::proj::directx::perspective(
-            self.fov_y_deg.to_radians(),
-            aspect,
-            near,
-            far,
-        );
+        use glam::camera::rh::proj::directx;
+        let proj = if self.orthographic {
+            let h = self.distance * (fov * 0.5).tan();
+            directx::orthographic(-h * aspect, h * aspect, -h, h, near, far)
+        } else {
+            directx::perspective(fov, aspect, near, far)
+        };
         proj * glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Y)
+    }
+}
+
+/// Pan/zoom for the 2D UV view.
+#[derive(Default)]
+pub struct UvCamera {
+    /// UV coordinate at the center of the view.
+    pub center: Vec2,
+    /// Points per UV unit; 0 means "frame the 0–1 tile on the next draw".
+    pub zoom: f32,
+    /// Shader transform: ndc = uv * xy + zw.
+    pub xform: [f32; 4],
+}
+
+impl UvCamera {
+    pub fn update(&mut self, size: egui::Vec2) {
+        if self.zoom <= 0.0 {
+            self.center = Vec2::splat(0.5);
+            self.zoom = size.x.min(size.y) * 0.85;
+        }
+        let (sx, sy) = (2.0 * self.zoom / size.x, 2.0 * self.zoom / size.y);
+        self.xform = [sx, sy, -self.center.x * sx, -self.center.y * sy];
+    }
+
+    pub fn to_screen(&self, rect: egui::Rect, uv: Vec2) -> egui::Pos2 {
+        let d = (uv - self.center) * self.zoom;
+        rect.center() + vec2(d.x, -d.y)
     }
 }

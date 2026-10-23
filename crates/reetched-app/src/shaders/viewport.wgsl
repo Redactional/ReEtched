@@ -1,4 +1,5 @@
-// Viewport: sky, PBR mesh, wireframe, grid (into an HDR target), then tone mapping.
+// Viewport: sky + PBR mesh + wireframe into an HDR target, then tone mapping.
+// Also the 2D UV view, drawn straight to its display target.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -6,8 +7,10 @@ struct Globals {
     eye: vec4<f32>,
     // x: exposure multiplier, y: env rotation (radians), z: env max lod, w: background lod
     params: vec4<f32>,
-    // x: grid plane height, y: grid cell size, z: grid extent
-    grid: vec4<f32>,
+    // x: 3D view mode, y: environment opacity, z: 2D view mode
+    view: vec4<f32>,
+    // 2D view: ndc = uv * xy + zw
+    uv_xform: vec4<f32>,
     sh: array<vec4<f32>, 9>,
 };
 
@@ -16,6 +19,16 @@ struct Globals {
 @group(0) @binding(2) var env_smp: sampler;
 
 const PI: f32 = 3.14159265;
+// Viewport background, linear (#262626 like Painter).
+const BACKGROUND: vec3<f32> = vec3(0.0194, 0.0194, 0.0194);
+
+// View modes; keep in sync with ViewMode in viewport.rs.
+const MODE_MATERIAL: u32 = 0u;
+const MODE_BASE_COLOR: u32 = 1u;
+const MODE_ROUGHNESS: u32 = 2u;
+const MODE_METALLIC: u32 = 3u;
+const MODE_NORMAL: u32 = 4u;
+const MODE_UV: u32 = 5u;
 
 // Rotates a world direction into the environment's frame.
 fn env_frame(d: vec3<f32>) -> vec3<f32> {
@@ -45,6 +58,27 @@ fn sh_irradiance(n_world: vec3<f32>) -> vec3<f32> {
     return max(e, vec3(0.0));
 }
 
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let c0 = max(c, vec3(0.0));
+    return select(1.055 * pow(c0, vec3(1.0 / 2.4)) - 0.055, c0 * 12.92, c0 <= vec3(0.0031308));
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, c <= vec3(0.04045));
+}
+
+// Solo-channel output, linear (encoded for display afterwards). Base color is already
+// linear; data channels are shown as raw values (0.5 roughness = 50% grey on screen).
+fn solo(mode: u32, base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    switch mode {
+        case MODE_ROUGHNESS: { return srgb_to_linear(vec3(rough)); }
+        case MODE_METALLIC: { return srgb_to_linear(vec3(metal)); }
+        case MODE_NORMAL: { return srgb_to_linear(n * 0.5 + 0.5); }
+        case MODE_UV: { return srgb_to_linear(vec3(fract(uv), 0.0)); }
+        default: { return base; }
+    }
+}
+
 // ---------------------------------------------------------------- mesh
 
 struct Material {
@@ -64,6 +98,7 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 };
 
 @vertex
@@ -72,6 +107,7 @@ fn vs_mesh(v: VsIn) -> VsOut {
     o.clip = g.view_proj * vec4(v.pos, 1.0);
     o.world = v.pos;
     o.normal = v.normal;
+    o.uv = v.uv;
     return o;
 }
 
@@ -79,10 +115,16 @@ fn vs_mesh(v: VsIn) -> VsOut {
 fn fs_pbr(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     var n = normalize(in.normal);
     if !front { n = -n; }
-    let v = normalize(g.eye.xyz - in.world);
     let base = mat.base_color.rgb;
     let rough = clamp(mat.rough_metal.x, 0.02, 1.0);
     let metal = mat.rough_metal.y;
+
+    let mode = u32(g.view.x);
+    if mode != MODE_MATERIAL {
+        return vec4(solo(mode, base, mat.rough_metal.x, metal, n, in.uv), 1.0);
+    }
+
+    let v = normalize(g.eye.xyz - in.world);
     let f0 = mix(vec3(0.04), base, metal);
     let nv = max(dot(n, v), 1e-4);
 
@@ -125,11 +167,15 @@ fn vs_fullscreen(@builtin(vertex_index) i: u32) -> Fullscreen {
     return o;
 }
 
+// Alpha carries how much environment shows through over the flat background.
 @fragment
 fn fs_sky(in: Fullscreen) -> @location(0) vec4<f32> {
+    if u32(g.view.x) != MODE_MATERIAL {
+        return vec4(0.0);
+    }
     let far = g.inv_view_proj * vec4(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - g.eye.xyz);
-    return vec4(env(dir, g.params.w), 1.0);
+    return vec4(env(dir, g.params.w), g.view.y);
 }
 
 @group(1) @binding(0) var hdr_tex: texture_2d<f32>;
@@ -141,39 +187,41 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_tonemap(in: Fullscreen) -> @location(0) vec4<f32> {
-    let c = textureLoad(hdr_tex, vec2<i32>(in.clip.xy), 0).rgb * g.params.x;
-    return vec4(aces(c), 1.0); // target is *Srgb, so encoding happens in hardware
+    let c = textureLoad(hdr_tex, vec2<i32>(in.clip.xy), 0);
+    var rgb = c.rgb;
+    if u32(g.view.x) == MODE_MATERIAL {
+        rgb = aces(rgb * g.params.x);
+    }
+    // egui shows the display texture as-is, so encode to sRGB here.
+    return vec4(linear_to_srgb(mix(BACKGROUND, rgb, c.a)), 1.0);
 }
 
-// ---------------------------------------------------------------- grid
-
-struct GridOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-};
+// ---------------------------------------------------------------- 2D UV view
 
 @vertex
-fn vs_grid(@builtin(vertex_index) i: u32) -> GridOut {
-    let corner = vec2(f32(i & 1u), f32(i >> 1u)) * 2.0 - 1.0;
-    let world = vec3(g.eye.x + corner.x * g.grid.z, g.grid.x, g.eye.z + corner.y * g.grid.z);
-    var o: GridOut;
-    o.clip = g.view_proj * vec4(world, 1.0);
-    o.world = world;
+fn vs_uv(v: VsIn) -> VsOut {
+    var o: VsOut;
+    o.clip = vec4(v.uv * g.uv_xform.xy + g.uv_xform.zw, 0.0, 1.0);
+    o.world = v.pos;
+    o.normal = v.normal;
+    o.uv = v.uv;
     return o;
 }
 
-fn grid_lines(p: vec2<f32>) -> f32 {
-    let w = fwidth(p);
-    let d = abs(fract(p - 0.5) - 0.5) / max(w, vec2(1e-6));
-    return 1.0 - min(min(d.x, d.y), 1.0);
+@fragment
+fn fs_uv(in: VsOut) -> @location(0) vec4<f32> {
+    // Unlit: "Material" mode shows base color, like Painter's 2D view.
+    let mode = u32(g.view.z);
+    let c = solo(mode, mat.base_color.rgb, mat.rough_metal.x, mat.rough_metal.y, normalize(in.normal), in.uv);
+    return vec4(linear_to_srgb(c), 1.0);
+}
+
+@vertex
+fn vs_uv_wire(v: VsIn) -> @builtin(position) vec4<f32> {
+    return vec4(v.uv * g.uv_xform.xy + g.uv_xform.zw, 0.0, 1.0);
 }
 
 @fragment
-fn fs_grid(in: GridOut) -> @location(0) vec4<f32> {
-    let p = in.world.xz / g.grid.y;
-    let minor = grid_lines(p);
-    let major = grid_lines(p / 10.0);
-    let fade = 1.0 - smoothstep(0.2, 1.0, length(in.world.xz - g.eye.xz) / g.grid.z);
-    let a = max(minor * 0.2, major * 0.5) * fade;
-    return vec4(vec3(0.6), a);
+fn fs_uv_wire() -> @location(0) vec4<f32> {
+    return vec4(0.1, 0.1, 0.1, 1.0); // already display-encoded
 }
