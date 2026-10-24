@@ -244,7 +244,7 @@ impl Expr {
 }
 
 /// A dynamic stroke: expressions for the dab count and each dab's behavior.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Dynamics {
     pub name: String,
     /// Dabs per stamp.

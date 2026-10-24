@@ -44,6 +44,8 @@ struct RowCtx<'a> {
     collapsed: &'a HashSet<NodeId>,
     channel: Channel,
     actions: Vec<StackAction>,
+    /// Content thumbnails by (layer, mask?).
+    thumbs: std::collections::HashMap<(NodeId, bool), egui::TextureId>,
 }
 
 impl State {
@@ -132,6 +134,7 @@ impl State {
         });
         ui.separator();
 
+        let thumbs = self.layer_thumbnails(ui.ctx(), self.layer_channel);
         let Some(set) = self.doc.texture_sets.get_mut(self.selected_part) else {
             ui.label(RichText::new("No texture set").color(theme::WEAK));
             return;
@@ -141,6 +144,7 @@ impl State {
             collapsed: &self.collapsed,
             channel: self.layer_channel,
             actions: Vec::new(),
+            thumbs,
         };
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -424,6 +428,7 @@ impl State {
         let mut pick: Option<BitmapSlot> = None;
         let mut clear: Option<BitmapSlot> = None;
         let mut text: Option<BitmapSlot> = None;
+        let mut save_mask = false;
         let mut show_brush = false;
         let channels = self
             .doc
@@ -502,6 +507,10 @@ impl State {
                     }
                     ui.add_space(8.0);
                     effect_req = crate::effects_ui::mask_effects_ui(ui, mask, &maps);
+                    ui.add_space(8.0);
+                    if ui.button("Save as smart mask…").clicked() {
+                        save_mask = true;
+                    }
                     return;
                 }
 
@@ -643,6 +652,9 @@ impl State {
                     });
             });
 
+        if save_mask {
+            self.save_smart_mask();
+        }
         if let Some(i) = effect_req.pick_color {
             self.id_pick = Some((sel.node, i));
             self.info("Click the model to pick an ID color".into());
@@ -977,13 +989,31 @@ impl State {
 
     fn run_export(&mut self) {
         let dir = PathBuf::from(self.export.dir.trim());
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.error(format!("Could not create {}: {e}", dir.display()));
-            return;
-        }
         let Some(preset) = self.export.presets.get(self.export.preset).cloned() else {
             return;
         };
+        let (settings, include) = (self.export.settings.clone(), self.export.include.clone());
+        match self.export_textures(&dir, &preset, &settings, &include) {
+            Ok(files) => {
+                let n: usize = files.values().map(Vec::len).sum();
+                self.info(format!("Exported {n} textures to {}", dir.display()));
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Writes the included texture sets' textures into `dir`; returns the files
+    /// written per texture set.
+    pub(crate) fn export_textures(
+        &mut self,
+        dir: &std::path::Path,
+        preset: &reetched_doc::export::ExportPreset,
+        settings: &reetched_doc::export::ExportSettings,
+        include: &[bool],
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<PathBuf>>> {
+        use anyhow::Context;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Could not create {}", dir.display()))?;
         // Make sure every composite reflects the current document.
         let warnings = self.viewport.sync(
             &self.device,
@@ -997,15 +1027,15 @@ impl State {
         }
         let project = self.project_name();
         let mesh = mesh_name(&self.doc.mesh_source);
-        let mut written = 0;
+        let mut out = std::collections::BTreeMap::new();
         for (i, set) in self.doc.texture_sets.clone().iter().enumerate() {
-            if !self.export.include.get(i).copied().unwrap_or(false) {
+            if !include.get(i).copied().unwrap_or(false) {
                 continue;
             }
             let tiles = self.viewport.tiles(i);
             let udim = tiles.len() > 1 || set.is_udim();
             for tile in tiles {
-                let result = self
+                let files = self
                     .viewport
                     .read_back(&self.device, &self.queue, i, tile)
                     .map(|mut data| {
@@ -1014,37 +1044,52 @@ impl State {
                     })
                     .and_then(|data| {
                         export_texture_set(
-                            &preset,
-                            &self.export.settings,
+                            preset,
+                            settings,
                             &data,
-                            &dir,
+                            dir,
                             (&project, &mesh, &set.name),
                             udim.then_some(tile),
                         )
-                    });
-                match result {
-                    Ok(files) => written += files.len(),
-                    Err(e) => {
-                        self.error(format!("Export of {} failed: {e:#}", set.name));
-                        return;
-                    }
-                }
+                    })
+                    .with_context(|| format!("Export of {} failed", set.name))?;
+                out.entry(set.name.clone())
+                    .or_insert_with(Vec::new)
+                    .extend(files);
             }
         }
-        self.info(format!("Exported {written} textures to {}", dir.display()));
+        Ok(out)
     }
 }
 
 impl State {
     /// Writes the mesh (USD, USDZ or OBJ) and the textures it references.
     pub fn export_mesh(&mut self) {
+        let dir = PathBuf::from(self.export.dir.trim());
+        let format = self.export.mesh_format;
+        let name = mesh_name(&self.doc.mesh_source);
+        let path = dir.join(format!("{name}.{}", format.extension()));
+        match self.export_mesh_to(&path, format) {
+            Ok(()) => self.info(format!("Exported {}", path.display())),
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Writes the mesh to `path`, with its textures (current preset) beside it.
+    pub(crate) fn export_mesh_to(
+        &mut self,
+        path: &std::path::Path,
+        format: MeshFormat,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
         use reetched_doc::export::{UDIM_TOKEN, expand_name};
         use reetched_io::export::{MaterialFiles, write_obj, write_usda, write_usdc, write_usdz};
-        let dir = PathBuf::from(self.export.dir.trim());
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.error(format!("Could not create {}: {e}", dir.display()));
-            return;
-        }
+        let dir = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_owned();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Could not create {}", dir.display()))?;
         for w in self.viewport.sync(
             &self.device,
             &self.queue,
@@ -1078,15 +1123,8 @@ impl State {
                         )?;
                         Ok(data)
                     });
-                match result {
-                    Ok(data) => {
-                        heights.insert((i, tile), (data.width, data.height_map));
-                    }
-                    Err(e) => {
-                        self.error(format!("Export of {} failed: {e:#}", set.name));
-                        return;
-                    }
-                }
+                let data = result.with_context(|| format!("Export of {} failed", set.name))?;
+                heights.insert((i, tile), (data.width, data.height_map));
             }
             // The preset's maps, in order: base color, metallic, roughness, normal, height,
             // emissive, opacity. UDIM sets reference all tiles through the <UDIM> token.
@@ -1121,18 +1159,13 @@ impl State {
             h[(y * res + x) as usize] * scale
         };
         let displace: Option<reetched_io::export::Displace> = (scale > 0.0).then_some(&displace);
-        let format = self.export.mesh_format;
-        let path = dir.join(format!("{mesh_name}.{}", format.extension()));
-        let result = match format {
-            MeshFormat::Usda => write_usda(&path, &self.mesh, displace, &materials),
-            MeshFormat::Usdc => write_usdc(&path, &self.mesh, displace, &materials),
-            MeshFormat::Usdz => write_usdz(&path, &self.mesh, displace, &materials, &dir),
-            MeshFormat::Obj => write_obj(&path, &self.mesh, displace, &materials),
-        };
-        match result {
-            Ok(()) => self.info(format!("Exported {}", path.display())),
-            Err(e) => self.error(format!("Mesh export failed: {e:#}")),
+        match format {
+            MeshFormat::Usda => write_usda(path, &self.mesh, displace, &materials),
+            MeshFormat::Usdc => write_usdc(path, &self.mesh, displace, &materials),
+            MeshFormat::Usdz => write_usdz(path, &self.mesh, displace, &materials, &dir),
+            MeshFormat::Obj => write_obj(path, &self.mesh, displace, &materials),
         }
+        .context("Mesh export failed")
     }
 }
 
@@ -1271,26 +1304,33 @@ fn node_row(ui: &mut Ui, node: &mut Node, depth: usize, ctx: &mut RowCtx) {
                 }
                 // Thumbnail.
                 let (thumb, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
-                match &node.kind {
-                    NodeKind::Fill(fill) => {
-                        ui.painter()
-                            .rect_filled(thumb, 2.0, swatch(fill, ctx.channel));
-                    }
-                    NodeKind::Paint(_) | NodeKind::Folder { .. } => {
-                        let icon = if folder {
-                            ic::ICON_FOLDER
-                        } else {
-                            ic::ICON_BRUSH
-                        };
-                        ui.painter()
-                            .rect_filled(thumb, 2.0, Color32::from_gray(0x3a));
-                        ui.painter().text(
-                            thumb.center(),
-                            egui::Align2::CENTER_CENTER,
-                            icon.codepoint,
-                            egui::FontId::new(18.0, icon.font_family()),
-                            theme::WEAK,
-                        );
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                if let Some(tex) = ctx.thumbs.get(&(id, false)) {
+                    ui.painter()
+                        .rect_filled(thumb, 2.0, Color32::from_gray(0x3a));
+                    ui.painter().image(*tex, thumb, uv, Color32::WHITE);
+                } else {
+                    match &node.kind {
+                        NodeKind::Fill(fill) => {
+                            ui.painter()
+                                .rect_filled(thumb, 2.0, swatch(fill, ctx.channel));
+                        }
+                        NodeKind::Paint(_) | NodeKind::Folder { .. } => {
+                            let icon = if folder {
+                                ic::ICON_FOLDER
+                            } else {
+                                ic::ICON_BRUSH
+                            };
+                            ui.painter()
+                                .rect_filled(thumb, 2.0, Color32::from_gray(0x3a));
+                            ui.painter().text(
+                                thumb.center(),
+                                egui::Align2::CENTER_CENTER,
+                                icon.codepoint,
+                                egui::FontId::new(18.0, icon.font_family()),
+                                theme::WEAK,
+                            );
+                        }
                     }
                 }
                 ui.painter().rect_stroke(
@@ -1307,15 +1347,21 @@ fn node_row(ui: &mut Ui, node: &mut Node, depth: usize, ctx: &mut RowCtx) {
                         (false, MaskBackground::White) => Color32::WHITE,
                         (false, MaskBackground::Black) => Color32::BLACK,
                     };
+                    let tint = if mask.enabled {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_gray(80)
+                    };
                     ui.painter().rect_filled(
                         m,
                         2.0,
-                        if mask.enabled {
-                            fill
-                        } else {
-                            fill.gamma_multiply(0.3)
-                        },
+                        fill.gamma_multiply(if mask.enabled { 1.0 } else { 0.3 }),
                     );
+                    if let Some(tex) = ctx.thumbs.get(&(id, true)) {
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter().image(*tex, m, uv, tint);
+                    }
                     let stroke = if mask_selected {
                         Stroke::new(1.5, theme::ACCENT)
                     } else {

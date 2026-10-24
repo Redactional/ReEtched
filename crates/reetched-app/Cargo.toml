@@ -26,6 +26,9 @@ reetched-graph.workspace = true
 reetched-substance.workspace = true
 reetched-color.workspace = true
 reetched-shader.workspace = true
+reetched-trace.workspace = true
+reetched-library = { path = "../reetched-library" }
+reetched-script = { path = "../reetched-script" }
 naga = "30.0.1"
 serde_json = "1"
 wgpu = { version = "30", features = ["naga-ir"] }
@@ -36,6 +39,10 @@ env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["hdr", "exr", "png", "jpeg", "tga", "tiff"] }
 rfd = "0.17"
 resvg = "0.48"
+dirs = "6"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+rayon = "1.12"
 
 [dev-dependencies]
 psd = "0.3"

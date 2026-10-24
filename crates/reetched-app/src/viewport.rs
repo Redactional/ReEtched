@@ -158,6 +158,11 @@ pub struct RenderSettings {
     pub aperture: f32,
     /// Focus distance; 0 focuses on the orbit target.
     pub focus: f32,
+    /// Render the material view with the GPU path tracer.
+    pub path_trace: bool,
+    pub bounces: u32,
+    /// Samples per pixel the path tracer stops at.
+    pub trace_samples: u32,
 }
 
 impl Default for RenderSettings {
@@ -177,6 +182,9 @@ impl Default for RenderSettings {
             dof: false,
             aperture: 0.02,
             focus: 0.0,
+            path_trace: false,
+            bounces: reetched_trace::FrameInputs::DEFAULT_BOUNCES,
+            trace_samples: 512,
         }
     }
 }
@@ -399,6 +407,20 @@ pub struct DisplayLut {
     pub data: Vec<[f32; 3]>,
 }
 
+/// Material textures the path tracer samples are this size (any tile resolution).
+// ponytail: fixed 1024² (32 MB per tile); follow the tile resolution if detail matters.
+const TRACE_MATERIAL_SIZE: u32 = 1024;
+
+/// The path tracer, created the first time it is turned on.
+struct Trace {
+    tracer: reetched_trace::PathTracer,
+    materials: reetched_trace::Materials,
+    /// The current mesh is uploaded (cleared by `set_mesh`).
+    has_mesh: bool,
+    /// `scene_version` the material layers were copied at.
+    scene: Option<u64>,
+}
+
 pub struct Viewport {
     pub view3d: ViewTarget,
     pub view2d: ViewTarget,
@@ -437,6 +459,7 @@ pub struct Viewport {
     compositor: Compositor,
     paint: PaintGpu,
     texture_sampler: wgpu::Sampler,
+    trace: Option<Trace>,
 }
 
 impl Viewport {
@@ -685,7 +708,7 @@ impl Viewport {
             module: &device.create_shader_module(wgpu::include_wgsl!("shaders/prefilter.wgsl")),
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::gpu_cache::get(),
         });
         let env_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("env"),
@@ -785,6 +808,7 @@ impl Viewport {
                 anisotropy_clamp: 1,
                 ..Default::default()
             }),
+            trace: None,
         }
     }
 
@@ -808,6 +832,9 @@ impl Viewport {
         ));
         let (lo, hi) = mesh.bounds();
         self.mesh_scale = (hi - lo).length().max(1e-6);
+        if let Some(t) = &mut self.trace {
+            t.has_mesh = false;
+        }
         let bounds = |r: &Range<u32>| {
             mesh.indices[r.start as usize..r.end as usize].iter().fold(
                 (Vec3::MAX, Vec3::MIN),
@@ -974,6 +1001,12 @@ impl Viewport {
     ) -> anyhow::Result<Vec<(PaintKey, TileMap)>> {
         self.paint
             .end(device, queue, &mut self.compositor, resources)
+    }
+
+    /// Keeps the compositor's caches within `budget` bytes (between frames).
+    pub fn end_frame(&mut self, budget: u64) {
+        let painting = self.paint.active();
+        self.compositor.trim(budget, painting);
     }
 
     /// Brush alpha image as a GPU texture.
@@ -1223,6 +1256,51 @@ impl Viewport {
             .map_or_else(Vec::new, Part::tile_numbers)
     }
 
+    /// The path tracer needs the mesh (first use, or the mesh changed).
+    pub fn trace_needs_mesh(&self) -> bool {
+        self.trace.as_ref().is_none_or(|t| !t.has_mesh)
+    }
+
+    /// Builds the path tracer's BVH for `mesh` (the one last passed to `set_mesh`).
+    pub fn set_trace_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &Mesh,
+    ) -> anyhow::Result<()> {
+        // One material layer per (texture set, UDIM tile), in `parts` order.
+        let mut layer_of_triangle = vec![0u32; mesh.indices.len() / 3];
+        let tiles = self.parts.iter().flat_map(|p| &p.tiles);
+        let mut layers = 0;
+        for (k, tile) in tiles.enumerate() {
+            let tris = tile.indices.start as usize / 3..tile.indices.end as usize / 3;
+            layer_of_triangle[tris].fill(k as u32);
+            layers = k as u32 + 1;
+        }
+        let layers = layers.max(1);
+        let trace = self.trace.get_or_insert_with(|| Trace {
+            tracer: reetched_trace::PathTracer::new(device),
+            materials: reetched_trace::Materials::new(device, queue, TRACE_MATERIAL_SIZE, layers),
+            has_mesh: false,
+            scene: None,
+        });
+        if trace.materials.layers() < layers {
+            trace.materials =
+                reetched_trace::Materials::new(device, queue, TRACE_MATERIAL_SIZE, layers);
+        }
+        let took = trace.tracer.set_mesh(device, mesh, &layer_of_triangle)?;
+        log::info!("path tracer BVH built in {took:?}");
+        trace.has_mesh = true;
+        trace.scene = None;
+        self.last_key = None;
+        Ok(())
+    }
+
+    /// Samples per pixel the path tracer has so far (0 when it isn't running).
+    pub fn trace_samples(&self) -> u32 {
+        self.trace.as_ref().map_or(0, |t| t.tracer.samples())
+    }
+
     pub fn set_environment(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, env: EnvImage) {
         self.env_sh = env.diffuse_sh();
         self.env_view = prefilter_env(device, queue, &self.prefilter, &self.env_sampler, env);
@@ -1316,8 +1394,11 @@ impl Viewport {
             self.accum = 0;
             self.last_key = Some(key);
         }
+        let tracing = p.render.path_trace
+            && p.view_mode == ViewMode::Material
+            && self.trace.as_ref().is_some_and(|t| t.has_mesh);
         let accumulate = p.render.accumulate && p.view_mode == ViewMode::Material;
-        let n = if accumulate { self.accum } else { 0 };
+        let n = if accumulate || tracing { self.accum } else { 0 };
         // Sub-pixel jitter (Halton 2, 3), none on the first frame so a still image is sharp.
         let jitter = if n == 0 {
             Vec2::ZERO
@@ -1401,10 +1482,70 @@ impl Viewport {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
+        let traced = if tracing && self.view3d.visible() {
+            let trace = self.trace.as_mut().expect("tracing");
+            if trace.scene != Some(self.scene_version) {
+                let tiles = self.parts.iter().flat_map(|p| &p.tiles);
+                for (k, tile) in tiles.enumerate() {
+                    if let Some(set) = &tile.sets[0] {
+                        let v = &set.views;
+                        trace.materials.update_layer(
+                            device,
+                            encoder,
+                            k as u32,
+                            [&v[0], &v[1], &v[2], &v[3]],
+                        );
+                    }
+                }
+                trace.scene = Some(self.scene_version);
+            }
+            if n < r.trace_samples {
+                let hidden: Vec<bool> = self
+                    .parts
+                    .iter()
+                    .flat_map(|part| part.tiles.iter().map(|_| !part.visible))
+                    .collect();
+                let focus = if r.focus > 0.0 {
+                    r.focus
+                } else {
+                    p.target_distance
+                };
+                let inputs = reetched_trace::FrameInputs {
+                    width: self.targets.size[0].max(1),
+                    height: self.targets.size[1].max(1),
+                    inv_view_proj: (p.proj * p.view).inverse(),
+                    eye: p.eye,
+                    aperture: if r.dof { r.aperture } else { 0.0 },
+                    focus_distance: focus.max(1e-4),
+                    env: &self.env_view,
+                    env_sampler: &self.env_sampler,
+                    env_rotation: p.env_rotation,
+                    env_opacity: p.env_opacity,
+                    background_lod: params[3],
+                    max_bounces: r.bounces,
+                    samples_per_frame: 1,
+                    indirect_clamp: reetched_trace::FrameInputs::DEFAULT_CLAMP,
+                    reset: n == 0,
+                    frame: n,
+                    hidden: &hidden,
+                    materials: &trace.materials,
+                };
+                trace.tracer.render(device, encoder, &inputs);
+            }
+            trace.tracer.output().map(|v| v.texture().clone())
+        } else {
+            None
+        };
         if self.view3d.visible() {
-            self.render_3d(encoder, p);
+            self.render_3d(encoder, p, traced.as_ref());
             self.history_cur = 1 - self.history_cur;
-            let frames = if r.dof { DOF_FRAMES } else { ACCUMULATE_FRAMES };
+            let frames = if tracing {
+                r.trace_samples
+            } else if r.dof {
+                DOF_FRAMES
+            } else {
+                ACCUMULATE_FRAMES
+            };
             self.accum = (n + 1).min(frames);
         }
         if self.view2d.visible() {
@@ -1420,7 +1561,14 @@ impl Viewport {
             .filter(|t| t.bind_group.is_some())
     }
 
-    fn render_3d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
+    /// `traced`: the path tracer's image, which replaces the rasterized one
+    /// (the scene is still drawn for the depth buffer brushes test against).
+    fn render_3d(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        p: &FrameParams,
+        traced: Option<&wgpu::Texture>,
+    ) {
         let t = &self.targets;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1534,27 +1682,36 @@ impl Viewport {
             pass.set_bind_group(1, group, &[]);
             pass.draw(0..3, 0..1);
         };
-        fullscreen(
-            encoder,
-            "sss h",
-            &t.sss[1],
-            &self.pipelines.sss_h,
-            &t.sss_h_bg,
-        );
-        fullscreen(
-            encoder,
-            "sss v",
-            &t.sss[2],
-            &self.pipelines.sss_v,
-            &t.sss_v_bg,
-        );
-        fullscreen(
-            encoder,
-            "accumulate",
-            &t.history[cur],
-            &self.pipelines.accumulate,
-            &t.accum_bg[cur],
-        );
+        if let Some(traced) = traced {
+            // The tracer accumulates by itself.
+            encoder.copy_texture_to_texture(
+                traced.as_image_copy(),
+                t.history[cur].texture().as_image_copy(),
+                traced.size(),
+            );
+        } else {
+            fullscreen(
+                encoder,
+                "sss h",
+                &t.sss[1],
+                &self.pipelines.sss_h,
+                &t.sss_h_bg,
+            );
+            fullscreen(
+                encoder,
+                "sss v",
+                &t.sss[2],
+                &self.pipelines.sss_v,
+                &t.sss_v_bg,
+            );
+            fullscreen(
+                encoder,
+                "accumulate",
+                &t.history[cur],
+                &self.pipelines.accumulate,
+                &t.accum_bg[cur],
+            );
+        }
         fullscreen(
             encoder,
             "bloom down",
@@ -1605,6 +1762,9 @@ impl Viewport {
 
     /// The 3D view is still refining (progressive anti-aliasing); keep redrawing.
     pub fn accumulating(&self, settings: &RenderSettings) -> bool {
+        if settings.path_trace && self.trace.as_ref().is_some_and(|t| t.has_mesh) {
+            return self.view3d.visible() && self.accum < settings.trace_samples;
+        }
         let frames = if settings.dof {
             DOF_FRAMES
         } else {
@@ -1751,7 +1911,7 @@ fn compile_custom(
             targets: &[target.clone(), target],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::gpu_cache::get(),
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(format!("the GPU rejected the translated shader: {e}"));
@@ -1962,7 +2122,11 @@ impl Targets {
         ];
         let oit_accum = sized(HDR_FORMAT, rt, full);
         let oit_reveal = sized(REVEAL_FORMAT, rt, full);
-        let history = [sized(HDR_FORMAT, rt, full), sized(HDR_FORMAT, rt, full)];
+        // Copy destination too: the path tracer's image goes straight into history.
+        let history = [
+            sized(HDR_FORMAT, rt | U::COPY_DST, full),
+            sized(HDR_FORMAT, rt | U::COPY_DST, full),
+        ];
         let bloom = [
             sized(HDR_FORMAT, rt, quarter),
             sized(HDR_FORMAT, rt, quarter),
@@ -2299,7 +2463,7 @@ impl PipelineWith<'_> {
                 targets: d.targets,
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::gpu_cache::get(),
         })
     }
 }

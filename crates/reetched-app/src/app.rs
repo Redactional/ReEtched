@@ -116,6 +116,8 @@ pub enum AssetCategory {
     Materials,
     SmartMaterials,
     Procedural,
+    /// Files from the asset library folders (None = every kind).
+    Library(Option<reetched_library::AssetKind>),
 }
 
 pub struct App {
@@ -183,6 +185,15 @@ pub struct State {
     /// The text resource window, while open.
     pub text_ui: Option<crate::text_ui::TextUi>,
     pub color: crate::color_ui::ColorUi,
+    pub layer_thumbs: crate::thumbs::Thumbs,
+    pub settings: crate::settings::Settings,
+    pub library: crate::library_ui::LibraryUi,
+    pub settings_open: bool,
+    pub script: crate::scripting::Scripting,
+    /// The loaded environment map (None = the built-in sky).
+    pub env_path: Option<PathBuf>,
+    pub session: crate::session::Session,
+    pub new_project: Option<crate::templates::NewProject>,
     /// Properties shows the tool (true) or the selected layer (false).
     pub properties_tool: bool,
     /// Latest pen pressure (1 with a mouse).
@@ -243,6 +254,7 @@ impl App {
         startup_mesh: Option<PathBuf>,
     ) -> Self {
         let env = EnvImage::procedural_sky();
+        let settings = crate::settings::Settings::load();
         let mut state = State {
             device: device.clone(),
             queue: queue.clone(),
@@ -298,6 +310,14 @@ impl App {
             text_ui: None,
             warp_drag: None,
             color: Default::default(),
+            layer_thumbs: Default::default(),
+            library: crate::library_ui::LibraryUi::new(&settings.library_roots),
+            settings,
+            settings_open: false,
+            script: Default::default(),
+            env_path: None,
+            session: crate::session::Session::start(),
+            new_project: None,
             properties_tool: false,
             pressure: 1.0,
             last_stroke_end: None,
@@ -315,6 +335,10 @@ impl App {
             quit: false,
         };
         state.set_mesh(Mesh::uv_sphere(1.0, 64, 32), "Preview sphere".into(), None);
+        // Tests start Python themselves (it costs a process launch).
+        if !cfg!(test) {
+            state.start_scripting();
+        }
         if let Some(path) = startup_mesh {
             state.open_any(&path);
         }
@@ -328,6 +352,18 @@ impl App {
         self.state.quit
     }
 
+    /// Clean exit: keep settings, drop this session's autosave.
+    pub fn shutdown(&mut self) {
+        let s = &mut self.state;
+        s.notify_script("shutdown", serde_json::json!({}));
+        s.flush_script_events();
+        if let Err(e) = s.settings.save() {
+            log::warn!("could not save settings: {e:#}");
+        }
+        s.session.end();
+        crate::gpu_cache::save();
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if self.state.thumbs.is_empty() {
@@ -337,6 +373,7 @@ impl App {
             self.state.procedural.refresh_thumbs(&ctx);
         }
         self.state.update_procedurals();
+        self.state.library.poll();
         if self.state.procedural.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -383,7 +420,8 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{}  |  Version: {}",
+                                "GPU cache {} MB  |  {}  |  Version: {}",
+                                self.state.cache_mb(),
                                 self.state.adapter,
                                 env!("CARGO_PKG_VERSION")
                             ))
@@ -409,11 +447,30 @@ impl App {
         self.state.export_window(&ctx);
         self.state.bake_window(&ctx);
         self.state.text_window(&ctx);
+        self.state.new_project_window(&ctx);
+        self.state.settings_window(&ctx);
+        self.state.recovery_window(&ctx);
+        self.state.console_window(&ctx);
+        self.state.plugins_window(&ctx);
+        let s = &mut self.state;
+        if let Some(e) = s.session.tick(
+            s.settings.autosave_minutes,
+            &s.doc,
+            &s.mesh,
+            &s.resources,
+            s.project_path.as_deref(),
+        ) {
+            s.error(e);
+        }
 
         // A whole drag or text edit becomes one undo step.
         let interacting =
             ctx.input(|i| i.pointer.any_down()) || ctx.memory(|m| m.focused().is_some());
         self.state.history.observe(&self.state.doc, interacting);
+        self.state.script_frame();
+        if self.state.script.wants_ticks() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     fn tile(&self, pane: Pane) -> Option<TileId> {
@@ -442,17 +499,41 @@ impl App {
                 .clicked()
         };
         ui.menu_button("File", |ui| {
-            if shortcut(ui, "New project from mesh…", "Ctrl+N") {
-                self.state.pick_mesh();
+            if shortcut(ui, "New project…", "Ctrl+N") {
+                self.state.open_new_project();
             }
             if shortcut(ui, "Open project…", "Ctrl+O") {
                 self.state.pick_project();
             }
+            let recent = self.state.settings.recent_projects.clone();
+            ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                ui.menu_button("Open recent", |ui| {
+                    for p in recent {
+                        if ui
+                            .button(file_name(&p))
+                            .on_hover_text(p.display().to_string())
+                            .clicked()
+                        {
+                            self.state.open_project(&p);
+                        }
+                    }
+                });
+            });
             if shortcut(ui, "Save", "Ctrl+S") {
                 self.state.save(false);
             }
             if shortcut(ui, "Save as…", "Ctrl+Shift+S") {
                 self.state.save(true);
+            }
+            if ui
+                .button("Save and compact")
+                .on_hover_text("Drops images and files no layer uses any more, then saves")
+                .clicked()
+            {
+                self.state.save_compact();
+            }
+            if ui.button("Save texture set as template…").clicked() {
+                self.state.save_template();
             }
             if ui
                 .button("Reimport mesh…")
@@ -478,6 +559,9 @@ impl App {
                 self.state.import_bridge_dialog();
             }
             ui.separator();
+            if ui.button("Settings…").clicked() {
+                self.state.settings_open = true;
+            }
             if ui.button("Quit").clicked() {
                 self.state.quit = true;
             }
@@ -493,6 +577,7 @@ impl App {
                 s.history.redo(&mut s.doc);
             }
         });
+        ui.menu_button("Python", |ui| self.state.python_menu(ui));
         ui.menu_button("Window", |ui| {
             for pane in Pane::ALL {
                 let mut visible = self.pane_visible(pane);
@@ -574,6 +659,13 @@ impl App {
         for w in warnings {
             s.warn(w);
         }
+        if s.render.path_trace && s.viewport.trace_needs_mesh() {
+            let (device, queue) = (s.device.clone(), s.queue.clone());
+            if let Err(e) = s.viewport.set_trace_mesh(&device, &queue, &s.mesh) {
+                s.render.path_trace = false;
+                s.error(format!("The path tracer can't take this mesh: {e:#}"));
+            }
+        }
         let params = FrameParams {
             view,
             proj,
@@ -598,6 +690,7 @@ impl App {
         };
         s.viewport
             .render(&s.device, &s.queue, egui, encoder, &params);
+        s.viewport.end_frame(s.settings.vram_budget());
     }
 }
 
@@ -695,15 +788,6 @@ impl State {
         }
     }
 
-    pub fn pick_mesh(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Meshes", MESH_EXTENSIONS)
-            .pick_file()
-        {
-            self.load_mesh(&path);
-        }
-    }
-
     pub fn pick_project(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("ReEtched project", &[project::EXTENSION])
@@ -724,7 +808,10 @@ impl State {
                 self.set_mesh(mesh, name.clone(), Some(doc));
                 self.resources = resources;
                 self.project_path = Some(path.to_owned());
+                self.settings.add_recent(path);
+                self.session.mark_saved(&self.doc, Some(path));
                 self.info(format!("Opened project {name}"));
+                self.notify_script("project_opened", serde_json::json!({ "path": path }));
             }
             Err(e) => self.error(format!("Could not open project: {e:#}")),
         }
@@ -746,13 +833,43 @@ impl State {
                 p
             }
         };
-        match project::save(&path, &self.doc, &self.mesh, &self.resources) {
+        self.save_to(&path);
+    }
+
+    /// Saves to `path`; true on success.
+    pub fn save_to(&mut self, path: &Path) -> bool {
+        self.notify_script("project_about_to_save", serde_json::json!({ "path": path }));
+        match project::save(path, &self.doc, &self.mesh, &self.resources) {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
-                self.project_path = Some(path);
+                self.project_path = Some(path.to_owned());
+                self.settings.add_recent(path);
+                self.session.mark_saved(&self.doc, Some(path));
+                self.notify_script("project_saved", serde_json::json!({ "path": path }));
+                true
             }
-            Err(e) => self.error(format!("Could not save: {e:#}")),
+            Err(e) => {
+                self.error(format!("Could not save: {e:#}"));
+                false
+            }
         }
+    }
+
+    /// Drops resources nothing uses any more, then saves.
+    pub fn save_compact(&mut self) {
+        let keep: Vec<_> = self.brush.alpha.iter().cloned().collect();
+        let dropped = self.doc.compact(&keep);
+        self.info(format!("Compacted: {dropped} unused file(s) dropped"));
+        self.save(false);
+    }
+
+    pub fn open_new_project(&mut self) {
+        self.new_project = Some(crate::templates::NewProject {
+            mesh: String::new(),
+            template: 0,
+            resolution: 2048,
+            custom: None,
+        });
     }
 
     pub fn project_name(&self) -> String {
@@ -802,7 +919,7 @@ impl State {
             self.pick_project();
         }
         if new {
-            self.pick_mesh();
+            self.open_new_project();
         }
         if !typing && ctx.input(|i| i.key_pressed(Key::Delete)) {
             self.delete_selected();
@@ -988,9 +1105,10 @@ impl State {
         }
     }
 
-    fn load_environment(&mut self, path: &Path) {
+    pub(crate) fn load_environment(&mut self, path: &Path) {
         match EnvImage::load(path) {
             Ok(env) => {
+                self.env_path = Some(path.to_owned());
                 self.preview_env = PreviewEnv::new(&env);
                 self.thumbs.clear(); // regenerated next frame with the new lighting
                 self.viewport
@@ -1096,6 +1214,7 @@ impl State {
                     )
                 })
                 .collect(),
+            AssetCategory::Library(_) => Vec::new(),
             AssetCategory::Procedural => self
                 .procedural
                 .items()
@@ -1177,6 +1296,11 @@ impl State {
 
     fn status_line(&self) -> &str {
         self.log.last().map_or("", |l| l.text.as_str())
+    }
+
+    /// GPU memory the rebuildable caches hold, for the status bar.
+    fn cache_mb(&mut self) -> u64 {
+        self.viewport.compositor().cache_bytes() / (1024 * 1024)
     }
 
     fn tool_strip_ui(&mut self, ui: &mut egui::Ui) {
@@ -2541,5 +2665,194 @@ mod tests {
             .filter(|(c, cov)| **cov && c[0] > 0.8)
             .count();
         assert!(white > 50, "the text shows up white: {white}");
+    }
+
+    #[test]
+    fn library_assets_are_found_and_used() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let dir = crate::settings::config_dir().join("library");
+        let _ = std::fs::remove_dir_all(dir.join("textures"));
+        let _ = std::fs::remove_dir_all(dir.join("alphas"));
+        std::fs::create_dir_all(dir.join("textures")).unwrap();
+        std::fs::create_dir_all(dir.join("alphas")).unwrap();
+        let png = |path: &Path, c: [u8; 4]| {
+            image::RgbaImage::from_pixel(4, 4, image::Rgba(c))
+                .save(path)
+                .unwrap();
+        };
+        png(&dir.join("textures/rusty_plate.png"), [200, 40, 20, 255]);
+        png(&dir.join("alphas/dots.png"), [255, 255, 255, 255]);
+        let s = &mut h.app.state;
+        s.library.lib.rescan();
+        s.library.poll();
+        let found: Vec<_> = s
+            .library
+            .lib
+            .query("rusty", Some(reetched_library::AssetKind::Texture), false)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), 1, "the texture is found by name");
+        let alpha = s
+            .library
+            .lib
+            .query("", Some(reetched_library::AssetKind::Alpha), false)
+            .into_iter()
+            .next()
+            .cloned()
+            .expect("files in alphas/ are alphas");
+
+        // Double-clicking a texture puts it on the selected fill's shown channel.
+        let fill = s
+            .doc
+            .new_fill("f".into(), reetched_doc::Fill::new([1.0; 3], 0.0, 0.5));
+        let id = fill.id;
+        s.doc.texture_sets[0].stack.insert(0, fill);
+        s.selected = Some(Selected {
+            node: id,
+            mask: false,
+        });
+        s.use_asset(&found[0]);
+        let NodeKind::Fill(f) = &s.doc.texture_sets[0].stack[0].kind else {
+            panic!("fill")
+        };
+        assert!(f.channels[&Channel::BaseColor].bitmap.is_some());
+        s.use_asset(&alpha);
+        assert!(s.brush.alpha.is_some());
+
+        // Brush presets keep the settings and the alpha image.
+        s.brush.size = 77.0;
+        let preset = crate::library_ui::BrushPreset {
+            brush: s.brush.clone(),
+            alpha: Some("89504e47".into()),
+        };
+        let path = std::env::temp_dir().join("reetched-test.rbrush");
+        std::fs::write(&path, serde_json::to_vec(&preset).unwrap()).unwrap();
+        s.brush = crate::brush::Brush::default();
+        s.load_brush_preset(&path);
+        assert_eq!(s.brush.size, 77.0);
+        let a = s.brush.alpha.clone().unwrap();
+        assert_eq!(s.resources.files[&a].as_slice(), &[0x89, 0x50, 0x4e, 0x47]);
+    }
+
+    #[test]
+    fn python_scripts_drive_the_app() {
+        if let Err(e) = reetched_script::find_python() {
+            eprintln!("no Python; skipping: {e}");
+            return;
+        }
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        // Build the bridge into its own target dir (ours is locked while tests run).
+        let exe = std::env::current_exe().unwrap();
+        let target = exe
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .join("reetched-python-tests");
+        let status = std::process::Command::new(env!("CARGO"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["build", "-p", "reetched-python", "--target-dir"])
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "building reetched-python failed");
+        let lib = target.join("debug").join(reetched_script::library_name());
+        // SAFETY: no other test reads this, and Python isn't running yet.
+        unsafe { std::env::set_var("REETCHED_PYTHON_LIB", lib) };
+        let s = &mut h.app.state;
+        s.start_scripting();
+        assert!(s.script.wants_ticks(), "{}", s.script.status);
+        let out = std::env::temp_dir().join("reetched-script-export");
+        let _ = std::fs::remove_dir_all(&out);
+        s.run_console(
+            "from reetched import layerstack as ls, textureset as ts, export, event\n\
+             seen = []\n\
+             event.DISPATCHER.connect(event.Event, lambda e: seen.append(e.name))\n",
+        );
+        s.run_console(&format!(
+            r#"s = ts.get_active()
+fill = ls.insert_fill(ls.InsertPosition.from_texture_set_stack(s))
+fill.name = "Rust"
+fill.set_channel_value("basecolor", (1.0, 0.0, 0.0))
+group = ls.insert_group(ls.InsertPosition.above_node(fill))
+ls.move_node(fill, ls.InsertPosition.inside_node(group))
+assert ls.get_root_layer_nodes(s)[0] == group
+assert group.children()[0].channel_value("basecolor") == (1.0, 0.0, 0.0)
+try:
+    ls.move_node(group, ls.InsertPosition.inside_node(group))
+    raise SystemExit("moving a group into itself must fail")
+except Exception as e:
+    print("refused:", e)
+r = export.export_project_textures({{"exportPath": r"{}", "exportParameters": {{"fileFormat": "png"}}}})
+assert r.all_files(), r
+"#,
+            out.display()
+        ));
+        s.run_console("print('events', seen)");
+        let console = s.script.output.clone();
+        assert!(!console.contains("Traceback"), "{console}");
+        assert!(console.contains("refused:"), "{console}");
+        assert!(console.contains("export_finished"), "{console}");
+        let top = &s.doc.texture_sets[0].stack[0];
+        let NodeKind::Folder { children } = &top.kind else {
+            panic!("the group is on top");
+        };
+        assert_eq!(children[0].name, "Rust");
+        assert!(
+            std::fs::read_dir(&out).unwrap().count() > 0,
+            "textures written"
+        );
+        // Each call was its own undo step: undo takes the move back out of the group.
+        s.history.undo(&mut s.doc);
+        assert!(matches!(
+            &s.doc.texture_sets[0].stack[1].kind,
+            NodeKind::Fill(_)
+        ));
+    }
+
+    #[test]
+    fn path_tracer_renders_the_material_view() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let s = &mut h.app.state;
+        let node = s.doc.new_fill(
+            "red".into(),
+            reetched_doc::Fill::new([0.8, 0.05, 0.05], 0.0, 0.5),
+        );
+        s.add_node(node);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let raster = center_pixel(&h);
+        h.app.state.render.path_trace = true;
+        for _ in 0..24 {
+            h.frame(vec![]);
+        }
+        let s = &h.app.state;
+        assert!(
+            s.viewport.trace_samples() >= 16,
+            "{}",
+            s.viewport.trace_samples()
+        );
+        assert!(
+            s.viewport.accumulating(&s.render),
+            "keeps refining up to the sample count"
+        );
+        let traced = center_pixel(&h);
+        assert!(
+            traced[0] > traced[1].saturating_add(40) && traced[0] > traced[2].saturating_add(40),
+            "the red sphere shows: traced {traced:?}, raster {raster:?}"
+        );
+        // Same material, so roughly the same brightness as the rasterizer.
+        let diff = (traced[0] as i32 - raster[0] as i32).abs();
+        assert!(diff < 70, "traced {traced:?} vs raster {raster:?}");
     }
 }

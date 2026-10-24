@@ -41,21 +41,31 @@ impl State {
                     self.asset_category = cat;
                 }
             }
-            ui.add_enabled_ui(false, |ui| {
-                for (icon, name) in [
-                    (ic::ICON_MASKED_TRANSITIONS, "Smart masks"),
-                    (ic::ICON_FILTER_ALT, "Filters"),
-                    (ic::ICON_BRUSH, "Brushes"),
-                    (ic::ICON_BLUR_ON, "Alphas"),
-                    (ic::ICON_TEXTURE, "Textures"),
-                    (ic::ICON_LIGHT_MODE, "Environments"),
-                ] {
-                    icon_button(ui, icon, false, name)
-                        .on_disabled_hover_text(format!("{name} — arrive in a later phase"));
+            use reetched_library::AssetKind as K;
+            for (icon, kind, name) in [
+                (
+                    ic::ICON_MASKED_TRANSITIONS,
+                    Some(K::SmartMask),
+                    "Smart masks",
+                ),
+                (ic::ICON_BRUSH, Some(K::Brush), "Brushes"),
+                (ic::ICON_BLUR_ON, Some(K::Alpha), "Alphas"),
+                (ic::ICON_TEXTURE, Some(K::Texture), "Textures"),
+                (ic::ICON_LIGHT_MODE, Some(K::Environment), "Environments"),
+                (ic::ICON_CODE, Some(K::Shader), "Shaders"),
+                (ic::ICON_FOLDER, None, "All library files"),
+            ] {
+                let cat = C::Library(kind);
+                if icon_button(ui, icon, self.asset_category == cat, name).clicked() {
+                    self.asset_category = cat;
                 }
-            });
+            }
         });
         ui.separator();
+        if let crate::app::AssetCategory::Library(kind) = self.asset_category {
+            self.library_assets_ui(ui, kind);
+            return;
+        }
 
         if self.asset_category == crate::app::AssetCategory::SmartMaterials
             && ui.button("Import smart material…").clicked()
@@ -278,6 +288,34 @@ impl State {
                         .on_hover_text("How far light travels under the surface (scene units)");
                     });
                     ui.end_row();
+                    ui.label("Renderer");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut r.path_trace, false, "Raster");
+                        ui.selectable_value(&mut r.path_trace, true, "Path tracer")
+                            .on_hover_text(
+                                "Physically based light transport: reflections, shadows and \
+                                 bounce light. Refines while the view stays still",
+                            );
+                    });
+                    ui.end_row();
+                    if r.path_trace {
+                        ui.label("Bounces");
+                        ui.add(egui::Slider::new(&mut r.bounces, 1..=16));
+                        ui.end_row();
+                        ui.label("Samples");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut r.trace_samples)
+                                    .range(1..=65536)
+                                    .speed(8),
+                            );
+                            ui.label(
+                                RichText::new(format!("{} so far", self.viewport.trace_samples()))
+                                    .color(theme::WEAK),
+                            );
+                        });
+                        ui.end_row();
+                    }
                     ui.label("Anti-aliasing");
                     ui.checkbox(&mut r.accumulate, "Progressive")
                         .on_hover_text("Refines the image over a few frames while nothing moves");

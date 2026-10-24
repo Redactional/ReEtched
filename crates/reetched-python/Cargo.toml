@@ -1,0 +1,17 @@
+[package]
+name = "reetched-python"
+description = "Embedded CPython bridge for ReEtched scripting (loaded at runtime by reetched-script)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# Only this DLL links Python, so the app itself starts without Python installed.
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3: one build works with any CPython >= 3.8 (links python3.dll on Windows).
+# generate-import-lib: builds without a Python install on the build machine.
+pyo3 = { version = "0.29", default-features = false, features = ["macros", "abi3-py38", "generate-import-lib"] }

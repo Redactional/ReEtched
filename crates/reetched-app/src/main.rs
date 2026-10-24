@@ -13,7 +13,9 @@ mod compositor;
 mod dynamics;
 mod effects_ui;
 mod env;
+mod gpu_cache;
 mod images;
+mod library_ui;
 mod paint_gpu;
 mod paint_ui;
 mod panels;
@@ -21,11 +23,17 @@ mod preview;
 mod procedural;
 mod psd_export;
 mod reimport;
+mod scripting;
+mod session;
+mod settings;
+mod settings_ui;
 mod shader_ui;
 mod smart_presets;
 mod stack_ui;
+mod templates;
 mod text_ui;
 mod theme;
+mod thumbs;
 mod tools_ui;
 mod viewport;
 
@@ -118,11 +126,15 @@ impl ApplicationHandler for Runner {
         let Some(g) = &mut self.gfx else { return };
         let response = g.egui_state.on_window_event(&g.window, &event);
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                g.app.shutdown();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => g.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 let repaint_after = g.redraw();
                 if g.app.wants_quit() {
+                    g.app.shutdown();
                     event_loop.exit();
                 } else if repaint_after.is_zero() {
                     g.window.request_redraw();
@@ -168,19 +180,25 @@ impl Gfx {
         let wireframe = adapter
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE);
+        let cacheable = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("reetched"),
-                required_features: if wireframe {
+                required_features: (if wireframe {
                     wgpu::Features::POLYGON_MODE_LINE
                 } else {
                     wgpu::Features::empty()
-                },
+                }) | (if cacheable {
+                    wgpu::Features::PIPELINE_CACHE
+                } else {
+                    wgpu::Features::empty()
+                }),
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await?;
 
+        gpu_cache::init(&device, &info);
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))

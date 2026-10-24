@@ -84,7 +84,7 @@ pub fn encode_png16(img: &reetched_bake::Image, kind: MapKind) -> anyhow::Result
 
 impl State {
     pub fn bake_window(&mut self, ctx: &egui::Context) {
-        self.poll_bake();
+        self.poll_bake(false);
         if !self.bake.open {
             return;
         }
@@ -210,7 +210,7 @@ impl State {
         }
     }
 
-    fn start_bake(&mut self) {
+    pub(crate) fn start_bake(&mut self) {
         let low = self.mesh.clone();
         let high_path = Some(self.bake.high_poly.trim().to_owned())
             .filter(|p| !p.is_empty())
@@ -276,12 +276,18 @@ impl State {
         self.info("Baking mesh maps…".into());
     }
 
-    /// Picks up a finished bake.
-    fn poll_bake(&mut self) {
-        let Some(job) = &self.bake.job else { return };
-        let msg = match job.rx.try_recv() {
+    /// Picks up a finished bake (`wait`: blocks until it ends). Some(true) when
+    /// a bake finished successfully.
+    pub(crate) fn poll_bake(&mut self, wait: bool) -> Option<bool> {
+        let job = self.bake.job.as_ref()?;
+        let msg = if wait {
+            job.rx.recv().map_err(|_| mpsc::TryRecvError::Disconnected)
+        } else {
+            job.rx.try_recv()
+        };
+        let msg = match msg {
             Ok(m) => m,
-            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 BakeMessage::Failed("the bake stopped unexpectedly".into())
             }
@@ -307,9 +313,16 @@ impl State {
                     }
                 }
                 self.info(format!("Baked {count} mesh maps"));
+                Some(true)
             }
-            BakeMessage::Failed(e) => self.error(e),
-            BakeMessage::Cancelled => self.warn("Bake cancelled".into()),
+            BakeMessage::Failed(e) => {
+                self.error(e);
+                Some(false)
+            }
+            BakeMessage::Cancelled => {
+                self.warn("Bake cancelled".into());
+                Some(false)
+            }
         }
     }
 

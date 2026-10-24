@@ -354,14 +354,22 @@ impl State {
             }
         } else {
             let view = self.view_info(rect);
-            for (p, brush) in &placed {
-                let ndc = Vec2::new(
-                    (p.x - rect.min.x) / rect.width() * 2.0 - 1.0,
-                    1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
-                );
-                let (origin, dir) = view_ray(view.view_proj, ndc);
-                if let Some(hit) = raycast(&self.mesh, origin, dir).filter(|h| h.part == stroke.set)
-                {
+            // Ray casts are independent: run them in parallel (dynamic strokes place many).
+            use rayon::prelude::*;
+            let mesh = &self.mesh;
+            let hits: Vec<_> = placed
+                .par_iter()
+                .map(|(p, _)| {
+                    let ndc = Vec2::new(
+                        (p.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+                        1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
+                    );
+                    let (origin, dir) = view_ray(view.view_proj, ndc);
+                    raycast(mesh, origin, dir).filter(|h| h.part == stroke.set)
+                })
+                .collect();
+            for ((_, brush), hit) in placed.iter().zip(hits) {
+                if let Some(hit) = hit {
                     let mut new = world_dabs(brush, &view, &hit, self.pressure);
                     if let Some((d, arc)) = ribbon {
                         // Brush x along the path; y across it (screen y points down).

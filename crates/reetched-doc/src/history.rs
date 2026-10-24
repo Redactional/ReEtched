@@ -10,6 +10,8 @@ pub struct History {
     redo: Vec<Document>,
     /// Last state the user finished editing.
     committed: Document,
+    /// Counts commits, undos and redos (tells listeners the document changed).
+    steps: u64,
 }
 
 impl History {
@@ -18,7 +20,13 @@ impl History {
             undo: Vec::new(),
             redo: Vec::new(),
             committed: doc.clone(),
+            steps: 0,
         }
+    }
+
+    /// Changes whenever a step is committed, undone or redone.
+    pub fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// Call once per frame. While `interacting` (e.g. a slider is held) changes are
@@ -33,6 +41,7 @@ impl History {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.steps += 1;
     }
 
     pub fn undo(&mut self, doc: &mut Document) -> bool {
@@ -43,6 +52,7 @@ impl History {
         };
         self.redo.push(std::mem::replace(doc, previous));
         self.committed = doc.clone();
+        self.steps += 1;
         true
     }
 
@@ -52,6 +62,7 @@ impl History {
         };
         self.undo.push(std::mem::replace(doc, next));
         self.committed = doc.clone();
+        self.steps += 1;
         true
     }
 

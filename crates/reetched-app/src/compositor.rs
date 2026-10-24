@@ -160,6 +160,11 @@ pub struct Compositor {
     defaults: [ChannelSet; GROUPS],
     /// Paint layers' and masks' painted texels on the GPU.
     paint: HashMap<PaintKey, PaintTexture>,
+    /// For the memory budget: frame counter, and when each paint texture and
+    /// bitmap was last used (bitmaps with their size in bytes).
+    frame: u64,
+    paint_used: HashMap<PaintKey, u64>,
+    bitmap_used: HashMap<(ResourceId, Decode), (u64, u64)>,
     /// Rendered procedural materials by render key: one texture per channel.
     procedural: HashMap<String, [Option<wgpu::TextureView>; CHANNELS]>,
     /// Resolution and mesh maps of the tile being composited (for render keys).
@@ -247,7 +252,7 @@ impl Compositor {
                     targets: &targets,
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::gpu_cache::get(),
             })
         };
         let group = |suffix: &str| GroupPipelines {
@@ -298,6 +303,9 @@ impl Compositor {
             dummy,
             defaults,
             paint: HashMap::new(),
+            frame: 0,
+            paint_used: HashMap::new(),
+            bitmap_used: HashMap::new(),
             procedural: HashMap::new(),
             proc_ctx: Default::default(),
         }
@@ -328,7 +336,74 @@ impl Compositor {
         if entry.synced != *map {
             upload_tiles(queue, entry, map, resources);
         }
-        entry.view.clone()
+        let view = entry.view.clone();
+        self.paint_used.insert(key, self.frame);
+        view
+    }
+
+    /// GPU memory held by caches that can be rebuilt (paint textures, bitmaps,
+    /// scratch sets), in bytes.
+    pub fn cache_bytes(&self) -> u64 {
+        let paint: u64 = self
+            .paint
+            .values()
+            .map(|p| p.resolution as u64 * p.resolution as u64 * 8)
+            .sum();
+        let bitmaps: u64 = self.bitmap_used.values().map(|(_, b)| b).sum();
+        let pool: u64 = self
+            .pool
+            .iter()
+            .map(|s| s.resolution as u64 * s.resolution as u64 * 8 * SET_TEXTURES as u64)
+            .sum();
+        paint + bitmaps + pool
+    }
+
+    /// Ends a frame: when the caches exceed `budget` bytes, drops scratch sets,
+    /// then the least recently used bitmaps and paint textures not used this
+    /// frame (they're rebuilt from the document when needed). `keep_paint`: a
+    /// stroke is in progress, its paint textures hold unsaved texels.
+    pub fn trim(&mut self, budget: u64, keep_paint: bool) {
+        self.frame += 1;
+        if self.cache_bytes() <= budget {
+            return;
+        }
+        self.pool.clear();
+        let now = self.frame - 1;
+        enum Item {
+            Paint(PaintKey),
+            Bitmap((ResourceId, Decode)),
+        }
+        let mut items: Vec<(u64, Item)> = self
+            .bitmap_used
+            .iter()
+            .filter(|(_, (used, _))| *used < now)
+            .map(|(k, (used, _))| (*used, Item::Bitmap(k.clone())))
+            .collect();
+        if !keep_paint {
+            items.extend(
+                self.paint
+                    .keys()
+                    .map(|k| (self.paint_used.get(k).copied().unwrap_or(0), *k))
+                    .filter(|(used, _)| *used < now)
+                    .map(|(used, k)| (used, Item::Paint(k))),
+            );
+        }
+        items.sort_by_key(|(used, _)| *used);
+        for (_, item) in items {
+            if self.cache_bytes() <= budget {
+                break;
+            }
+            match item {
+                Item::Paint(k) => {
+                    self.paint.remove(&k);
+                    self.paint_used.remove(&k);
+                }
+                Item::Bitmap(k) => {
+                    self.bitmaps.remove(&k);
+                    self.bitmap_used.remove(&k);
+                }
+            }
+        }
     }
 
     pub fn paint_texture(&self, key: PaintKey) -> Option<&PaintTexture> {
@@ -345,6 +420,7 @@ impl Compositor {
     /// Drops every paint texture (when a different document is loaded).
     pub fn clear_paint(&mut self) {
         self.paint.clear();
+        self.paint_used.clear();
     }
 
     pub fn new_set(&self, device: &wgpu::Device, resolution: u32) -> ChannelSet {
@@ -704,35 +780,44 @@ impl Compositor {
         decode: Decode,
         warnings: &mut Vec<String>,
     ) -> Option<wgpu::TextureView> {
-        let ocio = self.ocio.as_ref();
-        self.bitmaps
-            .entry((id.clone(), decode.clone()))
-            .or_insert_with(|| {
-                let bytes = resources.files.get(id)?;
-                let img = match crate::images::decode(bytes) {
-                    Ok(img) => img,
-                    Err(e) => {
-                        warnings.push(format!("could not decode an image: {e:#}"));
-                        return None;
-                    }
-                };
-                match (&decode, ocio) {
+        let key = (id.clone(), decode.clone());
+        if let Some(view) = self.bitmaps.get(&key) {
+            if let Some(u) = self.bitmap_used.get_mut(&key) {
+                u.0 = self.frame;
+            }
+            return view.clone();
+        }
+        let decoded = resources.files.get(id).map(|b| crate::images::decode(b));
+        let (view, size) = match decoded {
+            None => (None, 0),
+            Some(Err(e)) => {
+                warnings.push(format!("could not decode an image: {e:#}"));
+                (None, 0)
+            }
+            Some(Ok(img)) => {
+                // Mips add a third.
+                let texels = img.width() as u64 * img.height() as u64 * 4 / 3;
+                match (&decode, self.ocio.as_ref()) {
                     (Decode::Ocio(space), Some(ocio)) => {
                         let mut px = img.to_rgba32f();
                         if let Err(e) = ocio.to_working(space, &mut px) {
                             warnings.push(format!("OCIO conversion from {space} failed: {e:#}"));
                         }
-                        Some(upload_rgba32f(device, queue, &px))
+                        (Some(upload_rgba32f(device, queue, &px)), texels * 8)
                     }
-                    (d, _) => Some(upload_rgba8(
-                        device,
-                        queue,
-                        &img.to_rgba8(),
-                        !matches!(d, Decode::Raw),
-                    )),
+                    (d, _) => {
+                        let srgb = !matches!(d, Decode::Raw);
+                        (
+                            Some(upload_rgba8(device, queue, &img.to_rgba8(), srgb)),
+                            texels * 4,
+                        )
+                    }
                 }
-            })
-            .clone()
+            }
+        };
+        self.bitmaps.insert(key.clone(), view.clone());
+        self.bitmap_used.insert(key, (self.frame, size));
+        view
     }
 
     fn params(
@@ -1638,6 +1723,49 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         resources.add(png)
+    }
+
+    #[test]
+    fn caches_over_budget_drop_unused_paint_and_rebuild_it() {
+        let _gpu = crate::gpu_test_lock();
+        let Some((device, queue)) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut resources = Resources::default();
+        let map = TileMap::from_fn(RES, &mut resources, |_, _| [1.0, 0.0, 0.0, 1.0]);
+        let mut comp = Compositor::new(&device, &queue);
+        for k in 0..4 {
+            comp.paint_view(&device, &queue, (k, 0, 1001), &map, RES, &resources);
+        }
+        let full = comp.cache_bytes();
+        assert_eq!(full, 4 * (RES * RES * 8) as u64);
+        // Used this frame: kept, whatever the budget.
+        comp.trim(0, false);
+        assert_eq!(comp.cache_bytes(), full);
+        // Keep using one; the rest go once the budget is exceeded.
+        comp.paint_view(&device, &queue, (0, 0, 1001), &map, RES, &resources);
+        comp.trim(full / 2, false);
+        assert!(comp.cache_bytes() <= full / 2);
+        assert!(
+            comp.paint_texture((0, 0, 1001)).is_some(),
+            "the one in use stays"
+        );
+        // A stroke in progress protects them.
+        comp.paint_view(&device, &queue, (1, 0, 1001), &map, RES, &resources);
+        comp.trim(0, true);
+        comp.trim(0, true);
+        assert!(comp.paint_texture((1, 0, 1001)).is_some());
+        // An evicted texture comes back with its texels when needed again.
+        comp.trim(0, false);
+        comp.trim(0, false);
+        assert!(comp.paint_texture((1, 0, 1001)).is_none());
+        let view = comp.paint_view(&device, &queue, (1, 0, 1001), &map, RES, &resources);
+        drop(view);
+        let tex = &comp.paint_texture((1, 0, 1001)).unwrap().texture;
+        let px = crate::paint_gpu::read_region(&device, &queue, tex, 3, 3, 1, 1, 8).unwrap();
+        let h: [half::f16; 4] = bytemuck::pod_read_unaligned(&px);
+        assert_eq!(h[0].to_f32(), 1.0);
     }
 
     #[test]

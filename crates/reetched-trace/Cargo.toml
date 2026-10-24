@@ -1,0 +1,20 @@
+[package]
+name = "reetched-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reetched-io.workspace = true
+anyhow.workspace = true
+glam.workspace = true
+log.workspace = true
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+obvhs = { version = "0.4", features = ["parallel"] }
+
+[dev-dependencies]
+pollster = "1"
+half = "2"

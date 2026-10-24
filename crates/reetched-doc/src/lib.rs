@@ -1399,6 +1399,48 @@ impl Document {
         out
     }
 
+    /// Every file resource the document uses: bitmaps, procedural packages,
+    /// mesh maps, shaders.
+    pub fn used_resources(&self) -> std::collections::BTreeSet<ResourceId> {
+        fn walk(nodes: &[Node], out: &mut std::collections::BTreeSet<ResourceId>) {
+            for n in nodes {
+                if let Some(m) = &n.mask {
+                    out.extend(m.bitmap.iter().cloned());
+                }
+                match &n.kind {
+                    NodeKind::Fill(f) => {
+                        out.extend(f.channels.values().filter_map(|c| c.bitmap.clone()));
+                        if let Some(p) = &f.procedural {
+                            out.extend(p.resource_ids());
+                        }
+                    }
+                    NodeKind::Folder { children } => walk(children, out),
+                    NodeKind::Paint(_) => {}
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        for set in &self.texture_sets {
+            walk(&set.stack, &mut out);
+            out.extend(set.mesh_maps.values().cloned());
+            for maps in set.udim_mesh_maps.values() {
+                out.extend(maps.values().cloned());
+            }
+            out.extend(set.shader.resource_ids());
+        }
+        out
+    }
+
+    /// Forgets resources nothing uses (except `keep`, e.g. the brush's alpha), so
+    /// the next save leaves them out. Returns how many were dropped.
+    pub fn compact(&mut self, keep: &[ResourceId]) -> usize {
+        let used = self.used_resources();
+        let before = self.resources.len();
+        self.resources
+            .retain(|id, _| used.contains(id) || keep.contains(id));
+        before - self.resources.len()
+    }
+
     pub fn new_folder(&mut self, name: String) -> Node {
         let id = self.alloc_id();
         Node::new(
@@ -1564,6 +1606,22 @@ mod tests {
         assert!(!move_node(&mut s, f, Placement::Into(inner_id)));
         assert!(!move_node(&mut s, f, Placement::Into(f)));
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn compact_drops_only_unused_resources() {
+        let mut doc = Document::new(None, &["s".into()]);
+        let info = |n: &str| ResourceInfo { name: n.into() };
+        for id in ["used", "stale", "brush"] {
+            doc.resources.insert(id.into(), info(id));
+        }
+        let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+        fill.channels.get_mut(&Channel::BaseColor).unwrap().bitmap = Some("used".into());
+        let node = doc.new_fill("f".into(), fill);
+        doc.texture_sets[0].stack.push(node);
+        assert_eq!(doc.compact(&["brush".into()]), 1);
+        let left: Vec<&str> = doc.resources.keys().map(String::as_str).collect();
+        assert_eq!(left, ["brush", "used"]);
     }
 
     #[test]

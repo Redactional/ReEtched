@@ -174,6 +174,38 @@ impl<'a> Scene<'a> {
     }
 }
 
+/// A mesh's triangles in a BVH, for fast closest-hit ray casts (picking, painting).
+pub struct Raycaster {
+    tris: Vec<Triangle>,
+    bvh: CwBvh,
+}
+
+impl Raycaster {
+    pub fn new(mesh: &Mesh) -> Self {
+        let scene = Scene::new(mesh);
+        Self {
+            tris: scene.tris,
+            bvh: scene.bvh,
+        }
+    }
+
+    /// Closest hit within `max`: (triangle index, distance along `dir`).
+    pub fn hit(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<(usize, f32)> {
+        let ray = Ray::new(origin.into(), nudge(dir).into(), 0.0, max);
+        let mut hit = RayHit::none();
+        self.bvh
+            .ray_traverse(ray, &mut hit, |r, id| {
+                self.tris[self.bvh.primitive_indices[id] as usize].intersect(r)
+            })
+            .then(|| {
+                (
+                    self.bvh.primitive_indices[hit.primitive_id as usize] as usize,
+                    hit.t,
+                )
+            })
+    }
+}
+
 /// obvhs misses flat geometry with rays exactly along an axis (zero direction
 /// components); a negligible tilt avoids that.
 fn nudge(d: Vec3) -> Vec3 {

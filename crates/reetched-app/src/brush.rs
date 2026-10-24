@@ -7,7 +7,7 @@ use reetched_doc::{Channel, ResourceId};
 use reetched_io::Mesh;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Axis {
     X,
     Y,
@@ -24,7 +24,7 @@ impl Axis {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Symmetry {
     Off,
     /// Mirror across the plane through the mesh center, perpendicular to the axis.
@@ -33,13 +33,14 @@ pub enum Symmetry {
     Radial(Axis, u32),
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BrushChannel {
     pub enabled: bool,
     pub value: [f32; 3],
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Brush {
     /// Radius in screen points.
     pub size: f32,
@@ -139,44 +140,66 @@ pub struct Hit {
     pub tri: usize,
 }
 
-/// Nearest triangle hit along a ray (Möller–Trumbore).
-/// ponytail: brute force over every triangle; add a BVH (e.g. obvhs) when meshes get large.
+/// Nearest triangle hit along a ray, through a BVH built once per mesh.
 pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
-    let mut best: Option<(f32, usize, f32, f32)> = None;
-    for (t_index, tri) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
-        let [a, b, c] = tri.map(|i| Vec3::from(mesh.vertices[i as usize].position));
-        let (e1, e2) = (b - a, c - a);
-        let p = dir.cross(e2);
-        let det = e1.dot(p);
-        if det.abs() < 1e-12 {
-            continue;
-        }
-        let inv = 1.0 / det;
-        let s = origin - a;
-        let u = s.dot(p) * inv;
-        if !(0.0..=1.0).contains(&u) {
-            continue;
-        }
-        let q = s.cross(e1);
-        let v = dir.dot(q) * inv;
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        let t = e2.dot(q) * inv;
-        if t > 1e-6 && best.is_none_or(|(bt, ..)| t < bt) {
-            best = Some((t, t_index, u, v));
-        }
-    }
-    let (t, t_index, u, v) = best?;
+    let caster = raycaster(mesh);
+    let (t_index, t) = caster.hit(origin, dir, f32::MAX)?;
     let first = t_index as u32 * 3;
     let part = mesh.parts.iter().position(|p| p.indices.contains(&first))?;
-    let uv = |k: u32| Vec2::from(mesh.vertices[mesh.indices[(first + k) as usize] as usize].uv);
+    let idx = &mesh.indices[t_index * 3..t_index * 3 + 3];
+    let pos = |k: usize| Vec3::from(mesh.vertices[idx[k] as usize].position);
+    let uv = |k: usize| Vec2::from(mesh.vertices[idx[k] as usize].uv);
+    let p = origin + dir * t;
+    // Barycentric weights of the hit point.
+    let (a, b, c) = (pos(0), pos(1), pos(2));
+    let (v0, v1, v2) = (b - a, c - a, p - a);
+    let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
+    let (d20, d21) = (v2.dot(v0), v2.dot(v1));
+    let denom = (d00 * d11 - d01 * d01).max(1e-30);
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
     Some(Hit {
-        pos: origin + dir * t,
-        uv: uv(0) * (1.0 - u - v) + uv(1) * u + uv(2) * v,
+        pos: p,
+        uv: uv(0) * (1.0 - v - w) + uv(1) * v + uv(2) * w,
         part,
         tri: t_index,
     })
+}
+
+/// The BVH for `mesh`, rebuilt when the mesh changes.
+/// ponytail: one cached mesh, keyed by buffer addresses, lengths and a few vertices;
+/// a different mesh that matches all of those would reuse a stale BVH.
+fn raycaster(mesh: &Mesh) -> std::sync::Arc<reetched_bake::Raycaster> {
+    use std::sync::{Arc, Mutex};
+    type Key = (usize, usize, usize, usize, [u32; 6]);
+    static CACHE: Mutex<Option<(Key, Arc<reetched_bake::Raycaster>)>> = Mutex::new(None);
+    let corner = |i: usize| mesh.vertices.get(i).map_or(0, |v| v.position[0].to_bits());
+    let key: Key = (
+        mesh.vertices.as_ptr() as usize,
+        mesh.vertices.len(),
+        mesh.indices.as_ptr() as usize,
+        mesh.indices.len(),
+        [
+            corner(0),
+            corner(mesh.vertices.len() / 2),
+            corner(mesh.vertices.len().saturating_sub(1)),
+            mesh.indices.first().copied().unwrap_or(0),
+            mesh.indices
+                .get(mesh.indices.len() / 2)
+                .copied()
+                .unwrap_or(0),
+            mesh.indices.last().copied().unwrap_or(0),
+        ],
+    );
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, r)) = cache.as_ref()
+        && *k == key
+    {
+        return r.clone();
+    }
+    let r = Arc::new(reetched_bake::Raycaster::new(mesh));
+    *cache = Some((key, r.clone()));
+    r
 }
 
 /// Ray through a point of the view (`ndc` in -1..1, y up).

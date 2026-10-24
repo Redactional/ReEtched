@@ -2,7 +2,7 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 6 of 9 done).** You can bake mesh maps, paint and texture a model (UDIM tiles included) with layers, procedural and smart materials, shade it with metal/rough, Adobe Standard Material, OpenPBR or your own Painter GLSL shaders under OCIO color management, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), save projects and export game-ready textures, PSDs and USD/OBJ meshes. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 7 of 9 done).** You can bake mesh maps, paint and texture a model (UDIM tiles included) with layers, procedural and smart materials, shade it with metal/rough, Adobe Standard Material, OpenPBR or your own Painter GLSL shaders under OCIO color management, preview it with a GPU path tracer, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), automate it all with Python, save projects and export game-ready textures, PSDs and USD/OBJ meshes. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
@@ -30,6 +30,11 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - **Mesh export** as USD (`.usda`, UsdPreviewSurface materials) or OBJ + MTL, with its textures and optional displacement from the height channel
 - **Layered PSD export**: one Photoshop file per texture set and channel, keeping layers, folders, masks, blend modes and opacities
 - Load your own **.hdr / .exr** environment maps
+- **Path tracer** (Display settings → Renderer): a GPU path tracer for the material view, with image-based lighting, reflections, shadows, bounce light, cutout opacity and depth of field, refining while the view stays still
+- **Python scripting** with your own Python 3.8+ install: a console, script files, plugins with their own menu entries, and an API for projects, texture sets, layers, resources, export, baking and display settings (see [Python scripting](crates/reetched-script/README.md))
+- **Asset library**: point Settings at your folders of textures, environments, alphas, brushes, smart materials and masks, Substance graphs, shaders, OCIO configs, templates and meshes; search, tags, favorites and thumbnails, updated as files change on disk. Save brush presets and smart masks into it
+- **Autosave and crash recovery**, Save and compact (drops unused images), recent projects, and **project templates** (New project, Ctrl+N) with built-ins for PBR metal/rough, ASM, OpenPBR, Unreal, Unity HDRP and mobile
+- Layer and mask thumbnails in the layer stack, a GPU memory budget for cached textures, and a shader pipeline cache
 - Painter-style navigation: **Alt+LMB** orbit, **Alt+MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame
 
 ## Building
@@ -41,10 +46,11 @@ You need a recent stable [Rust toolchain](https://rustup.rs) (1.88+) and a C com
 - **Linux:** `gcc` or `clang`
 
 ```bash
+cargo build --release --workspace
 cargo run --release -p reetched-app -- path/to/mesh.fbx
 ```
 
-The mesh argument is optional — without it you get a preview sphere. You can also drag meshes and HDRIs onto the window.
+The mesh argument is optional — without it you get a preview sphere. You can also drag meshes and HDRIs onto the window. The workspace build also builds `reetched_python` (the Python bridge library) next to the executable; without it, or without Python installed, everything except scripting works.
 
 ```bash
 cargo test --workspace
@@ -60,6 +66,10 @@ crates/
   reetched-substance/ Substance file readers (.sbs) and the Painter bridge importer
   reetched-color/  pure-Rust OpenColorIO v2 subset: configs, transforms, LUTs, ACES 1.x / 2.x
   reetched-shader/ Painter custom shader (.glsl) translation, with our own implementation of its shader API
+  reetched-trace/  GPU path tracer (wgpu compute, BVH)
+  reetched-library/ asset library: folder scanning, kinds, tags, favorites, thumbnails, file watching
+  reetched-script/ Python scripting host: finds your Python and drives the bridge
+  reetched-python/ the Python side: the `reetched` module and plugin loader (pyo3, loaded at runtime)
   reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, smart materials, texture export
   reetched-app/    the application: UI, GPU layer compositor, viewport renderer, shaders
 tools/

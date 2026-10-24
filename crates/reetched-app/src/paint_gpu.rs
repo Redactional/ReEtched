@@ -235,7 +235,7 @@ impl PaintGpu {
                     targets: &[Some(target)],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::gpu_cache::get(),
             })
         };
         let accumulate = wgpu::BlendComponent {
@@ -381,6 +381,11 @@ impl PaintGpu {
             tiles: BTreeMap::new(),
             projection: None,
         });
+    }
+
+    /// A stroke is in progress (its paint textures hold texels not yet read back).
+    pub fn active(&self) -> bool {
+        self.stroke.is_some()
     }
 
     /// Projection tool: the image this stroke paints and where it sits on screen.
