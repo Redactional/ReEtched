@@ -1,7 +1,8 @@
 //! Mesh export: OBJ (+ MTL) and USD (`.usda` with UsdPreviewSurface
-//! materials), optionally displaced by the height channel.
+//! materials; `.usdc`/`.usdz` in `usd.rs`), optionally displaced by the height channel.
 
 use crate::Mesh;
+pub use crate::usd::{write_usdc, write_usdz};
 use anyhow::{Context, Result};
 use glam::Vec3;
 use std::{collections::HashMap, fmt::Write as _, path::Path};
@@ -138,6 +139,16 @@ pub fn write_usda(
     displace: Option<Displace>,
     materials: &[MaterialFiles],
 ) -> Result<()> {
+    let u = usda_text(mesh, displace, materials)?;
+    std::fs::write(path, u).with_context(|| format!("could not write {}", path.display()))
+}
+
+/// The `.usda` text; the usdc/usdz writers convert it to binary.
+pub(crate) fn usda_text(
+    mesh: &Mesh,
+    displace: Option<Displace>,
+    materials: &[MaterialFiles],
+) -> Result<String> {
     let list = |items: Vec<String>| items.join(", ");
     let pos = positions(mesh, displace);
     let mut u = String::new();
@@ -191,6 +202,11 @@ pub fn write_usda(
         )
     )?;
     writeln!(u, "        uniform token subdivisionScheme = \"none\"")?;
+    // Each face is in exactly one material subset.
+    writeln!(
+        u,
+        "        uniform token subsetFamily:materialBind:familyType = \"partition\""
+    )?;
     for part in &mesh.parts {
         let name = usd_name(&part.material);
         let faces: Vec<String> = (part.indices.start / 3..part.indices.end / 3)
@@ -277,13 +293,13 @@ pub fn write_usda(
         )?;
         writeln!(
             u,
-            "            def Shader \"St\"\n            {{\n                uniform token info:id = \"UsdPrimvarReader_float2\"\n                token inputs:varname = \"st\"\n                float2 outputs:result\n            }}\n"
+            "            def Shader \"St\"\n            {{\n                uniform token info:id = \"UsdPrimvarReader_float2\"\n                string inputs:varname = \"st\"\n                float2 outputs:result\n            }}\n"
         )?;
         u.push_str(&readers);
         writeln!(u, "        }}")?;
     }
     writeln!(u, "    }}\n}}")?;
-    std::fs::write(path, u).with_context(|| format!("could not write {}", path.display()))
+    Ok(u)
 }
 
 #[cfg(test)]
@@ -297,6 +313,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             uv: [x, y],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            ..Default::default()
         };
         Mesh {
             vertices: vec![v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)],

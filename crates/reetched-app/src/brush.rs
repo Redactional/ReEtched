@@ -63,6 +63,8 @@ pub struct Brush {
     /// Grey level painted into masks.
     pub mask_value: f32,
     pub alpha: Option<ResourceId>,
+    /// A dynamic stroke: several dabs per stamp, driven by expressions.
+    pub dynamics: Option<crate::dynamics::Dynamics>,
 }
 
 impl Default for Brush {
@@ -81,17 +83,24 @@ impl Default for Brush {
             pressure_size: true,
             pressure_flow: false,
             symmetry: Symmetry::Off,
-            channels: BTreeMap::from([
-                (Channel::BaseColor, ch(true, [0.8, 0.8, 0.8])),
-                (Channel::Metallic, ch(true, [0.0; 3])),
-                (Channel::Roughness, ch(true, [0.4; 3])),
-                (Channel::Normal, ch(false, [0.0, 0.0, 1.0])),
-                (Channel::Height, ch(false, [0.25; 3])),
-                (Channel::Emissive, ch(false, [1.0, 0.6, 0.2])),
-                (Channel::Opacity, ch(false, [0.0; 3])),
-            ]),
+            channels: Channel::ALL
+                .into_iter()
+                .map(|c| {
+                    let b = match c {
+                        Channel::BaseColor => ch(true, [0.8, 0.8, 0.8]),
+                        Channel::Metallic => ch(true, [0.0; 3]),
+                        Channel::Roughness => ch(true, [0.4; 3]),
+                        Channel::Height => ch(false, [0.25; 3]),
+                        Channel::Emissive => ch(false, [1.0, 0.6, 0.2]),
+                        Channel::Opacity => ch(false, [0.0; 3]),
+                        c => ch(false, c.empty_value()),
+                    };
+                    (c, b)
+                })
+                .collect(),
             mask_value: 1.0,
             alpha: None,
+            dynamics: None,
         }
     }
 }

@@ -129,7 +129,14 @@ pub fn channel_for(o: &OutputDef) -> Option<Channel> {
         "height" | "displacement" => Channel::Height,
         "emissive" | "emission" => Channel::Emissive,
         "opacity" | "alpha" => Channel::Opacity,
-        _ => return None,
+        "ambientocclusion" | "ao" => Channel::AmbientOcclusion,
+        "specular" | "specularlevel" => Channel::SpecularLevel,
+        "anisotropy" | "anisotropylevel" => Channel::Anisotropy,
+        "coat" | "coatweight" | "coatopacity" => Channel::Coat,
+        "sheen" | "sheenweight" | "sheenopacity" => Channel::Sheen,
+        "transmission" | "transmissive" => Channel::Transmission,
+        "subsurface" | "scattering" => Channel::Scattering,
+        other => return Channel::from_id(other),
     })
 }
 

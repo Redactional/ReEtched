@@ -14,7 +14,7 @@ struct Dab {
     up_angle: vec4<f32>,
     // xyz: view direction (eye → center), w: flags (1 = depth test, 2 = UV space)
     view_flags: vec4<f32>,
-    // xy: UV center, z: UV radius
+    // xy: UV center, z: UV radius, w: ribbon arc length (in brush radii)
     uv: vec4<f32>,
 };
 
@@ -31,6 +31,8 @@ struct Splat {
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 @group(0) @binding(2) var alpha_tex: texture_2d<f32>;
 @group(0) @binding(3) var smp: sampler;
+// xy: UV origin of the UDIM tile being painted.
+@group(0) @binding(4) var<uniform> TILE: vec4<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -49,20 +51,32 @@ struct VsOut {
 @vertex
 fn vs_uv(v: VsIn) -> VsOut {
     var o: VsOut;
-    o.clip = vec4(v.uv * 2.0 - 1.0, 0.0, 1.0);
+    o.clip = vec4((v.uv - TILE.xy) * 2.0 - 1.0, 0.0, 1.0);
     o.world = v.pos;
     o.normal = v.normal;
     o.uv = v.uv;
     return o;
 }
 
-// Brush footprint at `d` (brush space, unit radius).
-fn shape(d: vec2<f32>, angle: f32) -> f32 {
+// Brush footprint at `d` (brush space, unit radius). Ribbons (flag 4): the dab's x
+// axis follows the path, and the alpha repeats along it every brush diameter.
+fn shape(d: vec2<f32>, angle: f32, dab: Dab) -> f32 {
+    let h = min(S.params.y, 0.999);
+    if (u32(dab.view_flags.w) & 4u) != 0u {
+        if abs(d.x) >= 1.0 || abs(d.y) >= 1.0 {
+            return 0.0;
+        }
+        var a = 1.0 - smoothstep(h, 1.0, abs(d.y));
+        if S.params.w > 0.5 {
+            let t = vec2((dab.uv.w + d.x) * 0.5, d.y * -0.5 + 0.5);
+            a *= textureSampleLevel(alpha_tex, smp, t, 0.0).r;
+        }
+        return a;
+    }
     let r = length(d);
     if r >= 1.0 {
         return 0.0;
     }
-    let h = min(S.params.y, 0.999);
     var a = 1.0 - smoothstep(h, 1.0, r);
     if S.params.w > 0.5 {
         let c = cos(angle);
@@ -100,7 +114,7 @@ fn fs_splat(in: VsOut) -> @location(0) vec4<f32> {
         let flags = u32(dab.view_flags.w);
         var a = 0.0;
         if (flags & 2u) != 0u {
-            a = shape((in.uv - dab.uv.xy) / dab.uv.z, dab.up_angle.w);
+            a = shape((in.uv - dab.uv.xy) / dab.uv.z, dab.up_angle.w, dab);
         } else {
             let v = in.world - dab.center_radius.xyz;
             let r = dab.center_radius.w;
@@ -111,7 +125,7 @@ fn fs_splat(in: VsOut) -> @location(0) vec4<f32> {
             if S.params.z > -1.5 && dot(n, -dab.view_flags.xyz) < S.params.z {
                 continue;
             }
-            a = shape(vec2(dot(v, dab.right_flow.xyz), dot(v, dab.up_angle.xyz)) / r, dab.up_angle.w);
+            a = shape(vec2(dot(v, dab.right_flow.xyz), dot(v, dab.up_angle.xyz)) / r, dab.up_angle.w, dab);
             if a > 0.0 && (flags & 1u) != 0u && !visible(in.world, r) {
                 a = 0.0;
             }

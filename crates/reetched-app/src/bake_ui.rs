@@ -10,8 +10,8 @@ use std::{
     sync::{Arc, mpsc},
 };
 
-/// Encoded maps for one texture set: (set index, [(map, PNG bytes)]).
-type SetMaps = (usize, Vec<(MeshMap, Vec<u8>)>);
+/// Encoded maps for one texture set tile: (set index, UDIM tile, [(map, PNG bytes)]).
+type SetMaps = (usize, u32, Vec<(MeshMap, Vec<u8>)>);
 
 enum BakeMessage {
     Done(Vec<SetMaps>),
@@ -35,6 +35,8 @@ pub struct BakeUi {
     /// Which texture sets to bake.
     pub include: Vec<bool>,
     pub job: Option<BakeJob>,
+    /// UDIM tile whose maps Texture Set Settings lists (0 = the set's first).
+    pub map_tile: u32,
 }
 
 pub fn mesh_map(kind: MapKind) -> MeshMap {
@@ -241,24 +243,27 @@ impl State {
             let mut out = Vec::new();
             for (n, set) in sets.into_iter().enumerate() {
                 c.store(n, std::sync::atomic::Ordering::Relaxed);
-                let Some(maps) = reetched_bake::bake(&low, set, high.as_ref(), &settings, &p)
-                else {
-                    let _ = tx.send(BakeMessage::Cancelled);
-                    return;
-                };
-                let mut encoded = Vec::new();
-                for (kind, img) in maps {
-                    match encode_png16(&img, kind) {
-                        Ok(bytes) => encoded.push((mesh_map(kind), bytes)),
-                        Err(e) => {
-                            let _ = tx.send(BakeMessage::Failed(format!(
-                                "Could not encode a baked map: {e:#}"
-                            )));
-                            return;
+                for (tile, _) in low.udim_tiles(set) {
+                    let Some(maps) =
+                        reetched_bake::bake(&low, set, tile, high.as_ref(), &settings, &p)
+                    else {
+                        let _ = tx.send(BakeMessage::Cancelled);
+                        return;
+                    };
+                    let mut encoded = Vec::new();
+                    for (kind, img) in maps {
+                        match encode_png16(&img, kind) {
+                            Ok(bytes) => encoded.push((mesh_map(kind), bytes)),
+                            Err(e) => {
+                                let _ = tx.send(BakeMessage::Failed(format!(
+                                    "Could not encode a baked map: {e:#}"
+                                )));
+                                return;
+                            }
                         }
                     }
+                    out.push((set, tile, encoded));
                 }
-                out.push((set, encoded));
             }
             let _ = tx.send(BakeMessage::Done(out));
         });
@@ -285,18 +290,19 @@ impl State {
         match msg {
             BakeMessage::Done(sets) => {
                 let mut count = 0;
-                for (set, maps) in sets {
+                for (set, tile, maps) in sets {
                     for (map, bytes) in maps {
                         let id = self.resources.add(bytes);
-                        let name = format!(
-                            "{}_{}.png",
-                            self.doc.texture_sets[set].name,
-                            map.painter_suffix()
-                        );
+                        let ts = &mut self.doc.texture_sets[set];
+                        let name = if tile == reetched_doc::FIRST_UDIM {
+                            format!("{}_{}.png", ts.name, map.painter_suffix())
+                        } else {
+                            format!("{}_{}.{tile}.png", ts.name, map.painter_suffix())
+                        };
+                        ts.mesh_maps_for_mut(tile).insert(map, id.clone());
                         self.doc
                             .resources
-                            .insert(id.clone(), reetched_doc::ResourceInfo { name });
-                        self.doc.texture_sets[set].mesh_maps.insert(map, id);
+                            .insert(id, reetched_doc::ResourceInfo { name });
                         count += 1;
                     }
                 }
@@ -321,6 +327,20 @@ impl State {
         if import {
             self.import_painter_maps();
         }
+        let tiles = self.viewport.tiles(set_index);
+        if !tiles.contains(&self.bake.map_tile) {
+            self.bake.map_tile = tiles.first().copied().unwrap_or(reetched_doc::FIRST_UDIM);
+        }
+        let tile = self.bake.map_tile;
+        if tiles.len() > 1 {
+            ComboBox::from_id_salt("map_tile")
+                .selected_text(format!("Tile {tile}"))
+                .show_ui(ui, |ui| {
+                    for t in &tiles {
+                        ui.selectable_value(&mut self.bake.map_tile, *t, format!("Tile {t}"));
+                    }
+                });
+        }
         let Some(set) = self.doc.texture_sets.get(set_index) else {
             return;
         };
@@ -333,7 +353,7 @@ impl State {
             .show(ui, |ui| {
                 for map in MeshMap::ALL {
                     ui.label(map.label());
-                    match set.mesh_maps.get(&map) {
+                    match set.mesh_maps_for(tile).get(&map) {
                         Some(id) => {
                             ui.label(
                                 RichText::new(names.get(id).map_or("baked", |r| r.name.as_str()))
@@ -354,7 +374,9 @@ impl State {
                 }
             });
         if let Some(map) = clear {
-            self.doc.texture_sets[set_index].mesh_maps.remove(&map);
+            self.doc.texture_sets[set_index]
+                .mesh_maps_for_mut(tile)
+                .remove(&map);
         }
         if let Some(map) = load
             && let Some(path) = rfd::FileDialog::new()
@@ -362,7 +384,9 @@ impl State {
                 .pick_file()
             && let Some(id) = self.import_resource(&path)
         {
-            self.doc.texture_sets[set_index].mesh_maps.insert(map, id);
+            self.doc.texture_sets[set_index]
+                .mesh_maps_for_mut(tile)
+                .insert(map, id);
         }
     }
 

@@ -29,7 +29,7 @@ pub struct SmartMaterial {
 fn refs(node: &Node, files: &mut BTreeSet<ResourceId>, tiles: &mut BTreeSet<TileId>) {
     if let Some(mask) = &node.mask {
         files.extend(mask.bitmap.iter().cloned());
-        if let Some(p) = &mask.paint {
+        for p in mask.paint_maps() {
             tiles.extend(p.tiles.values().cloned());
         }
     }
@@ -41,7 +41,7 @@ fn refs(node: &Node, files: &mut BTreeSet<ResourceId>, tiles: &mut BTreeSet<Tile
             }
         }
         NodeKind::Paint(paint) => {
-            for map in paint.channels.values() {
+            for (_, _, map) in paint.maps() {
                 tiles.extend(map.tiles.values().cloned());
             }
         }

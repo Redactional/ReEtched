@@ -11,8 +11,18 @@ use egui::{
 };
 use egui_material_icons::icons as ic;
 use glam::Vec2;
+use reetched_doc::Channel;
 
 impl State {
+    /// The selected texture set's channels beyond the core seven.
+    fn extra_channels(&self) -> Vec<Channel> {
+        self.doc
+            .texture_sets
+            .get(self.selected_part)
+            .map(|s| s.channels().into_iter().filter(|c| !c.is_core()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn assets_ui(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("›  All libraries").color(theme::WEAK));
         ui.add(
@@ -204,6 +214,7 @@ impl State {
                 });
             ui.add_space(8.0);
             ui.label(theme::header("RENDERING"));
+            let ocio = self.color.ocio.is_some();
             let r = &mut self.render;
             egui::Grid::new("rendering")
                 .num_columns(2)
@@ -215,7 +226,9 @@ impl State {
                         .selected_text(r.tone_map.label())
                         .show_ui(ui, |ui| {
                             for t in ToneMap::ALL {
-                                ui.selectable_value(&mut r.tone_map, t, t.label());
+                                if t != ToneMap::Ocio || ocio {
+                                    ui.selectable_value(&mut r.tone_map, t, t.label());
+                                }
                             }
                         });
                     ui.end_row();
@@ -253,11 +266,43 @@ impl State {
                     ui.add(egui::Slider::new(&mut r.parallax, 0.0..=0.2))
                         .on_hover_text("Parallax occlusion from the height channel (0 = off)");
                     ui.end_row();
+                    ui.label("Subsurface scattering");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut r.sss, "");
+                        ui.add_enabled(
+                            r.sss,
+                            egui::Slider::new(&mut r.sss_radius, 0.001..=0.5)
+                                .logarithmic(true)
+                                .text("radius"),
+                        )
+                        .on_hover_text("How far light travels under the surface (scene units)");
+                    });
+                    ui.end_row();
                     ui.label("Anti-aliasing");
                     ui.checkbox(&mut r.accumulate, "Progressive")
                         .on_hover_text("Refines the image over a few frames while nothing moves");
                     ui.end_row();
+                    ui.label("Depth of field");
+                    ui.add_enabled(r.accumulate, egui::Checkbox::new(&mut r.dof, ""))
+                        .on_disabled_hover_text("Needs progressive anti-aliasing");
+                    ui.end_row();
+                    if r.dof {
+                        ui.label("Aperture");
+                        ui.add(egui::Slider::new(&mut r.aperture, 0.0..=1.0).logarithmic(true))
+                            .on_hover_text("Lens radius in scene units: bigger blurs more");
+                        ui.end_row();
+                        ui.label("Focus distance");
+                        ui.add(
+                            egui::DragValue::new(&mut r.focus)
+                                .speed(0.01)
+                                .range(0.0..=10_000.0),
+                        )
+                        .on_hover_text("0 focuses on the point the camera orbits");
+                        ui.end_row();
+                    }
                 });
+            ui.add_space(8.0);
+            self.color_management_ui(ui);
             ui.add_space(8.0);
             ui.label(theme::header("CAMERA"));
             egui::Grid::new("camera")
@@ -361,9 +406,10 @@ impl State {
             cam.frame(self.bounds);
         }
 
+        let channels = self.extra_channels();
         overlay(ui, rect, |ui| {
             camera_combo(ui, &mut self.camera.orthographic, "cam_overlay");
-            view_mode_combo(ui, &mut self.view_mode, "mode3d");
+            view_mode_combo(ui, &mut self.view_mode, "mode3d", &channels);
         });
     }
 
@@ -385,26 +431,40 @@ impl State {
         );
         self.accept_preset_drop(&response, None);
         drop_highlight(ui, &response);
-        self.paint_input(ui, &response, rect, true);
-        self.polygon_input(ui, &response, rect, true);
+        if !self.warp_input(ui, &response, rect) {
+            self.paint_input(ui, &response, rect, true);
+            self.polygon_input(ui, &response, rect, true);
+        }
 
-        // UDIM 1001 outline.
+        // UDIM tile outlines.
         let painter = ui.painter_at(rect);
-        let lo = self.uv_camera.to_screen(rect, Vec2::ZERO);
-        let hi = self.uv_camera.to_screen(rect, Vec2::ONE);
-        painter.rect_stroke(
-            Rect::from_two_pos(lo, hi),
-            0.0,
-            Stroke::new(1.0, Color32::from_gray(0x60)),
-            StrokeKind::Middle,
-        );
-        painter.text(
-            Rect::from_two_pos(lo, hi).left_top() + vec2(4.0, 3.0),
-            egui::Align2::LEFT_TOP,
-            "1001",
-            egui::FontId::proportional(10.5),
-            theme::WEAK,
-        );
+        let mut tiles = self.viewport.tiles(self.selected_part);
+        if tiles.is_empty() {
+            tiles.push(reetched_doc::FIRST_UDIM);
+        }
+        for t in tiles {
+            let o = Vec2::from(reetched_doc::udim_origin(t));
+            let lo = self.uv_camera.to_screen(rect, o);
+            let hi = self.uv_camera.to_screen(rect, o + Vec2::ONE);
+            painter.rect_stroke(
+                Rect::from_two_pos(lo, hi),
+                0.0,
+                Stroke::new(1.0, Color32::from_gray(0x60)),
+                StrokeKind::Middle,
+            );
+            let label = self
+                .doc
+                .texture_sets
+                .get(self.selected_part)
+                .map_or_else(|| t.to_string(), |s| s.tile_label(t));
+            painter.text(
+                Rect::from_two_pos(lo, hi).left_top() + vec2(4.0, 3.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(10.5),
+                theme::WEAK,
+            );
+        }
 
         // Pan: MMB (or Alt+MMB); zoom: wheel or Alt+RMB; F frames the tile.
         let (alt, scroll, frame_key) = ui.input(|i| {
@@ -431,8 +491,9 @@ impl State {
             cam.zoom = 0.0;
         }
 
+        let channels = self.extra_channels();
         overlay(ui, rect, |ui| {
-            view_mode_combo(ui, &mut self.uv_mode, "mode2d")
+            view_mode_combo(ui, &mut self.uv_mode, "mode2d", &channels)
         });
     }
 }
@@ -479,13 +540,16 @@ fn camera_combo(ui: &mut Ui, orthographic: &mut bool, id: &str) {
         });
 }
 
-fn view_mode_combo(ui: &mut Ui, mode: &mut ViewMode, id: &str) {
+fn view_mode_combo(ui: &mut Ui, mode: &mut ViewMode, id: &str, extra: &[Channel]) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(mode.label())
         .width(130.0)
         .show_ui(ui, |ui| {
             for m in ViewMode::CHANNELS {
                 ui.selectable_value(mode, m, m.label());
+            }
+            for &c in extra {
+                ui.selectable_value(mode, ViewMode::Channel(c), c.label());
             }
             ui.separator();
             ui.label(theme::header("MESH MAPS"));

@@ -13,7 +13,7 @@ use std::{collections::HashMap, path::PathBuf};
 fn encode(c: Channel, v: [f32; 3]) -> [u8; 3] {
     let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     match c {
-        Channel::BaseColor | Channel::Emissive => v.map(|x| b(linear_to_srgb(x))),
+        _ if c.is_color() => v.map(|x| b(linear_to_srgb(x))),
         Channel::Normal => v.map(|x| b(x * 0.5 + 0.5)),
         Channel::Height => [b(v[0] + 0.5); 3],
         _ => [b(v[0]); 3],
@@ -29,6 +29,7 @@ fn value(d: &ChannelData, c: Channel, i: usize) -> [f32; 3] {
         Channel::Height => [d.height_map[i]; 3],
         Channel::Emissive => d.emissive[i],
         Channel::Opacity => [d.opacity[i]; 3],
+        c => d.extra.get(&c).map_or(c.empty_value(), |v| v[i]),
     }
 }
 
@@ -36,7 +37,7 @@ fn value(d: &ChannelData, c: Channel, i: usize) -> [f32; 3] {
 fn uses(nodes: &[Node], c: Channel) -> bool {
     nodes.iter().any(|n| match &n.kind {
         NodeKind::Fill(f) => f.channels.get(&c).is_some_and(|s| s.enabled),
-        NodeKind::Paint(p) => p.channels.get(&c).is_some_and(|m| !m.tiles.is_empty()),
+        NodeKind::Paint(p) => p.maps().any(|(_, mc, m)| mc == c && !m.tiles.is_empty()),
         NodeKind::Folder { children } => uses(children, c),
     })
 }
@@ -70,37 +71,44 @@ impl State {
             if !self.export.include.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let merged = match self.viewport.read_back(&self.device, &self.queue, i) {
-                Ok(d) => d,
-                Err(e) => {
-                    self.error(format!("PSD export of {} failed: {e:#}", set.name));
-                    return;
-                }
-            };
-            let mut cache = Cache::default();
-            for c in Channel::ALL {
-                if c != Channel::BaseColor && !uses(&set.stack, c) {
-                    continue;
-                }
-                let nodes = self.psd_nodes(i, set, &set.stack, c, &mut cache);
-                let pixels: Vec<[u8; 4]> = (0..merged.base_color.len())
-                    .map(|k| {
-                        let [r, g, b] = encode(c, value(&merged, c, k));
-                        [r, g, b, if merged.coverage[k] { 255 } else { 0 }]
-                    })
-                    .collect();
-                let name = format!("{mesh}_{}_{c:?}.psd", set.name);
-                let path = dir.join(name);
-                match write_psd(&path, merged.width, merged.height, &pixels, &nodes) {
-                    Ok(notes) => {
-                        written += 1;
-                        for n in notes {
-                            self.warn(format!("{}: {n}", path.display()));
-                        }
-                    }
+            let tiles = self.viewport.tiles(i);
+            for &tile in &tiles {
+                let merged = match self.viewport.read_back(&self.device, &self.queue, i, tile) {
+                    Ok(d) => d,
                     Err(e) => {
-                        self.error(format!("PSD export failed: {e:#}"));
+                        self.error(format!("PSD export of {} failed: {e:#}", set.name));
                         return;
+                    }
+                };
+                let mut cache = Cache::default();
+                for c in set.channels() {
+                    if c != Channel::BaseColor && !uses(&set.stack, c) {
+                        continue;
+                    }
+                    let nodes = self.psd_nodes(i, tile, set, &set.stack, c, &mut cache);
+                    let pixels: Vec<[u8; 4]> = (0..merged.base_color.len())
+                        .map(|k| {
+                            let [r, g, b] = encode(c, value(&merged, c, k));
+                            [r, g, b, if merged.coverage[k] { 255 } else { 0 }]
+                        })
+                        .collect();
+                    let name = if tiles.len() > 1 || set.is_udim() {
+                        format!("{mesh}_{}_{c:?}.{tile}.psd", set.name)
+                    } else {
+                        format!("{mesh}_{}_{c:?}.psd", set.name)
+                    };
+                    let path = dir.join(name);
+                    match write_psd(&path, merged.width, merged.height, &pixels, &nodes) {
+                        Ok(notes) => {
+                            written += 1;
+                            for n in notes {
+                                self.warn(format!("{}: {n}", path.display()));
+                            }
+                        }
+                        Err(e) => {
+                            self.error(format!("PSD export failed: {e:#}"));
+                            return;
+                        }
                     }
                 }
             }
@@ -111,15 +119,17 @@ impl State {
         ));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn psd_nodes(
         &mut self,
         part: usize,
+        tile: u32,
         set: &TextureSet,
         nodes: &[Node],
         c: Channel,
         cache: &mut Cache,
     ) -> Vec<PsdNode> {
-        let res = set.resolution;
+        let res = set.tile_resolution(tile);
         let n_texels = (res * res) as usize;
         nodes
             .iter()
@@ -128,7 +138,7 @@ impl State {
                 let mask = n
                     .mask
                     .as_ref()
-                    .map(|m| self.mask_image(part, set, n.id, m, cache));
+                    .map(|m| self.mask_image(part, tile, set, n.id, m, cache));
                 match &n.kind {
                     NodeKind::Folder { children } => PsdNode::Group {
                         name: n.name.clone(),
@@ -136,11 +146,11 @@ impl State {
                         blend: blend.mode,
                         opacity: blend.opacity,
                         mask,
-                        children: self.psd_nodes(part, set, children, c, cache),
+                        children: self.psd_nodes(part, tile, set, children, c, cache),
                     },
                     kind => {
                         let pixels: Vec<[u8; 4]> = match kind {
-                            NodeKind::Paint(p) => match p.channels.get(&c) {
+                            NodeKind::Paint(p) => match p.map(tile, c) {
                                 Some(map) => (0..n_texels as u32)
                                     .map(|k| {
                                         let t = map.texel(&self.resources, k % res, k / res);
@@ -151,7 +161,7 @@ impl State {
                                 None => vec![[0; 4]; n_texels],
                             },
                             NodeKind::Fill(f) if f.channels.get(&c).is_some_and(|s| s.enabled) => {
-                                let data = self.fill_content(part, set, n, f, cache);
+                                let data = self.fill_content(part, tile, set, n, f, cache);
                                 (0..n_texels)
                                     .map(|k| {
                                         let [r, g, b] = encode(c, value(data, c, k));
@@ -163,7 +173,7 @@ impl State {
                         };
                         PsdNode::Layer {
                             name: n.name.clone(),
-                            visible: n.visible,
+                            visible: n.visible && n.on_tile(tile),
                             blend: blend.mode,
                             opacity: blend.opacity,
                             pixels,
@@ -179,6 +189,7 @@ impl State {
     fn fill_content<'a>(
         &mut self,
         part: usize,
+        tile: u32,
         set: &TextureSet,
         node: &Node,
         fill: &Fill,
@@ -187,7 +198,7 @@ impl State {
         cache.fills.entry(node.id).or_insert_with(|| {
             let mut alone = self.doc.new_fill(node.name.clone(), fill.clone());
             alone.id = node.id;
-            self.composite_alone(part, set, vec![alone])
+            self.composite_alone(part, tile, set, vec![alone])
         })
     }
 
@@ -195,6 +206,7 @@ impl State {
     fn mask_image(
         &mut self,
         part: usize,
+        tile: u32,
         set: &TextureSet,
         id: NodeId,
         mask: &Mask,
@@ -216,7 +228,7 @@ impl State {
         mask.enabled = true;
         white.mask = Some(mask);
         let black = self.doc.new_fill("black".into(), only_base(0.0));
-        let data = self.composite_alone(part, set, vec![white, black]);
+        let data = self.composite_alone(part, tile, set, vec![white, black]);
         let img: Vec<u8> = data
             .base_color
             .iter()
@@ -226,23 +238,34 @@ impl State {
         img
     }
 
-    fn composite_alone(&mut self, part: usize, set: &TextureSet, stack: Vec<Node>) -> ChannelData {
+    fn composite_alone(
+        &mut self,
+        part: usize,
+        tile: u32,
+        set: &TextureSet,
+        stack: Vec<Node>,
+    ) -> ChannelData {
         let mut tmp = set.clone();
         tmp.stack = stack;
-        match self
-            .viewport
-            .composite_temp(&self.device, &self.queue, part, &tmp, &self.resources)
-        {
+        match self.viewport.composite_temp(
+            &self.device,
+            &self.queue,
+            part,
+            tile,
+            &tmp,
+            &self.resources,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 self.warn(format!(
                     "PSD export: could not render a layer of {}: {e:#}",
                     set.name
                 ));
-                let n = (set.resolution * set.resolution) as usize;
+                let res = set.tile_resolution(tile);
+                let n = (res * res) as usize;
                 ChannelData {
-                    width: set.resolution,
-                    height: set.resolution,
+                    width: res,
+                    height: res,
                     base_color: vec![[0.0; 3]; n],
                     metallic: vec![0.0; n],
                     roughness: vec![0.0; n],
@@ -252,6 +275,7 @@ impl State {
                     opacity: vec![1.0; n],
                     coverage: vec![false; n],
                     ambient_occlusion: Vec::new(),
+                    extra: Default::default(),
                 }
             }
         }

@@ -26,6 +26,8 @@ pub enum MapSource {
     Opacity,
     Black,
     White,
+    /// Any other channel (specular level, coat, …), as composited.
+    Channel(crate::Channel),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -248,6 +250,9 @@ pub struct ChannelData {
     pub coverage: Vec<bool>,
     /// Baked ambient occlusion (empty = none, exported as white).
     pub ambient_occlusion: Vec<f32>,
+    /// The texture set's other channels (scalars in `[0]`); missing ones export
+    /// their empty value.
+    pub extra: std::collections::BTreeMap<crate::Channel, Vec<[f32; 3]>>,
 }
 
 impl ChannelData {
@@ -278,7 +283,14 @@ impl ChannelData {
             }
             // ponytail: height 0 is stored as mid grey; revisit with Painter golden exports.
             MapSource::Height => self.height_map[i] + 0.5,
-            MapSource::AmbientOcclusion => self.ambient_occlusion.get(i).copied().unwrap_or(1.0),
+            // Painter's "mixed AO": baked times painted.
+            MapSource::AmbientOcclusion => {
+                let painted = self
+                    .extra
+                    .get(&crate::Channel::AmbientOcclusion)
+                    .map_or(1.0, |d| d[i][0]);
+                self.ambient_occlusion.get(i).copied().unwrap_or(1.0) * painted
+            }
             MapSource::Emissive => {
                 let v = if component == Component::L {
                     let [r, g, b] = self.emissive[i];
@@ -291,6 +303,28 @@ impl ChannelData {
             MapSource::Opacity => self.opacity[i],
             MapSource::White => 1.0,
             MapSource::Black => 0.0,
+            MapSource::Channel(ch) => {
+                let v = self
+                    .extra
+                    .get(&ch)
+                    .and_then(|d| d.get(i))
+                    .copied()
+                    .unwrap_or_else(|| ch.empty_value());
+                let v = if component == Component::L {
+                    if ch.is_vector() {
+                        0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+                    } else {
+                        v[0]
+                    }
+                } else {
+                    v[if ch.is_vector() { c } else { 0 }]
+                };
+                if encode_srgb && ch.is_color() {
+                    linear_to_srgb(v)
+                } else {
+                    v
+                }
+            }
         }
     }
 }
@@ -362,16 +396,30 @@ fn padding_map(data: &ChannelData, padding: Padding) -> Vec<Option<u32>> {
     source
 }
 
+/// Stands for the tile number in file names that USD and other tools expand per tile.
+pub const UDIM_TOKEN: &str = "<UDIM>";
+
 /// Replaces `$tokens` in a file name template and strips characters Windows rejects.
-pub fn expand_name(template: &str, project: &str, mesh: &str, texture_set: &str) -> String {
-    let name = template
+/// `udim`: the UDIM tile (or `UDIM_TOKEN`) of a UDIM texture set; added as
+/// `.1002` when the template has no `$udim`.
+pub fn expand_name(
+    template: &str,
+    project: &str,
+    mesh: &str,
+    texture_set: &str,
+    udim: Option<&str>,
+) -> String {
+    let mut name = template
         .replace("$project", project)
         .replace("$mesh", mesh)
         .replace("$textureSet", texture_set)
         .replace("$textureset", texture_set)
-        .replace("$udim", "1001")
         .replace("$colorSpace", "");
-    name.chars()
+    if udim.is_some() && !name.contains("$udim") {
+        name.push_str(".$udim");
+    }
+    let name: String = name
+        .chars()
         .map(|c| {
             if "<>:\"/\\|?*".contains(c) || c.is_control() {
                 '_'
@@ -379,17 +427,22 @@ pub fn expand_name(template: &str, project: &str, mesh: &str, texture_set: &str)
                 c
             }
         })
-        .collect()
+        .collect();
+    // After sanitizing, so the token's brackets survive.
+    name.replace("$udim", udim.unwrap_or("1001"))
 }
 
-/// Writes every map of `preset` for one texture set. Returns the written files.
+/// Writes every map of `preset` for one texture set (one UDIM tile of it, if
+/// `udim` is set). Returns the written files.
 pub fn export_texture_set(
     preset: &ExportPreset,
     settings: &ExportSettings,
     data: &ChannelData,
     dir: &Path,
     names: (&str, &str, &str),
+    udim: Option<u32>,
 ) -> Result<Vec<PathBuf>> {
+    let udim = udim.map(|u| u.to_string());
     if !settings.format.depths().contains(&settings.depth) {
         bail!(
             "{:?} can't be written at {}",
@@ -431,7 +484,7 @@ pub fn export_texture_set(
         }
         let file = dir.join(format!(
             "{}.{}",
-            expand_name(&map.file_name, names.0, names.1, names.2),
+            expand_name(&map.file_name, names.0, names.1, names.2, udim.as_deref()),
             settings.format.extension()
         ));
         write_image(&file, settings, w, h, comps, &px)
@@ -634,6 +687,7 @@ fn painter_source(s: MapSource) -> Option<(&'static str, &'static str)> {
         MapSource::AmbientOcclusion => ("virtualMap", "Mixed_AO"),
         MapSource::Emissive => ("documentMap", "emissive"),
         MapSource::Opacity => ("documentMap", "opacity"),
+        MapSource::Channel(c) => ("documentMap", c.id()),
         MapSource::Black | MapSource::White => return None,
     })
 }
@@ -649,9 +703,10 @@ fn from_painter_source(kind: &str, name: &str) -> Option<MapSource> {
         ("documentMap", "normal") | ("virtualMap", "normal_opengl") => MapSource::NormalOpenGl,
         ("virtualMap", "normal_directx") => MapSource::NormalDirectX,
         ("virtualMap", "glossiness") => MapSource::Glossiness,
-        ("virtualMap", "mixed_ao")
-        | ("meshMap", "ambient_occlusion")
-        | ("documentMap", "ambientocclusion") => MapSource::AmbientOcclusion,
+        ("virtualMap", "mixed_ao") | ("meshMap", "ambient_occlusion") => {
+            MapSource::AmbientOcclusion
+        }
+        ("documentMap", other) => MapSource::Channel(crate::Channel::from_id(other)?),
         _ => return None,
     })
 }
@@ -769,6 +824,7 @@ mod tests {
             opacity: vec![1.0; 4],
             coverage: vec![false, true, true, false],
             ambient_occlusion: Vec::new(),
+            extra: Default::default(),
         }
     }
 
@@ -807,6 +863,7 @@ mod tests {
             &d,
             &dir,
             ("p", "m", "Set"),
+            None,
         )
         .unwrap();
         assert_eq!(files.len(), 4, "base, normal, ORM, emissive");
@@ -835,7 +892,8 @@ mod tests {
             depth: BitDepth::Float32,
             padding: Padding::None,
         };
-        let files = export_texture_set(preset, &settings, &d, &dir, ("p", "m", "exr")).unwrap();
+        let files =
+            export_texture_set(preset, &settings, &d, &dir, ("p", "m", "exr"), None).unwrap();
         let img = image::open(&files[0]).unwrap().to_rgb32f();
         assert_eq!(img.get_pixel(1, 0).0, [0.5, 0.25, 0.125]);
     }
@@ -853,8 +911,16 @@ mod tests {
     #[test]
     fn names_expand_and_sanitize() {
         assert_eq!(
-            expand_name("$mesh_$textureSet_$udim", "p", "ball", "Mat:1"),
+            expand_name("$mesh_$textureSet_$udim", "p", "ball", "Mat:1", None),
             "ball_Mat_1_1001"
+        );
+        assert_eq!(
+            expand_name("$mesh_$textureSet_Normal", "p", "ball", "M", Some("1002")),
+            "ball_M_Normal.1002"
+        );
+        assert_eq!(
+            expand_name("$textureSet_$udim", "p", "b", "M", Some(UDIM_TOKEN)),
+            "M_<UDIM>"
         );
     }
 }

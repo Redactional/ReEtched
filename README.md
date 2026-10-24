@@ -2,7 +2,7 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 6 of 9 done).** You can bake mesh maps, paint and texture a model with layers, procedural and smart materials, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), save projects and export game-ready textures. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 6 of 9 done).** You can bake mesh maps, paint and texture a model (UDIM tiles included) with layers, procedural and smart materials, shade it with metal/rough, Adobe Standard Material, OpenPBR or your own Painter GLSL shaders under OCIO color management, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), save projects and export game-ready textures, PSDs and USD/OBJ meshes. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
@@ -54,10 +54,12 @@ cargo test --workspace
 
 ```
 crates/
-  reetched-io/     mesh import (FBX, OBJ, glTF), tangent generation
+  reetched-io/     mesh import (FBX, OBJ, glTF, USD), mesh export (USD, USDZ, OBJ), topology, unwrapping
   reetched-bake/   CPU mesh map baker (BVH ray casting)
   reetched-graph/  procedural graph engine: Designer-style atomic nodes, function graphs, material library
   reetched-substance/ Substance file readers (.sbs) and the Painter bridge importer
+  reetched-color/  pure-Rust OpenColorIO v2 subset: configs, transforms, LUTs, ACES 1.x / 2.x
+  reetched-shader/ Painter custom shader (.glsl) translation, with our own implementation of its shader API
   reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, smart materials, texture export
   reetched-app/    the application: UI, GPU layer compositor, viewport renderer, shaders
 tools/

@@ -1,0 +1,18 @@
+[package]
+name = "reetched-color"
+description = "Pure-Rust subset of OpenColorIO v2: config loading, processors and LUT baking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# serde_yaml 0.9 keeps OCIO's `!<Tag>` nodes as `Value::Tagged`.
+serde_yaml = "0.9"
+roxmltree = "0.20"
+rayon = "1.12"
+
+[dev-dependencies]
+serde_json = "1"

@@ -3,6 +3,7 @@
 
 pub mod export;
 pub mod topology;
+mod usd;
 
 use anyhow::{Context, Result, anyhow, bail};
 use glam::{Mat4, Vec3};
@@ -17,6 +18,8 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// MikkTSpace tangent; w is the bitangent sign.
     pub tangent: [f32; 4],
+    /// Second UV set; zero when the mesh has only one.
+    pub uv1: [f32; 2],
 }
 
 #[derive(Clone)]
@@ -47,6 +50,55 @@ impl Mesh {
         self.indices.len() / 3
     }
 
+    /// UDIM tile of triangle `t` (by its UV centroid).
+    pub fn triangle_udim(&self, t: usize) -> u32 {
+        let uv = |k: usize| glam::Vec2::from(self.vertices[self.indices[t * 3 + k] as usize].uv);
+        let c = (uv(0) + uv(1) + uv(2)) / 3.0;
+        let u = (c.x.floor() as i64).clamp(0, 9) as u32;
+        let v = (c.y.floor() as i64).clamp(0, 99) as u32;
+        1001 + u + 10 * v
+    }
+
+    /// Orders each part's triangles by UDIM tile, so every tile is one index range.
+    /// Meshes inside the 0..1 tile are left as they are.
+    pub fn sort_by_udim(&mut self) {
+        for p in 0..self.parts.len() {
+            let range = self.parts[p].indices.clone();
+            let tris = (range.start / 3..range.end / 3).map(|t| t as usize);
+            let mut keyed: Vec<(u32, [u32; 3])> = tris
+                .map(|t| {
+                    let i = &self.indices[t * 3..t * 3 + 3];
+                    (self.triangle_udim(t), [i[0], i[1], i[2]])
+                })
+                .collect();
+            if keyed.windows(2).all(|w| w[0].0 <= w[1].0) {
+                continue;
+            }
+            keyed.sort_by_key(|k| k.0); // stable: keeps the order within a tile
+            let out = keyed.iter().flat_map(|k| k.1);
+            for (dst, src) in self.indices[range.start as usize..range.end as usize]
+                .iter_mut()
+                .zip(out)
+            {
+                *dst = src;
+            }
+        }
+    }
+
+    /// Part `part`'s UDIM tiles and their index ranges (after `sort_by_udim`).
+    pub fn udim_tiles(&self, part: usize) -> Vec<(u32, Range<u32>)> {
+        let range = self.parts[part].indices.clone();
+        let mut out: Vec<(u32, Range<u32>)> = Vec::new();
+        for t in range.start / 3..range.end / 3 {
+            let tile = self.triangle_udim(t as usize);
+            match out.last_mut() {
+                Some((n, r)) if *n == tile => r.end = t * 3 + 3,
+                _ => out.push((tile, t * 3..t * 3 + 3)),
+            }
+        }
+        out
+    }
+
     /// Built-in preview mesh, so the viewport isn't empty on startup.
     pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Mesh {
         let corner = |i: u32, j: u32| {
@@ -62,6 +114,7 @@ impl Mesh {
                 normal: n.into(),
                 uv: [u, 1.0 - v],
                 tangent: [0.0; 4],
+                uv1: [u, 1.0 - v],
             }
         };
         let mut corners = Vec::new();
@@ -88,7 +141,10 @@ pub fn load_mesh(path: &Path) -> Result<Mesh> {
     let soup = match ext.as_str() {
         "fbx" | "obj" => load_ufbx(path)?,
         "gltf" | "glb" => load_gltf(path)?,
-        _ => bail!("unsupported mesh format '.{ext}' (supported: fbx, obj, gltf, glb)"),
+        "usd" | "usda" | "usdc" | "usdz" => usd::load(path)?,
+        _ => bail!(
+            "unsupported mesh format '.{ext}' (supported: fbx, obj, gltf, glb, usd, usda, usdc, usdz)"
+        ),
     };
     if soup.groups.iter().all(|(_, c)| c.is_empty()) {
         bail!("{} contains no triangles", path.display());
@@ -98,13 +154,13 @@ pub fn load_mesh(path: &Path) -> Result<Mesh> {
 
 /// Triangle corners (3 per triangle) grouped by material, in first-seen order.
 #[derive(Default)]
-struct Soup {
-    groups: Vec<(String, Vec<Vertex>)>,
-    has_uvs: bool,
+pub(crate) struct Soup {
+    pub(crate) groups: Vec<(String, Vec<Vertex>)>,
+    pub(crate) has_uvs: bool,
 }
 
 impl Soup {
-    fn group(&mut self, name: &str) -> &mut Vec<Vertex> {
+    pub(crate) fn group(&mut self, name: &str) -> &mut Vec<Vertex> {
         let i = match self.groups.iter().position(|(n, _)| n == name) {
             Some(i) => i,
             None => {
@@ -157,6 +213,14 @@ fn load_ufbx(path: &Path) -> Result<Soup> {
                 } else {
                     [0.0; 2]
                 };
+                let uv1 =
+                    mesh.uv_sets
+                        .get(1)
+                        .filter(|s| s.vertex_uv.exists)
+                        .map_or([0.0; 2], |s| {
+                            let t = s.vertex_uv[ix];
+                            [t.x as f32, t.y as f32]
+                        });
                 out.push(Vertex {
                     position: [p.x as f32, p.y as f32, p.z as f32],
                     normal: Vec3::new(nn.x as f32, nn.y as f32, nn.z as f32)
@@ -164,6 +228,7 @@ fn load_ufbx(path: &Path) -> Result<Soup> {
                         .into(),
                     uv,
                     tangent: [0.0; 4],
+                    uv1,
                 });
             }
         }
@@ -201,6 +266,7 @@ fn load_gltf(path: &Path) -> Result<Soup> {
             let pos: Vec<[f32; 3]> = pos.collect();
             let nrm: Option<Vec<[f32; 3]>> = r.read_normals().map(|n| n.collect());
             let uvs: Option<Vec<[f32; 2]>> = r.read_tex_coords(0).map(|t| t.into_f32().collect());
+            let uvs1: Option<Vec<[f32; 2]>> = r.read_tex_coords(1).map(|t| t.into_f32().collect());
             let idx: Vec<u32> = match r.read_indices() {
                 Some(i) => i.into_u32().collect(),
                 None => (0..pos.len() as u32).collect(),
@@ -229,6 +295,7 @@ fn load_gltf(path: &Path) -> Result<Soup> {
                         // glTF puts v = 0 at the top; convert to the OpenGL convention.
                         uv: uvs.as_ref().map_or([0.0; 2], |u| [u[i][0], 1.0 - u[i][1]]),
                         tangent: [0.0; 4],
+                        uv1: uvs1.as_ref().map_or([0.0; 2], |u| [u[i][0], 1.0 - u[i][1]]),
                     });
                 }
             }
@@ -298,7 +365,7 @@ fn build(soup: Soup) -> Mesh {
         parts: Vec::new(),
         has_uvs: soup.has_uvs,
     };
-    let mut lookup: HashMap<[u32; 12], u32> = HashMap::new();
+    let mut lookup: HashMap<[u32; 14], u32> = HashMap::new();
     for (material, mut corners) in soup.groups {
         if corners.is_empty() {
             continue;
@@ -323,6 +390,7 @@ fn build(soup: Soup) -> Mesh {
             indices: start..mesh.indices.len() as u32,
         });
     }
+    mesh.sort_by_udim();
     mesh
 }
 
@@ -376,6 +444,34 @@ mod tests {
             assert!(t.abs_diff_eq(Vec3::X, 1e-4), "tangent {t}");
             assert_eq!(v.tangent[3], 1.0);
         }
+    }
+
+    #[test]
+    fn udim_tiles_become_contiguous_ranges() {
+        // Three triangles: tile 1002, 1001, 1002.
+        let v = |u: f32, w: f32| Vertex {
+            uv: [u, w],
+            ..Default::default()
+        };
+        let mut mesh = Mesh {
+            vertices: vec![
+                v(1.1, 0.1),
+                v(1.9, 0.1),
+                v(1.5, 0.9),
+                v(0.1, 0.1),
+                v(0.9, 0.1),
+                v(0.5, 0.9),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5, 2, 1, 0],
+            parts: vec![MeshPart {
+                material: "m".into(),
+                indices: 0..9,
+            }],
+            has_uvs: true,
+        };
+        mesh.sort_by_udim();
+        assert_eq!(mesh.indices, [3, 4, 5, 0, 1, 2, 2, 1, 0]);
+        assert_eq!(mesh.udim_tiles(0), [(1001, 0..3), (1002, 3..9)]);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[package]
+name = "reetched-shader"
+description = "Loads Substance 3D Painter custom shaders (.glsl) and translates them for the ReEtched viewport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+naga = { version = "30.0.1", features = ["glsl-in"] }
+serde_json = "1"
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["glsl-in", "wgsl-in", "wgsl-out"] }

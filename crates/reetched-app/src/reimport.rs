@@ -54,12 +54,7 @@ impl State {
                 .position(|s| s.name == part.material)
             else {
                 let layer = doc.new_paint("Layer 1".into());
-                sets.push(TextureSet {
-                    name: part.material.clone(),
-                    resolution: 2048,
-                    stack: vec![layer],
-                    mesh_maps: Default::default(),
-                });
+                sets.push(TextureSet::new(part.material.clone(), vec![layer]));
                 self.info(format!("New texture set {}", part.material));
                 continue;
             };

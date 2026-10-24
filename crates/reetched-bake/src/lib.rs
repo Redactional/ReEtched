@@ -224,21 +224,29 @@ fn averaged_normals(mesh: &Mesh) -> Vec<Vec3> {
         .collect()
 }
 
-fn rasterize(mesh: &Mesh, part: usize, res: u32, aa: u32) -> Vec<Vec<Sample>> {
+/// Texture-space samples of part `part`'s triangles in UDIM tile `tile`.
+fn rasterize(mesh: &Mesh, part: usize, tile: u32, res: u32, aa: u32) -> Vec<Vec<Sample>> {
     let mut texels: Vec<Vec<Sample>> = vec![Vec::new(); (res * res) as usize];
     let averaged = averaged_normals(mesh);
     let range = mesh.parts[part].indices.clone();
     let offsets: Vec<Vec2> = (0..aa * aa)
         .map(|i| Vec2::new((i % aa) as f32 + 0.5, (i / aa) as f32 + 0.5) / aa as f32)
         .collect();
-    for tri in mesh.indices[range.start as usize..range.end as usize]
-        .as_chunks::<3>()
-        .0
-    {
+    let k = tile.saturating_sub(1001);
+    let origin = Vec2::new((k % 10) as f32, (k / 10) as f32);
+    for t in range.start / 3..range.end / 3 {
+        if mesh.triangle_udim(t as usize) != tile {
+            continue;
+        }
+        let tri = &mesh.indices[t as usize * 3..t as usize * 3 + 3];
+        let tri = [tri[0], tri[1], tri[2]];
         let v = tri.map(|i| &mesh.vertices[i as usize]);
         let avg = tri.map(|i| averaged[i as usize]);
         // Texel space: x right, y down (row 0 = v 1).
-        let p = v.map(|v| Vec2::new(v.uv[0] * res as f32, (1.0 - v.uv[1]) * res as f32));
+        let p = v.map(|v| {
+            let uv = Vec2::from(v.uv) - origin;
+            Vec2::new(uv.x * res as f32, (1.0 - uv.y) * res as f32)
+        });
         let area = (p[1] - p[0]).perp_dot(p[2] - p[0]);
         if area.abs() < 1e-12 {
             continue;
@@ -310,7 +318,7 @@ pub fn transfer(
     reach: f32,
 ) -> Vec<Option<[f32; 2]>> {
     let scene = Scene::new(old);
-    let texels = rasterize(new, part, res, 1);
+    let texels = rasterize(new, part, 1001, res, 1);
     let (lo, hi) = new.bounds();
     let d = (hi - lo).length().max(1e-6) * reach;
     texels
@@ -340,12 +348,14 @@ pub fn id_color(part: usize) -> [f32; 3] {
     [k(5.0), k(3.0), k(1.0)].map(|c| 0.15 + 0.8 * (1.0 - c))
 }
 
-/// Bakes the requested maps for texture set `part` of `low`.
+/// Bakes the requested maps for UDIM tile `tile` (1001 for regular meshes) of
+/// texture set `part` of `low`.
 /// `high`: the detailed mesh to project; `None` bakes from `low` itself.
 /// Returns `None` if cancelled.
 pub fn bake(
     low: &Mesh,
     part: usize,
+    tile: u32,
     high: Option<&Mesh>,
     s: &Settings,
     progress: &Progress,
@@ -355,7 +365,7 @@ pub fn bake(
     let diag = (hi - lo).length().max(1e-6);
     let high_mesh = high.unwrap_or(low);
     let scene = Scene::new(high_mesh);
-    let texels = rasterize(low, part, res, s.antialiasing.max(1));
+    let texels = rasterize(low, part, tile, res, s.antialiasing.max(1));
     let wants = |k| s.maps.contains(&k);
     let (frontal, rear) = (s.max_frontal * diag, s.max_rear * diag);
     let ao_len = s.ao_distance * diag;
@@ -592,6 +602,7 @@ mod tests {
             normal,
             uv: [x, y],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
         };
         Mesh {
             vertices: vec![v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)],
@@ -631,6 +642,7 @@ mod tests {
         let maps = bake(
             &low,
             0,
+            1001,
             Some(&high),
             &settings(vec![MapKind::Normal, MapKind::Height, MapKind::Opacity]),
             &Progress::default(),
@@ -656,6 +668,7 @@ mod tests {
             normal: [0.0, 0.0, -1.0],
             uv: [0.0, 0.0],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
         };
         low.vertices.extend([
             roof(-1.0, -1.0),
@@ -672,6 +685,7 @@ mod tests {
         let maps = bake(
             &low,
             0,
+            1001,
             None,
             &settings(vec![MapKind::AmbientOcclusion]),
             &Progress::default(),
@@ -688,6 +702,7 @@ mod tests {
         let maps = bake(
             &plane,
             0,
+            1001,
             None,
             &settings(vec![MapKind::Curvature]),
             &Progress::default(),
@@ -698,6 +713,7 @@ mod tests {
         let maps = bake(
             &sphere,
             0,
+            1001,
             None,
             &settings(vec![MapKind::Curvature]),
             &Progress::default(),
@@ -725,6 +741,7 @@ mod tests {
             bake(
                 &quad(0.0, [0.0, 0.0, 1.0]),
                 0,
+                1001,
                 None,
                 &Settings::default(),
                 &progress

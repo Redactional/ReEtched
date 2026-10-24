@@ -1,19 +1,22 @@
-//! The 3D viewport and the 2D UV view: PBR + image-based lighting rendered into
-//! offscreen textures that egui displays.
+//! The 3D viewport and the 2D UV view: image-based lighting with the texture
+//! sets' shader models, rendered into offscreen textures that egui displays.
 
 use crate::{
-    compositor::{ChannelSet, Compositor, MeshPart, PaintKey},
+    compositor::{Compositor, GroupSets, MeshPart, PaintKey, VERTEX_ATTRIBUTES},
     env::EnvImage,
-    paint_gpu::{BrushShape, Camera, Dab, PaintGpu, StrokeTarget},
+    paint_gpu::{BrushShape, Camera, DAB_UV_SPACE, Dab, PaintGpu, StrokeTarget},
 };
-use glam::{Mat4, Vec3};
-use reetched_doc::{MeshMap, ResourceId, Resources, TextureSet, TileMap, export::ChannelData};
+use glam::{Mat4, Vec2, Vec3};
+use reetched_doc::{
+    Channel, MeshMap, ResourceId, Resources, ShaderModel, TextureSet, TileMap, export::ChannelData,
+};
 use reetched_io::{Mesh, Vertex};
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 use wgpu::util::DeviceExt;
 
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const REVEAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 /// egui displays these as-is, so shaders write sRGB-encoded values into a plain UNORM target.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Prefiltered env mips; level i holds roughness i / (ENV_LEVELS - 1).
@@ -38,7 +41,36 @@ struct Globals {
     extra: [f32; 4],
     /// x: bloom threshold, y: accumulation weight of this frame
     accum: [f32; 4],
+    /// x: scattering radius, y: pixels per world unit at distance 1, z: on
+    sss: [f32; 4],
+    /// Display LUT shaper: log2 min, log2 max, size
+    lut: [f32; 4],
+    /// Camera forward (world), vertical field of view (0 = orthographic)
+    camera: [f32; 4],
+    /// Width, height, 1/width, 1/height
+    screen: [f32; 4],
+    /// Time (s), scene radius, perspective (for custom shaders)
+    misc: [f32; 4],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialUniform {
+    tile: [f32; 4],
+    model: [f32; 4],
+    /// Channels present, by Painter shader id: x ids 0-31, y ids 32-63.
+    present: [u32; 4],
+}
+
+/// A compiled Painter shader.
+pub struct CustomShader {
+    pub shader: reetched_shader::Shader,
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// The host header Painter shaders compile against.
+const PAINTER_HOST: &str = include_str!("shaders/painter_host.glsl");
 
 /// How the 3D view maps HDR light to the screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,14 +79,17 @@ pub enum ToneMap {
     Agx,
     Neutral,
     Linear,
+    /// The loaded OCIO config's display/view, baked into a LUT.
+    Ocio,
 }
 
 impl ToneMap {
-    pub const ALL: [ToneMap; 4] = [
+    pub const ALL: [ToneMap; 5] = [
         ToneMap::Aces,
         ToneMap::Agx,
         ToneMap::Neutral,
         ToneMap::Linear,
+        ToneMap::Ocio,
     ];
 
     pub fn label(self) -> &'static str {
@@ -63,6 +98,7 @@ impl ToneMap {
             ToneMap::Agx => "AgX",
             ToneMap::Neutral => "Khronos PBR Neutral",
             ToneMap::Linear => "Linear (clamped)",
+            ToneMap::Ocio => "OCIO display / view",
         }
     }
 }
@@ -74,17 +110,25 @@ pub enum AlphaMode {
     /// Alpha test against a cutoff.
     Cutout,
     /// Stochastic transparency, smoothed by progressive accumulation.
+    Dithered,
+    /// Order-independent transparency (weighted blended).
     Blend,
 }
 
 impl AlphaMode {
-    pub const ALL: [AlphaMode; 3] = [AlphaMode::Opaque, AlphaMode::Cutout, AlphaMode::Blend];
+    pub const ALL: [AlphaMode; 4] = [
+        AlphaMode::Opaque,
+        AlphaMode::Cutout,
+        AlphaMode::Dithered,
+        AlphaMode::Blend,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             AlphaMode::Opaque => "Opaque",
             AlphaMode::Cutout => "Cutout (alpha test)",
-            AlphaMode::Blend => "Blend",
+            AlphaMode::Dithered => "Dithered",
+            AlphaMode::Blend => "Blend (order independent)",
         }
     }
 }
@@ -104,6 +148,16 @@ pub struct RenderSettings {
     pub parallax: f32,
     /// Progressive anti-aliasing: jitter and average frames while nothing changes.
     pub accumulate: bool,
+    /// Screen-space subsurface scattering.
+    pub sss: bool,
+    /// How far light scatters under the surface, in world units.
+    pub sss_radius: f32,
+    /// Depth of field (needs progressive accumulation).
+    pub dof: bool,
+    /// Lens radius in world units.
+    pub aperture: f32,
+    /// Focus distance; 0 focuses on the orbit target.
+    pub focus: f32,
 }
 
 impl Default for RenderSettings {
@@ -118,17 +172,25 @@ impl Default for RenderSettings {
             alpha_cutoff: 0.5,
             parallax: 0.0,
             accumulate: true,
+            sss: true,
+            sss_radius: 0.02,
+            dof: false,
+            aperture: 0.02,
+            focus: 0.0,
         }
     }
 }
 
 /// Frames accumulated before the view stops redrawing.
 const ACCUMULATE_FRAMES: u32 = 32;
+/// With depth of field: more frames, so the lens is sampled well.
+const DOF_FRAMES: u32 = 96;
 
 /// Everything that, when it changes, restarts accumulation.
 #[derive(Clone, PartialEq)]
 struct FrameKey {
-    view_proj: Mat4,
+    view: Mat4,
+    proj: Mat4,
     globals: [f32; 12],
     render: RenderSettings,
     wire: bool,
@@ -158,6 +220,8 @@ pub enum ViewMode {
     Opacity,
     /// A baked mesh map, shown as-is.
     Mesh(MeshMap),
+    /// One of the extra channels.
+    Channel(Channel),
 }
 
 impl ViewMode {
@@ -183,11 +247,13 @@ impl ViewMode {
             ViewMode::Emissive => "Emissive",
             ViewMode::Opacity => "Opacity",
             ViewMode::Mesh(m) => m.label(),
+            ViewMode::Channel(c) => c.label(),
         }
     }
 
-    fn shader_index(self) -> f32 {
-        match self {
+    /// (mode, solo channel index) for the shader.
+    fn shader_index(self) -> (f32, f32) {
+        let mode = match self {
             ViewMode::Material => 0.0,
             ViewMode::BaseColor => 1.0,
             ViewMode::Roughness => 2.0,
@@ -197,8 +263,25 @@ impl ViewMode {
             ViewMode::Mesh(_) => 6.0,
             ViewMode::Emissive => 7.0,
             ViewMode::Opacity => 8.0,
-        }
+            ViewMode::Channel(c) => return (9.0, c.index() as f32),
+        };
+        (mode, 0.0)
     }
+}
+
+/// One UDIM tile of a texture set.
+pub struct Tile {
+    pub number: u32,
+    indices: Range<u32>,
+    /// World-space bounds of the tile's triangles (to skip tiles a brush can't reach).
+    bounds: (Vec3, Vec3),
+    sets: GroupSets,
+    bind_group: Option<wgpu::BindGroup>,
+    material: wgpu::Buffer,
+    /// (AO map, previewed mesh map, shader model) the bind group was built with.
+    bound: (Option<ResourceId>, Option<ResourceId>, u32),
+    /// A custom shader's parameters and textures (bind group 2), with its shader.
+    custom: Option<(ResourceId, wgpu::BindGroup)>,
 }
 
 pub struct Part {
@@ -206,19 +289,27 @@ pub struct Part {
     /// Texture set visibility in the 3D view.
     pub visible: bool,
     pub triangles: u32,
-    indices: Range<u32>,
-    /// Composited channels; `None` until the first composite.
-    set: Option<ChannelSet>,
-    bind_group: Option<wgpu::BindGroup>,
+    pub tiles: Vec<Tile>,
     /// The texture set as last composited, to detect changes.
     composited: Option<TextureSet>,
-    /// (AO map, previewed mesh map) the bind group was built with.
-    bound_maps: (Option<ResourceId>, Option<ResourceId>),
+    /// Tiles whose paint changed under the same document (strokes in progress).
+    dirty: BTreeSet<u32>,
+}
+
+impl Part {
+    pub fn tile_numbers(&self) -> Vec<u32> {
+        self.tiles.iter().map(|t| t.number).collect()
+    }
 }
 
 pub struct FrameParams {
-    pub view_proj: Mat4,
+    pub view: Mat4,
+    pub proj: Mat4,
     pub eye: Vec3,
+    /// Distance from the eye to the orbit target (the automatic focus distance).
+    pub target_distance: f32,
+    /// Vertical field of view (radians); 0 for orthographic.
+    pub fov_y: f32,
     pub exposure_ev: f32,
     pub env_rotation: f32,
     /// 0 = sharp background, 1 = fully blurred.
@@ -258,13 +349,21 @@ impl ViewTarget {
 struct Targets {
     size: [u32; 2],
     hdr: wgpu::TextureView,
+    /// Light that scatters under the surface (this frame), and its blurred versions.
+    sss: [wgpu::TextureView; 3],
+    /// Transparency: premultiplied color sum and revealage.
+    oit_accum: wgpu::TextureView,
+    oit_reveal: wgpu::TextureView,
     depth: wgpu::TextureView,
     display: wgpu::TextureView,
     /// Accumulated frames, ping-ponged.
     history: [wgpu::TextureView; 2],
     /// Quarter-resolution bloom buffers.
     bloom: [wgpu::TextureView; 2],
-    /// Writes history[i] from the new frame and history[1 - i].
+    oit_bg: wgpu::BindGroup,
+    sss_h_bg: wgpu::BindGroup,
+    sss_v_bg: wgpu::BindGroup,
+    /// Writes history[i] from the new frame, history[1 - i] and the scattering.
     accum_bg: [wgpu::BindGroup; 2],
     /// Bright pass from history[i] into bloom[0].
     bloom_down_bg: [wgpu::BindGroup; 2],
@@ -277,7 +376,11 @@ struct Targets {
 struct Pipelines {
     sky: wgpu::RenderPipeline,
     pbr: wgpu::RenderPipeline,
+    oit: wgpu::RenderPipeline,
+    oit_resolve: wgpu::RenderPipeline,
     wire: Option<wgpu::RenderPipeline>,
+    sss_h: wgpu::RenderPipeline,
+    sss_v: wgpu::RenderPipeline,
     accumulate: wgpu::RenderPipeline,
     bloom_down: wgpu::RenderPipeline,
     blur_h: wgpu::RenderPipeline,
@@ -285,6 +388,15 @@ struct Pipelines {
     tonemap: wgpu::RenderPipeline,
     uv_fill: wgpu::RenderPipeline,
     uv_wire: Option<wgpu::RenderPipeline>,
+}
+
+/// The OCIO display transform as a 3D LUT.
+pub struct DisplayLut {
+    pub size: u32,
+    /// log2 stops below / above middle grey that the shaper covers.
+    pub log2_range: (f32, f32),
+    /// Display-encoded RGB, red fastest.
+    pub data: Vec<[f32; 3]>,
 }
 
 pub struct Viewport {
@@ -307,9 +419,17 @@ pub struct Viewport {
     last_key: Option<FrameKey>,
     /// Bumped whenever a texture set is re-composited.
     scene_version: u64,
+    env_view: wgpu::TextureView,
     env_sampler: wgpu::Sampler,
     env_sh: [[f32; 4]; 9],
     prefilter: wgpu::ComputePipeline,
+    /// The display LUT and its shaper (log2 min, max, size).
+    lut: (wgpu::TextureView, [f32; 3]),
+    /// The viewport's WGSL module (custom shaders reuse its vertex stage).
+    module: wgpu::ShaderModule,
+    /// Painter shaders by resource, compiled (or why they didn't).
+    custom: std::collections::HashMap<ResourceId, Result<CustomShader, String>>,
+    started: std::time::Instant,
     mesh: Option<(wgpu::Buffer, wgpu::Buffer)>,
     /// Mesh bounding-box diagonal.
     mesh_scale: f32,
@@ -328,42 +448,49 @@ impl Viewport {
         env: EnvImage,
     ) -> Self {
         use wgpu::ShaderStages as S;
+        let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
         let globals_layout = bind_group_layout(
             device,
             &[
                 (S::VERTEX_FRAGMENT, uniform_binding()),
                 (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, filtering),
                 (
                     S::FRAGMENT,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
                 ),
             ],
         );
-        // Composited set (t0..t2), sampler, baked AO, previewed mesh map, set t3.
-        let material_layout = bind_group_layout(
-            device,
-            &[
-                (S::FRAGMENT, texture_binding(true)),
-                (S::FRAGMENT, texture_binding(true)),
-                (S::FRAGMENT, texture_binding(true)),
-                (
-                    S::FRAGMENT,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                (S::FRAGMENT, texture_binding(true)),
-                (S::FRAGMENT, texture_binding(true)),
-                (S::FRAGMENT, texture_binding(true)),
-            ],
-        );
-        // Post passes: two inputs and a sampler.
+        // Composited tile: core t0..t2, sampler, baked AO, previewed mesh map, core t3,
+        // groups 1 and 2 t0..t2, material uniform.
+        let mut material = vec![
+            (S::FRAGMENT, texture_binding(true)),
+            (S::FRAGMENT, texture_binding(true)),
+            (S::FRAGMENT, texture_binding(true)),
+            (S::FRAGMENT, filtering),
+        ];
+        material.extend([(S::FRAGMENT, texture_binding(true)); 9]);
+        material.push((S::FRAGMENT, uniform_binding()));
+        let material_layout = bind_group_layout(device, &material);
+        // Post passes: two inputs, a sampler, a third input, the scene depth.
         let post_layout = bind_group_layout(
             device,
             &[
                 (S::FRAGMENT, texture_binding(true)),
                 (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, filtering),
+                (S::FRAGMENT, texture_binding(true)),
                 (
                     S::FRAGMENT,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                 ),
             ],
         );
@@ -381,21 +508,69 @@ impl Viewport {
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+            attributes: &VERTEX_ATTRIBUTES,
         };
         let mesh_buffers = [Some(vertex_layout)];
+        let target = |format| Some(wgpu::ColorTargetState::from(format));
+        // The scene pass writes color and the scattering buffer.
+        let scene = [target(HDR_FORMAT), target(HDR_FORMAT)];
+        let hdr = [target(HDR_FORMAT)];
+        let display = [target(DISPLAY_FORMAT)];
+        let add = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let reveal = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let oit_targets = [
+            Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: add,
+                    alpha: add,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            Some(wgpu::ColorTargetState {
+                format: REVEAL_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: reveal,
+                    alpha: reveal,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+        ];
+        let over = [Some(wgpu::ColorTargetState {
+            format: HDR_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
         let depth = |write, compare| Some((write, compare));
         let base = PipelineDesc {
             module: &module,
             buffers: &[],
-            topology: wgpu::PrimitiveTopology::TriangleList,
             polygon_mode: wgpu::PolygonMode::Fill,
             depth: None,
-            blend: None,
-            format: HDR_FORMAT,
+            targets: &hdr,
         };
         let mesh = PipelineDesc {
             buffers: &mesh_buffers,
+            targets: &scene,
             ..base
         };
         let lines = PipelineDesc {
@@ -403,14 +578,17 @@ impl Viewport {
             ..mesh
         };
         let pipelines = Pipelines {
-            sky: base
-                .with(
-                    "vs_fullscreen",
-                    "fs_sky",
-                    &globals_only,
-                    depth(false, wgpu::CompareFunction::Always),
-                )
-                .build(device),
+            sky: PipelineDesc {
+                targets: &scene,
+                ..base
+            }
+            .with(
+                "vs_fullscreen",
+                "fs_sky",
+                &globals_only,
+                depth(false, wgpu::CompareFunction::Always),
+            )
+            .build(device),
             pbr: mesh
                 .with(
                     "vs_mesh",
@@ -419,6 +597,28 @@ impl Viewport {
                     depth(true, wgpu::CompareFunction::Less),
                 )
                 .build(device),
+            oit: PipelineDesc {
+                targets: &oit_targets,
+                ..mesh
+            }
+            .with(
+                "vs_mesh",
+                "fs_oit",
+                &scene_layout,
+                depth(false, wgpu::CompareFunction::LessEqual),
+            )
+            .build(device),
+            oit_resolve: PipelineDesc {
+                targets: &over,
+                ..base
+            }
+            .with(
+                "vs_fullscreen",
+                "fs_oit_resolve",
+                &post_pipeline_layout,
+                None,
+            )
+            .build(device),
             wire: wireframe_supported.then(|| {
                 lines
                     .with(
@@ -429,6 +629,12 @@ impl Viewport {
                     )
                     .build(device)
             }),
+            sss_h: base
+                .with("vs_fullscreen", "fs_sss_h", &post_pipeline_layout, None)
+                .build(device),
+            sss_v: base
+                .with("vs_fullscreen", "fs_sss_v", &post_pipeline_layout, None)
+                .build(device),
             accumulate: base
                 .with(
                     "vs_fullscreen",
@@ -452,20 +658,20 @@ impl Viewport {
                 .with("vs_fullscreen", "fs_blur_v", &post_pipeline_layout, None)
                 .build(device),
             tonemap: PipelineDesc {
-                format: DISPLAY_FORMAT,
+                targets: &display,
                 ..base
             }
             .with("vs_fullscreen", "fs_tonemap", &post_pipeline_layout, None)
             .build(device),
             uv_fill: PipelineDesc {
-                format: DISPLAY_FORMAT,
+                targets: &display,
                 ..mesh
             }
             .with("vs_uv", "fs_uv", &scene_layout, None)
             .build(device),
             uv_wire: wireframe_supported.then(|| {
                 PipelineDesc {
-                    format: DISPLAY_FORMAT,
+                    targets: &display,
                     ..lines
                 }
                 .with("vs_uv_wire", "fs_uv_wire", &globals_only, None)
@@ -508,8 +714,18 @@ impl Viewport {
         let view2d = target(&uv_display);
         let env_sh = env.diffuse_sh();
         let env_view = prefilter_env(device, queue, &prefilter, &env_sampler, env);
-        let globals_bind_group =
-            globals_bind_group(device, &globals_layout, &globals, &env_view, &env_sampler);
+        let lut = (
+            lut_texture(device, queue, 2, &[[0.0; 3]; 8]),
+            [-8.0, 8.0, 2.0],
+        );
+        let globals_bind_group = globals_bind_group(
+            device,
+            &globals_layout,
+            &globals,
+            &env_view,
+            &env_sampler,
+            &lut.0,
+        );
 
         Self {
             view3d,
@@ -529,9 +745,14 @@ impl Viewport {
             history_cur: 0,
             last_key: None,
             scene_version: 0,
+            env_view,
             env_sampler,
             env_sh,
             prefilter,
+            lut,
+            module,
+            custom: Default::default(),
+            started: std::time::Instant::now(),
             mesh: None,
             mesh_scale: 1.0,
             white: device
@@ -587,67 +808,64 @@ impl Viewport {
         ));
         let (lo, hi) = mesh.bounds();
         self.mesh_scale = (hi - lo).length().max(1e-6);
+        let bounds = |r: &Range<u32>| {
+            mesh.indices[r.start as usize..r.end as usize].iter().fold(
+                (Vec3::MAX, Vec3::MIN),
+                |(lo, hi), &i| {
+                    let p = Vec3::from(mesh.vertices[i as usize].position);
+                    (lo.min(p), hi.max(p))
+                },
+            )
+        };
         self.parts = mesh
             .parts
             .iter()
-            .map(|p| Part {
+            .enumerate()
+            .map(|(k, p)| Part {
                 name: p.material.clone(),
                 visible: true,
                 triangles: (p.indices.end - p.indices.start) / 3,
-                indices: p.indices.clone(),
-                set: None,
-                bind_group: None,
+                tiles: mesh
+                    .udim_tiles(k)
+                    .into_iter()
+                    .map(|(number, indices)| Tile {
+                        number,
+                        bounds: bounds(&indices),
+                        indices,
+                        sets: Default::default(),
+                        bind_group: None,
+                        material: device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("material"),
+                            size: size_of::<MaterialUniform>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }),
+                        bound: (None, None, u32::MAX),
+                        custom: None,
+                    })
+                    .collect(),
                 composited: None,
-                bound_maps: (None, None),
+                dirty: BTreeSet::new(),
             })
             .collect();
     }
 
-    /// Starts a brush stroke on `targets` in texture set `res`.
+    /// Starts a brush stroke on `targets` (each with its tiles' current paint).
     #[allow(clippy::too_many_arguments)]
     pub fn paint_begin(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
         targets: Vec<StrokeTarget>,
-        res: u32,
-        resources: &Resources,
+        set: &TextureSet,
         mode: crate::paint_gpu::StrokeMode,
         opacity: f32,
     ) {
-        self.paint.begin(
-            device,
-            queue,
-            &mut self.compositor,
-            targets,
-            res,
-            resources,
-            mode,
-            opacity,
-        );
+        self.paint.begin(targets, set, mode, opacity);
     }
 
-    /// Projection tool: projects `image` (placed by `u`) onto texture set `part`
-    /// as the current stroke's color source, hidden where the 3D view is occluded.
-    pub fn paint_project(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        part: usize,
-        image: &wgpu::TextureView,
-        u: crate::paint_gpu::ProjectUniform,
-    ) {
-        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get(part)) else {
-            return;
-        };
-        let mesh = MeshPart {
-            vertices,
-            indices,
-            range: p.indices.clone(),
-            scale: self.mesh_scale,
-        };
-        let depth = (self.view3d.size == self.view3d.requested_size).then_some(&self.targets.depth);
-        self.paint.project(device, queue, &mesh, depth, image, u);
+    /// Projection tool: the image (placed by `u`) this stroke paints, projected from
+    /// the 3D view onto each tile as the stroke reaches it.
+    pub fn paint_project(&mut self, image: wgpu::TextureView, u: crate::paint_gpu::ProjectUniform) {
+        self.paint.set_projection(image, u);
     }
 
     /// An image resource as an sRGB-decoded texture.
@@ -662,20 +880,41 @@ impl Viewport {
             .bitmap_view_srgb(device, queue, resources, id)
     }
 
-    /// Polygon Fill: fills triangles (three vertex indices each) of texture set `part`.
+    /// Polygon Fill: fills triangles (three vertex indices each) of tile `tile` of
+    /// texture set `part`.
     pub fn paint_fill(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         part: usize,
+        tile: u32,
         indices: &[u32],
+        resources: &Resources,
     ) {
-        let (Some((vertices, _)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
+        let (Some((vertices, ib)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
             return;
         };
-        self.paint
-            .fill_triangles(device, queue, &self.compositor, vertices, indices);
-        p.composited = None;
+        let Some(t) = p.tiles.iter().find(|t| t.number == tile) else {
+            return;
+        };
+        let mesh = MeshPart {
+            vertices,
+            indices: ib,
+            range: t.indices.clone(),
+            scale: self.mesh_scale,
+            tile,
+        };
+        let depth = (self.view3d.size == self.view3d.requested_size).then_some(&self.targets.depth);
+        self.paint.fill_triangles(
+            device,
+            queue,
+            &mut self.compositor,
+            &mesh,
+            indices,
+            depth,
+            resources,
+        );
+        p.dirty.insert(tile);
     }
 
     /// Stamps dabs on texture set `part`. `occlusion`: test against the 3D view's depth.
@@ -690,31 +929,40 @@ impl Viewport {
         shape: &BrushShape,
         dabs: &[Dab],
         motion: [f32; 2],
+        resources: &Resources,
     ) {
-        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
+        let (Some((vertices, ib)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
             return;
-        };
-        let mesh = MeshPart {
-            vertices,
-            indices,
-            range: p.indices.clone(),
-            scale: self.mesh_scale,
         };
         let depth = (occlusion && self.view3d.size == self.view3d.requested_size)
             .then_some(&self.targets.depth);
-        self.paint.dabs(
-            device,
-            queue,
-            &self.compositor,
-            &mesh,
-            camera,
-            depth,
-            shape,
-            dabs,
-            motion,
-        );
-        // The paint textures changed under the same document: re-composite.
-        p.composited = None;
+        // Only the tiles some dab can reach.
+        for t in p
+            .tiles
+            .iter()
+            .filter(|t| dabs.iter().any(|d| dab_reaches(d, t)))
+        {
+            let mesh = MeshPart {
+                vertices,
+                indices: ib,
+                range: t.indices.clone(),
+                scale: self.mesh_scale,
+                tile: t.number,
+            };
+            self.paint.dabs(
+                device,
+                queue,
+                &mut self.compositor,
+                &mesh,
+                camera,
+                depth,
+                shape,
+                dabs,
+                motion,
+                resources,
+            );
+            p.dirty.insert(t.number);
+        }
     }
 
     /// Ends the stroke; returns each painted buffer's new tiles.
@@ -756,8 +1004,8 @@ impl Viewport {
         self.compositor.clear_paint();
     }
 
-    /// Re-composites texture sets whose layer stack changed, and binds their
-    /// baked AO and the previewed mesh map. Returns warnings.
+    /// Re-composites texture set tiles whose layer stack (or paint) changed, and binds
+    /// their baked AO and the previewed mesh map. Returns warnings.
     pub fn sync(
         &mut self,
         device: &wgpu::Device,
@@ -770,137 +1018,238 @@ impl Viewport {
         let Some((vertices, indices)) = &self.mesh else {
             return warnings;
         };
-        for (part, set) in self.parts.iter_mut().zip(sets) {
-            let maps = (
-                set.mesh_maps.get(&MeshMap::AmbientOcclusion).cloned(),
-                preview.and_then(|m| set.mesh_maps.get(&m).cloned()),
-            );
-            let changed = part.composited.as_ref() != Some(set);
-            if !changed && part.bound_maps == maps && part.bind_group.is_some() {
-                continue;
-            }
-            if changed {
-                let mesh = MeshPart {
-                    vertices,
-                    indices,
-                    range: part.indices.clone(),
-                    scale: self.mesh_scale,
-                };
-                warnings.extend(self.compositor.composite(
+        // Compile the Painter shaders texture sets use.
+        for set in sets {
+            if let ShaderModel::Custom { shader, .. } = &set.shader
+                && !self.custom.contains_key(shader)
+            {
+                let compiled = compile_custom(
                     device,
-                    queue,
-                    &mesh,
-                    set,
+                    &self.module,
+                    &self.globals_layout,
+                    &self.material_layout,
                     resources,
-                    &mut part.set,
-                ));
+                    shader,
+                );
+                if let Err(e) = &compiled {
+                    warnings.push(format!("Shader of {}: {e}", set.name));
+                }
+                self.custom.insert(shader.clone(), compiled);
             }
-            let map_view = |id: &Option<ResourceId>, comp: &mut Compositor| {
-                id.as_ref()
-                    .and_then(|id| comp.bitmap_view(device, queue, resources, id))
+        }
+        for (part, set) in self.parts.iter_mut().zip(sets) {
+            let changed = part.composited.as_ref() != Some(set);
+            let model = match set.shader {
+                ShaderModel::MetalRough | ShaderModel::Custom { .. } => 0,
+                ShaderModel::Asm => 1,
+                ShaderModel::OpenPbr => 2,
             };
-            let ao = map_view(&maps.0, &mut self.compositor).unwrap_or_else(|| self.white.clone());
-            let shown =
-                map_view(&maps.1, &mut self.compositor).unwrap_or_else(|| self.white.clone());
-            let views = &part.set.as_ref().expect("composite creates the set").views;
-            part.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("texture set"),
-                layout: &self.material_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&views[0]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&views[1]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&views[2]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&ao),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&shown),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(&views[3]),
-                    },
-                ],
-            }));
+            // Channels a Painter shader sees: the set's, and the baked AO.
+            let mut present = [0u32; 4];
+            for c in set.channels() {
+                present[0] |= 1 << c.index();
+            }
+            for tile in &mut part.tiles {
+                let maps = set.mesh_maps_for(tile.number);
+                let bound = (
+                    maps.get(&MeshMap::AmbientOcclusion).cloned(),
+                    preview.and_then(|m| maps.get(&m).cloned()),
+                    model,
+                );
+                let recomposite = changed || part.dirty.contains(&tile.number);
+                if changed {
+                    tile.custom = match &set.shader {
+                        ShaderModel::Custom {
+                            shader,
+                            params,
+                            textures,
+                            ..
+                        } => match self.custom.get(shader) {
+                            Some(Ok(c)) => Some((
+                                shader.clone(),
+                                custom_group(
+                                    device,
+                                    queue,
+                                    c,
+                                    params,
+                                    textures,
+                                    resources,
+                                    &mut self.compositor,
+                                    &self.white,
+                                ),
+                            )),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                }
+                if !recomposite && tile.bound == bound && tile.bind_group.is_some() {
+                    continue;
+                }
+                let mut present = present;
+                if bound.0.is_some() {
+                    present[1] |= 1; // id 32: baked AO
+                }
+                if recomposite {
+                    let mesh = MeshPart {
+                        vertices,
+                        indices,
+                        range: tile.indices.clone(),
+                        scale: self.mesh_scale,
+                        tile: tile.number,
+                    };
+                    warnings.extend(self.compositor.composite(
+                        device,
+                        queue,
+                        &mesh,
+                        set,
+                        resources,
+                        &mut tile.sets,
+                    ));
+                }
+                let map_view = |id: &Option<ResourceId>, comp: &mut Compositor| {
+                    id.as_ref()
+                        .and_then(|id| comp.bitmap_view(device, queue, resources, id))
+                };
+                let ao =
+                    map_view(&bound.0, &mut self.compositor).unwrap_or_else(|| self.white.clone());
+                let shown =
+                    map_view(&bound.1, &mut self.compositor).unwrap_or_else(|| self.white.clone());
+                let [u, v] = reetched_doc::udim_origin(tile.number);
+                queue.write_buffer(
+                    &tile.material,
+                    0,
+                    bytemuck::bytes_of(&MaterialUniform {
+                        tile: [u, v, 0.0, 0.0],
+                        model: [model as f32, 0.0, 0.0, 0.0],
+                        present,
+                    }),
+                );
+                let comp = &self.compositor;
+                let core = comp.group_views(&tile.sets, 0);
+                let g1 = comp.group_views(&tile.sets, 1);
+                let g2 = comp.group_views(&tile.sets, 2);
+                let views = [
+                    &core[0], &core[1], &core[2], &ao, &shown, &core[3], &g1[0], &g1[1], &g1[2],
+                    &g2[0], &g2[1], &g2[2],
+                ];
+                let mut entries: Vec<wgpu::BindGroupEntry> = Vec::new();
+                for (i, view) in views.iter().enumerate() {
+                    // Binding 3 is the sampler.
+                    let binding = if i < 3 { i } else { i + 1 } as u32;
+                    entries.push(wgpu::BindGroupEntry {
+                        binding,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    });
+                }
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: tile.material.as_entire_binding(),
+                });
+                tile.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("texture set tile"),
+                    layout: &self.material_layout,
+                    entries: &entries,
+                }));
+                tile.bound = bound;
+                self.scene_version += 1;
+            }
             part.composited = Some(set.clone());
-            part.bound_maps = maps;
-            self.scene_version += 1;
+            part.dirty.clear();
         }
         warnings
     }
 
-    /// Reads texture set `index` back from the GPU (for export).
-    /// Composites `set` on texture set `part`'s triangles into a scratch target
-    /// and reads it back (e.g. one layer alone, for PSD export).
+    /// Composites `set` on texture set `part`'s tile `tile` into a scratch target and
+    /// reads it back (e.g. one layer alone, for PSD export).
     pub fn composite_temp(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         part: usize,
+        tile: u32,
         set: &TextureSet,
         resources: &Resources,
     ) -> anyhow::Result<ChannelData> {
-        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get(part)) else {
-            anyhow::bail!("no mesh");
+        let (Some((vertices, indices)), Some(t)) = (
+            &self.mesh,
+            self.parts
+                .get(part)
+                .and_then(|p| p.tiles.iter().find(|t| t.number == tile)),
+        ) else {
+            anyhow::bail!("texture set {part} has no tile {tile}");
         };
         let mesh = MeshPart {
             vertices,
             indices,
-            range: p.indices.clone(),
+            range: t.indices.clone(),
             scale: self.mesh_scale,
+            tile,
         };
-        let mut out = None;
+        let mut out = GroupSets::default();
         let warnings = self
             .compositor
             .composite(device, queue, &mesh, set, resources, &mut out);
         if let Some(w) = warnings.first() {
             anyhow::bail!("{w}");
         }
-        self.compositor.read_back(
-            device,
-            queue,
-            out.as_ref().expect("composite creates the set"),
-        )
+        self.compositor.read_back(device, queue, &out)
     }
 
+    /// Reads tile `tile` of texture set `part` back from the GPU (for export).
     pub fn read_back(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        index: usize,
+        part: usize,
+        tile: u32,
     ) -> anyhow::Result<ChannelData> {
-        let set = self
+        let t = self
             .parts
-            .get(index)
-            .and_then(|p| p.set.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("texture set {index} hasn't been composited yet"))?;
-        self.compositor.read_back(device, queue, set)
+            .get(part)
+            .and_then(|p| p.tiles.iter().find(|t| t.number == tile))
+            .ok_or_else(|| anyhow::anyhow!("texture set {part} has no tile {tile}"))?;
+        self.compositor.read_back(device, queue, &t.sets)
+    }
+
+    /// UDIM tiles of texture set `part`.
+    pub fn tiles(&self, part: usize) -> Vec<u32> {
+        self.parts
+            .get(part)
+            .map_or_else(Vec::new, Part::tile_numbers)
     }
 
     pub fn set_environment(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, env: EnvImage) {
         self.env_sh = env.diffuse_sh();
-        let view = prefilter_env(device, queue, &self.prefilter, &self.env_sampler, env);
+        self.env_view = prefilter_env(device, queue, &self.prefilter, &self.env_sampler, env);
+        self.rebind_globals(device);
+    }
+
+    /// Sets the OCIO display LUT (used by `ToneMap::Ocio`).
+    pub fn set_display_lut(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lut: &DisplayLut,
+    ) {
+        let view = lut_texture(device, queue, lut.size, &lut.data);
+        self.lut = (view, [lut.log2_range.0, lut.log2_range.1, lut.size as f32]);
+        self.rebind_globals(device);
+        self.last_key = None;
+    }
+
+    fn rebind_globals(&mut self, device: &wgpu::Device) {
         self.globals_bind_group = globals_bind_group(
             device,
             &self.globals_layout,
             &self.globals,
-            &view,
+            &self.env_view,
             &self.env_sampler,
+            &self.lut.0,
         );
     }
 
@@ -945,18 +1294,18 @@ impl Viewport {
             max_lod,
             p.background_blur * max_lod,
         ];
-        let view = [
-            p.view_mode.shader_index(),
-            p.env_opacity,
-            p.uv_mode.shader_index(),
-            0.0,
-        ];
+        let (mode3d, solo3d) = p.view_mode.shader_index();
+        let (mode2d, solo2d) = p.uv_mode.shader_index();
+        // One solo channel slot: the 3D view's when it shows one, else the 2D view's.
+        let solo = if mode3d == 9.0 { solo3d } else { solo2d };
+        let view = [mode3d, p.env_opacity, mode2d, solo];
         // Restart accumulation when anything that shows in the 3D view changes.
         let key = FrameKey {
-            view_proj: p.view_proj,
+            view: p.view,
+            proj: p.proj,
             globals: [
-                params[0], params[1], params[3], view[0], view[1], p.eye.x, p.eye.y, p.eye.z, 0.0,
-                0.0, 0.0, 0.0,
+                params[0], params[1], params[3], view[0], view[1], view[3], p.eye.x, p.eye.y,
+                p.eye.z, 0.0, 0.0, 0.0,
             ],
             render: p.render,
             wire: p.show_wireframe,
@@ -971,15 +1320,43 @@ impl Viewport {
         let n = if accumulate { self.accum } else { 0 };
         // Sub-pixel jitter (Halton 2, 3), none on the first frame so a still image is sharp.
         let jitter = if n == 0 {
-            glam::Vec2::ZERO
+            Vec2::ZERO
         } else {
-            glam::Vec2::new(halton(n, 2), halton(n, 3)) - 0.5
+            Vec2::new(halton(n, 2), halton(n, 3)) - 0.5
         };
         let [w, h] = self.targets.size.map(|s| s.max(1) as f32);
+        // Depth of field: each frame looks through another point of the lens (Halton 5, 7
+        // on a disk), sheared so the focus plane stays put.
+        let r = &p.render;
+        let mut view_m = p.view;
+        if r.dof && accumulate && n > 0 {
+            let f = if r.focus > 0.0 {
+                r.focus
+            } else {
+                p.target_distance
+            }
+            .max(1e-4);
+            let (a, b) = (halton(n, 5), halton(n, 7));
+            let (s, c) = (a * std::f32::consts::TAU).sin_cos();
+            let o = Vec2::new(c, s) * b.sqrt() * r.aperture;
+            let shear = Mat4::from_cols(
+                glam::Vec4::X,
+                glam::Vec4::Y,
+                glam::Vec4::new(-o.x / f, -o.y / f, 1.0, 0.0),
+                glam::Vec4::new(-o.x, -o.y, 0.0, 1.0),
+            );
+            view_m = shear * p.view;
+        }
         let view_proj =
             Mat4::from_translation(Vec3::new(jitter.x * 2.0 / w, jitter.y * 2.0 / h, 0.0))
-                * p.view_proj;
-        let r = &p.render;
+                * p.proj
+                * view_m;
+        // Scattering radius → pixels: the projection's scale at distance 1.
+        let px_per_unit = if p.fov_y > 0.0 {
+            h * 0.5 / (p.fov_y * 0.5).tan()
+        } else {
+            h * 0.5 * p.proj.y_axis.y
+        };
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -1001,29 +1378,59 @@ impl Viewport {
                 (n % 64) as f32,
             ],
             accum: [r.bloom_threshold, 1.0 / (n + 1) as f32, 0.0, 0.0],
+            sss: [
+                r.sss_radius,
+                px_per_unit,
+                if r.sss { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            lut: [self.lut.1[0], self.lut.1[1], self.lut.1[2], 0.0],
+            camera: [
+                -p.view.x_axis.z,
+                -p.view.y_axis.z,
+                -p.view.z_axis.z,
+                p.fov_y,
+            ],
+            screen: [w, h, 1.0 / w, 1.0 / h],
+            misc: [
+                self.started.elapsed().as_secs_f32(),
+                self.mesh_scale * 0.5,
+                if p.fov_y > 0.0 { 1.0 } else { 0.0 },
+                0.0,
+            ],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
         if self.view3d.visible() {
             self.render_3d(encoder, p);
             self.history_cur = 1 - self.history_cur;
-            self.accum = (n + 1).min(ACCUMULATE_FRAMES);
+            let frames = if r.dof { DOF_FRAMES } else { ACCUMULATE_FRAMES };
+            self.accum = (n + 1).min(frames);
         }
         if self.view2d.visible() {
             self.render_2d(encoder, p);
         }
     }
 
+    fn visible_tiles(&self) -> impl Iterator<Item = &Tile> {
+        self.parts
+            .iter()
+            .filter(|p| p.visible)
+            .flat_map(|p| p.tiles.iter())
+            .filter(|t| t.bind_group.is_some())
+    }
+
     fn render_3d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
+        let t = &self.targets;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
-                color_attachments: &[Some(color_attachment(
-                    &self.targets.hdr,
-                    wgpu::Color::TRANSPARENT,
-                ))],
+                color_attachments: &[
+                    Some(color_attachment(&t.hdr, wgpu::Color::TRANSPARENT)),
+                    Some(color_attachment(&t.sss[0], wgpu::Color::TRANSPARENT)),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.targets.depth,
+                    view: &t.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -1038,27 +1445,79 @@ impl Viewport {
             if let Some((vertices, indices)) = &self.mesh {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                let visible = || {
-                    self.parts
-                        .iter()
-                        .filter(|part| part.visible && part.bind_group.is_some())
-                };
-                pass.set_pipeline(&self.pipelines.pbr);
-                for part in visible() {
-                    pass.set_bind_group(1, part.bind_group.as_ref(), &[]);
-                    pass.draw_indexed(part.indices.clone(), 0, 0..1);
+                let material = p.view_mode == ViewMode::Material;
+                for tile in self.visible_tiles() {
+                    let custom = tile
+                        .custom
+                        .as_ref()
+                        .filter(|_| material)
+                        .and_then(|(id, group)| Some((self.custom.get(id)?.as_ref().ok()?, group)));
+                    match custom {
+                        Some((c, group)) => {
+                            pass.set_pipeline(&c.pipeline);
+                            pass.set_bind_group(2, group, &[]);
+                        }
+                        None => pass.set_pipeline(&self.pipelines.pbr),
+                    }
+                    pass.set_bind_group(1, tile.bind_group.as_ref(), &[]);
+                    pass.draw_indexed(tile.indices.clone(), 0, 0..1);
                 }
                 if p.show_wireframe
                     && let Some(wire) = &self.pipelines.wire
                 {
                     pass.set_pipeline(wire);
-                    for part in visible() {
-                        pass.draw_indexed(part.indices.clone(), 0, 0..1);
+                    for tile in self.visible_tiles() {
+                        pass.draw_indexed(tile.indices.clone(), 0, 0..1);
                     }
                 }
             }
         }
-        let t = &self.targets;
+        let blended = p.render.alpha == AlphaMode::Blend && p.view_mode == ViewMode::Material;
+        if blended && let Some((vertices, indices)) = &self.mesh {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("transparency"),
+                    color_attachments: &[
+                        Some(color_attachment(&t.oit_accum, wgpu::Color::TRANSPARENT)),
+                        Some(color_attachment(&t.oit_reveal, wgpu::Color::WHITE)),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &t.depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_bind_group(0, &self.globals_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_pipeline(&self.pipelines.oit);
+                for tile in self.visible_tiles() {
+                    pass.set_bind_group(1, tile.bind_group.as_ref(), &[]);
+                    pass.draw_indexed(tile.indices.clone(), 0, 0..1);
+                }
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transparency resolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.hdr,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipelines.oit_resolve);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_bind_group(1, &t.oit_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
         let cur = self.history_cur;
         let fullscreen = |encoder: &mut wgpu::CommandEncoder,
                           label: &str,
@@ -1075,6 +1534,20 @@ impl Viewport {
             pass.set_bind_group(1, group, &[]);
             pass.draw(0..3, 0..1);
         };
+        fullscreen(
+            encoder,
+            "sss h",
+            &t.sss[1],
+            &self.pipelines.sss_h,
+            &t.sss_h_bg,
+        );
+        fullscreen(
+            encoder,
+            "sss v",
+            &t.sss[2],
+            &self.pipelines.sss_v,
+            &t.sss_v_bg,
+        );
         fullscreen(
             encoder,
             "accumulate",
@@ -1132,7 +1605,12 @@ impl Viewport {
 
     /// The 3D view is still refining (progressive anti-aliasing); keep redrawing.
     pub fn accumulating(&self, settings: &RenderSettings) -> bool {
-        settings.accumulate && self.view3d.visible() && self.accum < ACCUMULATE_FRAMES
+        let frames = if settings.dof {
+            DOF_FRAMES
+        } else {
+            ACCUMULATE_FRAMES
+        };
+        settings.accumulate && self.view3d.visible() && self.accum < frames
     }
 
     fn render_2d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
@@ -1152,22 +1630,232 @@ impl Viewport {
         else {
             return;
         };
-        let Some(bind_group) = &part.bind_group else {
-            return;
-        };
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, bind_group, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.set_pipeline(&self.pipelines.uv_fill);
-        pass.draw_indexed(part.indices.clone(), 0, 0..1);
-        if p.show_uv_wireframe
-            && let Some(wire) = &self.pipelines.uv_wire
-        {
-            pass.set_pipeline(wire);
-            pass.draw_indexed(part.indices.clone(), 0, 0..1);
+        for tile in part.tiles.iter().filter(|t| t.bind_group.is_some()) {
+            pass.set_bind_group(1, tile.bind_group.as_ref(), &[]);
+            pass.set_pipeline(&self.pipelines.uv_fill);
+            pass.draw_indexed(tile.indices.clone(), 0, 0..1);
+            if p.show_uv_wireframe
+                && let Some(wire) = &self.pipelines.uv_wire
+            {
+                pass.set_pipeline(wire);
+                pass.draw_indexed(tile.indices.clone(), 0, 0..1);
+            }
         }
     }
+}
+
+impl Viewport {
+    /// A Painter shader's compile result, once a texture set used it.
+    pub fn custom_shader(&self, id: &ResourceId) -> Option<&Result<CustomShader, String>> {
+        self.custom.get(id)
+    }
+
+    /// Forgets a compiled Painter shader (to recompile it).
+    pub fn forget_custom_shader(&mut self, id: &ResourceId) {
+        self.custom.remove(id);
+        self.invalidate();
+    }
+}
+
+/// Translates and compiles the Painter shader in resource `id`.
+fn compile_custom(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    globals: &wgpu::BindGroupLayout,
+    material: &wgpu::BindGroupLayout,
+    resources: &Resources,
+    id: &ResourceId,
+) -> Result<CustomShader, String> {
+    let bytes = resources
+        .files
+        .get(id)
+        .ok_or("the shader file is missing")?;
+    let source = String::from_utf8_lossy(bytes);
+    let shader = reetched_shader::translate(&source, PAINTER_HOST).map_err(|d| {
+        d.iter()
+            .filter(|d| d.severity == reetched_shader::Severity::Error)
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    use wgpu::ShaderStages as S;
+    let mut entries = vec![(
+        reetched_shader::PARAMS_BINDING,
+        S::FRAGMENT,
+        uniform_binding(),
+    )];
+    for t in &shader.textures {
+        entries.push((t.binding, S::FRAGMENT, texture_binding(true)));
+    }
+    if !shader.textures.is_empty() {
+        entries.push((
+            reetched_shader::USER_SAMPLER_BINDING,
+            S::FRAGMENT,
+            wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        ));
+    }
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(|(binding, visibility, ty)| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty,
+            count: None,
+        })
+        .collect();
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("painter shader params"),
+        entries: &entries,
+    });
+    // wgpu validates again; collect its error instead of panicking.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("painter shader"),
+        source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(shader.module.clone())),
+    });
+    let pipeline_layout = pipeline_layout(device, &[globals, material, &layout]);
+    let vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &VERTEX_ATTRIBUTES,
+    };
+    let target = Some(wgpu::ColorTargetState::from(HDR_FORMAT));
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("painter shader"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_mesh"),
+            compilation_options: Default::default(),
+            buffers: &[Some(vertex_layout)],
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &fragment,
+            entry_point: Some(shader.entry_point),
+            compilation_options: Default::default(),
+            targets: &[target.clone(), target],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        return Err(format!("the GPU rejected the translated shader: {e}"));
+    }
+    Ok(CustomShader {
+        shader,
+        pipeline,
+        layout,
+    })
+}
+
+/// Bind group 2 of a Painter shader: its parameter block (defaults, overridden by
+/// `params`) and its textures (`textures`, else white).
+#[allow(clippy::too_many_arguments)]
+fn custom_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    c: &CustomShader,
+    params: &std::collections::BTreeMap<String, Vec<f32>>,
+    textures: &std::collections::BTreeMap<String, ResourceId>,
+    resources: &Resources,
+    compositor: &mut Compositor,
+    white: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    let mut data = c.shader.default_uniform_data();
+    for p in &c.shader.params {
+        let Some(values) = params.get(&p.name) else {
+            continue;
+        };
+        for (k, v) in values.iter().take(p.ty.components()).enumerate() {
+            let at = p.offset as usize + k * 4;
+            let bytes = if p.ty.is_integer() {
+                (v.round() as i32).to_le_bytes()
+            } else {
+                v.to_le_bytes()
+            };
+            if let Some(dst) = data.get_mut(at..at + 4) {
+                dst.copy_from_slice(&bytes);
+            }
+        }
+    }
+    // A uniform binding can't be empty.
+    data.resize(data.len().max(16).next_multiple_of(16), 0);
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("painter shader params"),
+        contents: &data,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let views: Vec<(u32, wgpu::TextureView)> = c
+        .shader
+        .textures
+        .iter()
+        .map(|t| {
+            let view = textures
+                .get(&t.name)
+                .and_then(|id| compositor.bitmap_view_srgb(device, queue, resources, id))
+                .unwrap_or_else(|| white.clone());
+            (t.binding, view)
+        })
+        .collect();
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    let mut entries = vec![wgpu::BindGroupEntry {
+        binding: reetched_shader::PARAMS_BINDING,
+        resource: buffer.as_entire_binding(),
+    }];
+    for (binding, view) in &views {
+        entries.push(wgpu::BindGroupEntry {
+            binding: *binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        });
+    }
+    if !views.is_empty() {
+        entries.push(wgpu::BindGroupEntry {
+            binding: reetched_shader::USER_SAMPLER_BINDING,
+            resource: wgpu::BindingResource::Sampler(&sampler),
+        });
+    }
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("painter shader params"),
+        layout: &c.layout,
+        entries: &entries,
+    })
+}
+
+/// Can `dab` touch tile `t`? World dabs: their sphere against the tile's bounds;
+/// UV dabs: their circle against the tile's square.
+fn dab_reaches(d: &Dab, t: &Tile) -> bool {
+    if d.view_flags[3] as u32 & DAB_UV_SPACE != 0 {
+        let [u0, v0] = reetched_doc::udim_origin(t.number);
+        let (u, v, r) = (d.uv[0], d.uv[1], d.uv[2]);
+        return u + r >= u0 && u - r <= u0 + 1.0 && v + r >= v0 && v - r <= v0 + 1.0;
+    }
+    let c = Vec3::new(d.center_radius[0], d.center_radius[1], d.center_radius[2]);
+    // The splat shader reaches 1.5 radii.
+    let r = d.center_radius[3] * 1.5;
+    let nearest = c.clamp(t.bounds.0, t.bounds.1);
+    nearest.distance_squared(c) <= r * r
 }
 
 fn display_texture(device: &wgpu::Device, [width, height]: [u32; 2]) -> wgpu::TextureView {
@@ -1188,6 +1876,41 @@ fn display_texture(device: &wgpu::Device, [width, height]: [u32; 2]) -> wgpu::Te
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         })
+        .create_view(&Default::default())
+}
+
+/// A 3D LUT texture (rgba16f), red fastest.
+fn lut_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    size: u32,
+    data: &[[f32; 3]],
+) -> wgpu::TextureView {
+    let texels: Vec<half::f16> = data
+        .iter()
+        .flat_map(|c| [c[0], c[1], c[2], 1.0])
+        .map(half::f16::from_f32)
+        .collect();
+    device
+        .create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("display lut"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(&texels),
+        )
         .create_view(&Default::default())
 }
 
@@ -1232,12 +1955,21 @@ impl Targets {
         let quarter = [(width / 4).max(1), (height / 4).max(1)];
         let rt = U::RENDER_ATTACHMENT | U::TEXTURE_BINDING;
         let hdr = sized(HDR_FORMAT, rt, full);
+        let sss = [
+            sized(HDR_FORMAT, rt, full),
+            sized(HDR_FORMAT, rt, full),
+            sized(HDR_FORMAT, rt, full),
+        ];
+        let oit_accum = sized(HDR_FORMAT, rt, full);
+        let oit_reveal = sized(REVEAL_FORMAT, rt, full);
         let history = [sized(HDR_FORMAT, rt, full), sized(HDR_FORMAT, rt, full)];
         let bloom = [
             sized(HDR_FORMAT, rt, quarter),
             sized(HDR_FORMAT, rt, quarter),
         ];
-        let group = |a: &wgpu::TextureView, b: &wgpu::TextureView| {
+        // Kept and readable: brush strokes test occlusion against it, scattering too.
+        let depth = sized(DEPTH_FORMAT, rt, full);
+        let group = |a: &wgpu::TextureView, b: &wgpu::TextureView, c: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: post_layout,
@@ -1254,19 +1986,41 @@ impl Targets {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(c),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&depth),
+                    },
                 ],
             })
         };
         Self {
             size: full,
-            accum_bg: [group(&hdr, &history[1]), group(&hdr, &history[0])],
-            bloom_down_bg: [group(&history[0], &hdr), group(&history[1], &hdr)],
-            blur_h_bg: group(&bloom[0], &bloom[0]),
-            blur_v_bg: group(&bloom[1], &bloom[1]),
-            tonemap_bg: [group(&history[0], &bloom[0]), group(&history[1], &bloom[0])],
+            oit_bg: group(&oit_accum, &oit_reveal, &oit_accum),
+            sss_h_bg: group(&sss[0], &sss[0], &sss[0]),
+            sss_v_bg: group(&sss[1], &sss[1], &sss[1]),
+            accum_bg: [
+                group(&hdr, &history[1], &sss[2]),
+                group(&hdr, &history[0], &sss[2]),
+            ],
+            bloom_down_bg: [
+                group(&history[0], &hdr, &hdr),
+                group(&history[1], &hdr, &hdr),
+            ],
+            blur_h_bg: group(&bloom[0], &bloom[0], &bloom[0]),
+            blur_v_bg: group(&bloom[1], &bloom[1], &bloom[1]),
+            tonemap_bg: [
+                group(&history[0], &bloom[0], &bloom[0]),
+                group(&history[1], &bloom[0], &bloom[0]),
+            ],
             hdr,
-            // Kept and readable: brush strokes test occlusion against it.
-            depth: sized(DEPTH_FORMAT, rt, full),
+            sss,
+            oit_accum,
+            oit_reveal,
+            depth,
             display: display_texture(device, full),
             history,
             bloom,
@@ -1390,6 +2144,7 @@ fn globals_bind_group(
     globals: &wgpu::Buffer,
     env: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    lut: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("globals"),
@@ -1406,6 +2161,10 @@ fn globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(lut),
             },
         ],
     })
@@ -1478,11 +2237,9 @@ fn pipeline_layout(
 struct PipelineDesc<'a> {
     module: &'a wgpu::ShaderModule,
     buffers: &'a [Option<wgpu::VertexBufferLayout<'a>>],
-    topology: wgpu::PrimitiveTopology,
     polygon_mode: wgpu::PolygonMode,
     depth: Option<(bool, wgpu::CompareFunction)>,
-    blend: Option<wgpu::BlendState>,
-    format: wgpu::TextureFormat,
+    targets: &'a [Option<wgpu::ColorTargetState>],
 }
 
 struct PipelineWith<'a> {
@@ -1522,7 +2279,7 @@ impl PipelineWith<'_> {
                 buffers: d.buffers,
             },
             primitive: wgpu::PrimitiveState {
-                topology: d.topology,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 polygon_mode: d.polygon_mode,
                 cull_mode: None,
                 ..Default::default()
@@ -1539,11 +2296,7 @@ impl PipelineWith<'_> {
                 module: d.module,
                 entry_point: Some(self.fs),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: d.format,
-                    blend: d.blend,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: d.targets,
             }),
             multiview_mask: None,
             cache: None,

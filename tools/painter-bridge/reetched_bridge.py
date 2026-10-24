@@ -37,15 +37,31 @@ import substance_painter.ui
 FORMAT = "reetched-bridge"
 VERSION = 1
 
-# Painter ChannelType names -> bundle names. Other channels are reported, not exported.
+# Painter ChannelType names (compared case-insensitively) -> bundle names.
+# Other channels are reported, not exported.
 CHANNELS = {
-    "BaseColor": "basecolor",
-    "Metallic": "metallic",
-    "Roughness": "roughness",
-    "Normal": "normal",
-    "Height": "height",
-    "Emissive": "emissive",
-    "Opacity": "opacity",
+    "basecolor": "basecolor",
+    "metallic": "metallic",
+    "roughness": "roughness",
+    "normal": "normal",
+    "height": "height",
+    "emissive": "emissive",
+    "opacity": "opacity",
+    "specularlevel": "specularlevel",
+    "specularedgecolor": "specularedgecolor",
+    "anisotropylevel": "anisotropylevel",
+    "anisotropyangle": "anisotropyangle",
+    "transmissive": "transmissive",
+    "scattering": "scattering",
+    "scatteringcolor": "scatteringcolor",
+    "coatopacity": "coatopacity",
+    "coatcolor": "coatcolor",
+    "coatroughness": "coatroughness",
+    "sheenopacity": "sheenopacity",
+    "sheencolor": "sheencolor",
+    "sheenroughness": "sheenroughness",
+    "ao": "ambientocclusion",
+    "ambientocclusion": "ambientocclusion",
 }
 
 # Background values (black pass, white pass) under captured content, per channel.
@@ -56,6 +72,20 @@ BACKGROUNDS = {
     "height": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     "emissive": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     "opacity": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "specularlevel": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "specularedgecolor": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "anisotropylevel": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "anisotropyangle": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "transmissive": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "scattering": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "scatteringcolor": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "coatopacity": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "coatcolor": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "coatroughness": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "sheenopacity": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "sheencolor": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "sheenroughness": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "ambientocclusion": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     # Flat normal, then one tilted in red and green; blue carries no information.
     "normal": ([0.5, 0.5, 1.0], [1.0, 1.0, 1.0]),
 }
@@ -82,7 +112,7 @@ def _channel_types(stack):
     """(ChannelType, bundle name) for the channels the stack has that ReEtched supports."""
     out = []
     for ct in stack.all_channels().keys():
-        name = CHANNELS.get(ct.name)
+        name = CHANNELS.get(ct.name.lower())
         if name:
             out.append((ct, name))
     return out
@@ -349,7 +379,7 @@ class Bridge:
                 self.log.append("%s: only the first material layer is exported" % ts.name())
             stack = stacks[0]
             channels = _channel_types(stack)
-            dropped = [ct.name for ct in stack.all_channels().keys() if ct.name not in CHANNELS]
+            dropped = [ct.name for ct in stack.all_channels().keys() if ct.name.lower() not in CHANNELS]
             if dropped:
                 self.log.append("%s: channels not carried over: %s" % (ts.name(), ", ".join(sorted(dropped))))
             res = ts.get_resolution()

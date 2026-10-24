@@ -11,6 +11,38 @@ use glam::{Vec2, Vec3};
 use reetched_io::topology::{Selection, Topology};
 use std::sync::Arc;
 
+/// What the Path tool does along its curve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathMode {
+    Paint,
+    Erase,
+    Smudge,
+    /// The brush alpha drawn as one continuous band along the path.
+    Ribbon,
+    /// Closes the path and fills the faces inside it.
+    Fill,
+}
+
+impl PathMode {
+    pub const ALL: [PathMode; 5] = [
+        PathMode::Paint,
+        PathMode::Erase,
+        PathMode::Smudge,
+        PathMode::Ribbon,
+        PathMode::Fill,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PathMode::Paint => "Paint",
+            PathMode::Erase => "Erase",
+            PathMode::Smudge => "Smudge",
+            PathMode::Ribbon => "Ribbon",
+            PathMode::Fill => "Filled",
+        }
+    }
+}
+
 /// The Projection tool's image, placed over the 3D view.
 pub struct Stencil {
     pub image: Option<reetched_doc::ResourceId>,
@@ -119,7 +151,7 @@ impl State {
     }
 
     /// Projection tool: makes the stencil the current stroke's color source.
-    pub fn project_stencil(&mut self, part: usize) -> bool {
+    pub fn project_stencil(&mut self) -> bool {
         let Some(id) = self.stencil.image.clone() else {
             self.warn("Load an image for the Projection tool first".into());
             return false;
@@ -135,29 +167,29 @@ impl State {
         let u = self
             .stencil
             .uniform(self.view_proj(rect.width() / rect.height()), rect);
-        self.viewport
-            .paint_project(&self.device, &self.queue, part, &view, u);
+        self.viewport.paint_project(view, u);
         true
     }
 
     fn load_stencil(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "tga", "tif", "tiff"])
+            .add_filter("Images", crate::images::IMAGE_EXTENSIONS)
             .pick_file()
         else {
             return;
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.error(format!("Could not read {}: {e}", path.display()));
-                return;
-            }
-        };
-        let img = match image::load_from_memory(&bytes) {
+        match std::fs::read(&path) {
+            Ok(bytes) => self.set_stencil(ctx, &bytes, &path.display().to_string()),
+            Err(e) => self.error(format!("Could not read {}: {e}", path.display())),
+        }
+    }
+
+    /// Makes image file `bytes` the Projection tool's image.
+    pub fn set_stencil(&mut self, ctx: &egui::Context, bytes: &[u8], name: &str) {
+        let img = match crate::images::decode(bytes) {
             Ok(i) => i.to_rgba8(),
             Err(e) => {
-                self.error(format!("Could not decode {}: {e}", path.display()));
+                self.error(format!("Could not decode {name}: {e:#}"));
                 return;
             }
         };
@@ -169,7 +201,7 @@ impl State {
             egui::TextureOptions::LINEAR,
         ));
         // Held in resources (not the document) until painted with.
-        self.stencil.image = Some(self.resources.add(bytes));
+        self.stencil.image = Some(self.resources.add(bytes.to_vec()));
     }
 
     /// Polygon Fill: click fills the selection with the brush, Ctrl+click erases it;
@@ -190,8 +222,10 @@ impl State {
         let erase = ui.input(|i| i.modifiers.ctrl);
         let topo = self.topology();
         let hit = if uv_view {
-            self.uv_under(p, rect, true)
-                .and_then(|(uv, part)| Some((topo.triangle_at_uv(&self.mesh, part, uv)?, part)))
+            self.uv_under(p, rect, true).and_then(|(uv, part)| {
+                let tri = topo.triangle_at_uv(&self.mesh, part, uv)?;
+                Some((tri, part, Topology::point_at_uv(&self.mesh, tri, uv)))
+            })
         } else {
             let view_proj = self.view_proj(rect.width() / rect.height());
             let ndc = Vec2::new(
@@ -199,14 +233,14 @@ impl State {
                 1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
             );
             let (origin, dir) = view_ray(view_proj, ndc);
-            raycast(&self.mesh, origin, dir).map(|h| (h.tri, h.part))
+            raycast(&self.mesh, origin, dir).map(|h| (h.tri, h.part, h.pos))
         };
-        let Some((tri, part)) = hit else { return };
+        let Some((tri, part, at)) = hit else { return };
         if part != self.selected_part {
             self.warn("That's another texture set — select it first".into());
             return;
         }
-        self.polygon_fill(&topo.select(tri, self.polygon_mode), erase);
+        self.polygon_fill(&topo.select_at(tri, self.polygon_mode, at), erase);
     }
 
     fn marquee_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect) {
@@ -258,12 +292,24 @@ impl State {
         if !self.begin_stroke(true, mode) {
             return;
         }
-        let indices: Vec<u32> = tris
-            .iter()
-            .flat_map(|&t| self.mesh.indices[t as usize * 3..t as usize * 3 + 3].to_vec())
-            .collect();
-        self.viewport
-            .paint_fill(&self.device, &self.queue, self.selected_part, &indices);
+        // One fill per UDIM tile the triangles are in.
+        let mut by_tile: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        for &t in tris {
+            by_tile
+                .entry(self.mesh.triangle_udim(t as usize))
+                .or_default()
+                .extend_from_slice(&self.mesh.indices[t as usize * 3..t as usize * 3 + 3]);
+        }
+        for (tile, indices) in by_tile {
+            self.viewport.paint_fill(
+                &self.device,
+                &self.queue,
+                self.selected_part,
+                tile,
+                &indices,
+                &self.resources,
+            );
+        }
         self.end_stroke();
     }
 
@@ -339,23 +385,185 @@ impl State {
             self.warn("Part of the path is behind the camera".into());
             return;
         };
-        let mode = if self.path_erase {
-            StrokeMode::Erase
-        } else {
-            StrokeMode::Paint
+        if self.path_mode == PathMode::Fill {
+            self.fill_lasso(&pts, rect, false);
+            self.path_points.clear();
+            return;
+        }
+        let mode = match self.path_mode {
+            PathMode::Erase => StrokeMode::Erase,
+            PathMode::Smudge => StrokeMode::Smudge,
+            _ => StrokeMode::Paint,
         };
         self.pressure = 1.0;
         if !self.begin_stroke(false, mode) {
             return;
         }
-        let step = self.brush.step(1.0);
-        let mut path = StrokePath::default();
-        for p in catmull_rom(&pts, 16) {
-            let stamps = path.advance(p, step, 0.0);
-            self.stamp(&stamps, rect);
+        let curve = catmull_rom(&pts, 16);
+        if self.path_mode == PathMode::Ribbon {
+            self.stamp_ribbon(&curve, rect);
+        } else {
+            let step = self.brush.step(1.0);
+            let mut path = StrokePath::default();
+            for p in curve {
+                let stamps = path.advance(p, step, 0.0);
+                self.stamp(&stamps, rect);
+            }
         }
         self.end_stroke();
         self.path_points.clear();
+    }
+
+    /// Ribbon: dense dabs along `curve` (screen points), each turned along the path,
+    /// carrying the distance travelled so the brush alpha runs along it.
+    fn stamp_ribbon(&mut self, curve: &[Vec2], rect: Rect) {
+        let radius = self.brush.size.max(1.0);
+        let step = (radius * 0.2).max(1.0);
+        let mut path = StrokePath::default();
+        let mut stamps = Vec::new();
+        for &p in curve {
+            stamps.extend(path.advance(p, step, 0.0));
+        }
+        let mut travelled = 0.0;
+        for (i, &p) in stamps.iter().enumerate() {
+            let next = stamps.get(i + 1).copied().unwrap_or(p);
+            let prev = if i > 0 { stamps[i - 1] } else { p };
+            let dir = (next - prev).normalize_or(Vec2::X);
+            if i > 0 {
+                travelled += p.distance(prev) / radius;
+            }
+            self.stamp_with(&[p], rect, Some((dir, travelled)));
+        }
+    }
+
+    /// Fills (or erases) every front-facing triangle of the selected texture set
+    /// whose center falls inside the screen polygon `pts`.
+    pub fn fill_lasso(&mut self, pts: &[Vec2], rect: Rect, erase: bool) {
+        let view_proj = self.view_proj(rect.width() / rect.height());
+        let eye = self.camera.eye();
+        let part = &self.mesh.parts[self.selected_part.min(self.mesh.parts.len() - 1)];
+        let inside = |q: Vec2| {
+            // Even-odd rule.
+            let mut c = false;
+            for k in 0..pts.len() {
+                let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+                if (a.y > q.y) != (b.y > q.y) && q.x < a.x + (q.y - a.y) / (b.y - a.y) * (b.x - a.x)
+                {
+                    c = !c;
+                }
+            }
+            c
+        };
+        let tris: Vec<u32> = (part.indices.start / 3..part.indices.end / 3)
+            .filter(|&t| {
+                let idx = &self.mesh.indices[t as usize * 3..t as usize * 3 + 3];
+                let [a, b, c] =
+                    [0, 1, 2].map(|k| Vec3::from(self.mesh.vertices[idx[k] as usize].position));
+                let centroid = (a + b + c) / 3.0;
+                let facing = (b - a).cross(c - a).dot(eye - centroid) > 0.0;
+                facing
+                    && to_screen(view_proj, rect, centroid)
+                        .is_some_and(|s| inside(Vec2::new(s.x, s.y)))
+            })
+            .collect();
+        if tris.is_empty() {
+            self.warn("The filled path covers no faces of this texture set".into());
+            return;
+        }
+        self.polygon_fill(&tris, erase);
+    }
+
+    /// The selected layer's (or mask's) projection, when it's a warp projection.
+    fn warp_projection(&mut self) -> Option<&mut reetched_doc::Projection> {
+        let sel = self.selected?;
+        let node = self
+            .stack_mut()
+            .and_then(|s| reetched_doc::find_node_mut(s, sel.node))?;
+        let p = if sel.mask {
+            &mut node.mask.as_mut()?.projection
+        } else {
+            match &mut node.kind {
+                reetched_doc::NodeKind::Fill(f) => &mut f.projection,
+                _ => return None,
+            }
+        };
+        (p.mode == reetched_doc::ProjectionMode::Warp).then_some(p)
+    }
+
+    /// Warp projection lattice in the 2D view: drawn over the 0..1 tile, its
+    /// points dragged with the mouse. Returns true while it has the pointer.
+    pub fn warp_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect) -> bool {
+        let cam_center = self.uv_camera.center;
+        let zoom = self.uv_camera.zoom;
+        let drag = self.warp_drag;
+        let Some(p) = self.warp_projection() else {
+            return false;
+        };
+        // Lattice space: t = R(rot) (uv * scale) + offset (see uv_xform in compositor.wgsl).
+        let (s, c) = p.rotation_deg.to_radians().sin_cos();
+        let scale = Vec2::from(p.scale).max(Vec2::splat(1e-4));
+        let offset = Vec2::from(p.offset);
+        let to_uv = |l: Vec2| {
+            let d = l - offset;
+            Vec2::new(c * d.x + s * d.y, -s * d.x + c * d.y) / scale
+        };
+        let to_lattice = |uv: Vec2| {
+            let q = uv * scale;
+            Vec2::new(c * q.x - s * q.y, s * q.x + c * q.y) + offset
+        };
+        let screen = |uv: Vec2| {
+            let d = (uv - cam_center) * zoom;
+            rect.center() + egui::vec2(d.x, -d.y)
+        };
+        let from_screen = |q: egui::Pos2| {
+            cam_center + Vec2::new(q.x - rect.center().x, rect.center().y - q.y) / zoom
+        };
+        let points: Vec<egui::Pos2> = p
+            .warp
+            .iter()
+            .map(|w| screen(to_uv(Vec2::from(*w))))
+            .collect();
+        let painter = ui.painter_at(rect);
+        let line = Stroke::new(1.0, Color32::from_rgb(255, 170, 60));
+        for j in 0..4 {
+            for i in 0..4 {
+                let k = j * 4 + i;
+                if i < 3 {
+                    painter.line_segment([points[k], points[k + 1]], line);
+                }
+                if j < 3 {
+                    painter.line_segment([points[k], points[k + 4]], line);
+                }
+            }
+        }
+        for (k, q) in points.iter().enumerate() {
+            let r = if drag == Some(k) { 6.0 } else { 4.5 };
+            painter.circle_filled(*q, r, Color32::from_rgb(255, 170, 60));
+        }
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let mut grabbed = drag;
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && !ui.input(|i| i.modifiers.alt)
+            && let Some(q) = pointer
+        {
+            grabbed = points
+                .iter()
+                .enumerate()
+                .map(|(k, h)| (k, h.distance(q)))
+                .filter(|(_, d)| *d < 10.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(k, _)| k);
+        }
+        if let (Some(k), Some(q)) = (grabbed, pointer)
+            && response.dragged_by(egui::PointerButton::Primary)
+        {
+            p.warp[k] = to_lattice(from_screen(q)).into();
+        }
+        if response.drag_stopped() {
+            grabbed = None;
+        }
+        self.warp_drag = grabbed;
+        grabbed.is_some()
     }
 
     /// Tool-specific options at the top of the brush panel.
@@ -385,6 +593,11 @@ impl State {
                     if ui.button("Load image…").clicked() {
                         let ctx = ui.ctx().clone();
                         self.load_stencil(&ctx);
+                    }
+                    if ui.button("Text…").clicked() {
+                        self.text_ui = Some(crate::text_ui::TextUi::new(
+                            crate::text_ui::TextTarget::Stencil,
+                        ));
                     }
                     if ui.button("Center").clicked() {
                         self.stencil.center = Vec2::ZERO;
@@ -425,9 +638,10 @@ impl State {
                 }
             }
             Tool::Path => {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.path_erase, false, "Paint");
-                    ui.selectable_value(&mut self.path_erase, true, "Erase");
+                ui.horizontal_wrapped(|ui| {
+                    for m in PathMode::ALL {
+                        ui.selectable_value(&mut self.path_mode, m, m.label());
+                    }
                 });
                 hint(
                     ui,

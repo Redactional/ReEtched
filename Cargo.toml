@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Redactional/ReEtched"
-rust-version = "1.88"
+rust-version = "1.96"
 
 [workspace.dependencies]
 reetched-io = { path = "crates/reetched-io" }
@@ -15,6 +15,8 @@ reetched-doc = { path = "crates/reetched-doc" }
 reetched-bake = { path = "crates/reetched-bake" }
 reetched-graph = { path = "crates/reetched-graph" }
 reetched-substance = { path = "crates/reetched-substance" }
+reetched-color = { path = "crates/reetched-color" }
+reetched-shader = { path = "crates/reetched-shader" }
 anyhow = "1"
 glam = { version = "0.34", features = ["bytemuck"] }
 log = "0.4"

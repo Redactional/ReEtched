@@ -20,6 +20,16 @@ struct MeshInfo {
     /// (material name, first index, end index)
     parts: Vec<(String, u32, u32)>,
     has_uvs: bool,
+    /// Layout of `mesh_vertices.bin`: 1 = no second UV set (48 bytes per vertex),
+    /// 2 = `Vertex` as it is now.
+    #[serde(default = "vertex_format_v1")]
+    vertex_format: u32,
+}
+
+const VERTEX_FORMAT: u32 = 2;
+
+fn vertex_format_v1() -> u32 {
+    1
 }
 
 pub fn save(path: &Path, doc: &Document, mesh: &Mesh, resources: &Resources) -> Result<()> {
@@ -48,6 +58,7 @@ fn write_zip(path: &Path, doc: &Document, mesh: &Mesh, resources: &Resources) ->
             .map(|p| (p.material.clone(), p.indices.start, p.indices.end))
             .collect(),
         has_uvs: mesh.has_uvs,
+        vertex_format: VERTEX_FORMAT,
     };
     put("mesh.json", &serde_json::to_vec_pretty(&info)?)?;
     put("mesh_vertices.bin", bytemuck::cast_slice(&mesh.vertices))?;
@@ -101,12 +112,26 @@ pub fn load(path: &Path) -> Result<(Document, Mesh, Resources)> {
     doc.format_version = FORMAT_VERSION;
 
     let info: MeshInfo = serde_json::from_slice(&read("mesh.json")?)?;
-    let vertices: Vec<Vertex> = read("mesh_vertices.bin")?
-        .as_chunks::<{ size_of::<Vertex>() }>()
-        .0
-        .iter()
-        .map(|c| bytemuck::pod_read_unaligned(c))
-        .collect();
+    let raw = read("mesh_vertices.bin")?;
+    let vertices: Vec<Vertex> = match info.vertex_format {
+        1 => raw
+            .as_chunks::<48>()
+            .0
+            .iter()
+            .map(|c| {
+                let mut v = [0u8; size_of::<Vertex>()];
+                v[..48].copy_from_slice(c);
+                bytemuck::pod_read_unaligned(&v)
+            })
+            .collect(),
+        VERTEX_FORMAT => raw
+            .as_chunks::<{ size_of::<Vertex>() }>()
+            .0
+            .iter()
+            .map(|c| bytemuck::pod_read_unaligned(c))
+            .collect(),
+        f => bail!("unknown mesh vertex format {f}"),
+    };
     let indices: Vec<u32> = read("mesh_indices.bin")?
         .as_chunks::<4>()
         .0

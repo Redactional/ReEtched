@@ -1,0 +1,86 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    double3 xformOp:translate = (10, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def "Looks"
+    {
+        def Material "MatA"
+        {
+        }
+
+        def Material "MatB"
+        {
+        }
+    }
+
+    def Xform "A"
+    {
+        float3 xformOp:scale = (2, 2, 2)
+        uniform token[] xformOpOrder = ["xformOp:scale"]
+
+        def Mesh "Box"
+        {
+            int[] faceVertexCounts = [4, 5]
+            int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+            point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (2, 0, 0), (3, 0, 0), (3.5, 1, 0), (2.5, 2, 0), (1.5, 1, 0)]
+            normal3f[] primvars:normals = [(0, 0, -1), (0, 0, 1)] (
+                interpolation = "faceVarying"
+            )
+            int[] primvars:normals:indices = [1, 1, 1, 1, 1, 1, 1, 1, 1]
+            texCoord2f[] primvars:st = [(0, 0), (0.25, 0), (0.25, 0.5), (0, 0.5), (0.5, 0), (0.75, 0), (0.875, 0.5), (0.625, 1), (0.375, 0.5)] (
+                interpolation = "faceVarying"
+            )
+            texCoord2f[] primvars:st1 = [(0, 0), (0, 0.25), (0.5, 0.25), (0.5, 0), (0, 0.5), (0, 0.75), (0.5, 0.875), (1, 0.625), (0.5, 0.375)] (
+                interpolation = "vertex"
+            )
+            int[] primvars:st:indices = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+            def GeomSubset "partA" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform token elementType = "face"
+                uniform token familyName = "materialBind"
+                int[] indices = [0]
+                rel material:binding = </World/Looks/MatA>
+            }
+
+            def GeomSubset "partB" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform token elementType = "face"
+                uniform token familyName = "materialBind"
+                int[] indices = [1]
+                rel material:binding = </World/Looks/MatB>
+            }
+        }
+    }
+
+    def Xform "B"
+    {
+        float xformOp:rotateZ = 90
+        double3 xformOp:translate = (0, 0, 5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+
+        def Mesh "Tri" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0, 1, 2]
+            rel material:binding = </World/Looks/MatB>
+            uniform token orientation = "leftHanded"
+            point3f[] points = [(0, 0, 0), (0, 1, 0), (1, 0, 0)]
+        }
+    }
+}
+

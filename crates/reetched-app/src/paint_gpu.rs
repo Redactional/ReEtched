@@ -1,10 +1,12 @@
 //! Brush strokes on the GPU (see `shaders/paint.wgsl`): dabs accumulate into a
 //! stroke mask that is blended into the target paint textures; when the stroke
-//! ends, the touched tiles are read back into the document.
+//! ends, the touched tiles are read back into the document. A stroke can cross
+//! UDIM tiles: each tile gets its own mask and snapshots once the brush reaches it.
 
-use crate::compositor::{Compositor, MeshPart, PAINT_FORMAT, PaintKey};
+use crate::compositor::{Compositor, MeshPart, PAINT_FORMAT, PaintKey, VERTEX_ATTRIBUTES};
 use glam::{Mat4, Vec3};
-use reetched_doc::{Resources, TILE_BYTES, TILE_SIZE, TileMap};
+use reetched_doc::{NodeId, Resources, TILE_BYTES, TILE_SIZE, TextureSet, TileMap};
+use std::collections::BTreeMap;
 use wgpu::util::DeviceExt;
 
 pub const MAX_DABS: usize = 64;
@@ -18,12 +20,15 @@ pub struct Dab {
     pub right_flow: [f32; 4],
     pub up_angle: [f32; 4],
     pub view_flags: [f32; 4],
+    /// xy: UV center, z: UV radius, w: ribbon arc length (brush radii along the path)
     pub uv: [f32; 4],
 }
 
 /// `Dab::view_flags.w` bits.
 pub const DAB_DEPTH_TEST: u32 = 1;
 pub const DAB_UV_SPACE: u32 = 2;
+/// Ribbon: the alpha runs along the path instead of being stamped.
+pub const DAB_RIBBON: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -40,7 +45,7 @@ struct SplatUniform {
 struct ApplyUniform {
     color: [f32; 4],
     params: [f32; 4],
-    /// x: 1 = copy from an offset (clone, smudge), yz: offset in texels.
+    /// x: 1 = copy from an offset (clone, smudge), 2 = projected; yz: offset in texels.
     extra: [f32; 4],
 }
 
@@ -84,37 +89,58 @@ pub struct BrushShape {
     pub alpha: Option<wgpu::TextureView>,
 }
 
-/// A paint buffer a stroke writes into.
+/// A paint buffer a stroke writes into (in every UDIM tile it reaches).
 pub struct StrokeTarget {
-    pub key: PaintKey,
+    /// (layer, channel index or `MASK_SLOT`)
+    pub key: (NodeId, u8),
     /// Brush value for this buffer (linear color, normal, or scalar in x).
     pub value: [f32; 3],
     pub is_normal: bool,
     /// Projection tool: this buffer takes the projected image's colors.
     pub projected: bool,
-    /// The buffer's tiles when the stroke started.
-    pub old: TileMap,
+    /// The buffer's tiles per UDIM tile when the stroke started (missing = empty).
+    pub old: BTreeMap<u32, TileMap>,
 }
 
-struct Stroke {
+impl StrokeTarget {
+    fn paint_key(&self, tile: u32) -> PaintKey {
+        (self.key.0, self.key.1, tile)
+    }
+}
+
+/// The part of a stroke on one UDIM tile.
+struct TileStroke {
     res: u32,
-    mode: StrokeMode,
-    opacity: f32,
     mask: wgpu::Texture,
     mask_view: wgpu::TextureView,
     /// Smudge: this frame's dabs only.
     frame_mask: Option<wgpu::TextureView>,
-    /// Each target with a copy of its paint ("before"): from the stroke's
-    /// start, or for smudge from the start of the current frame.
-    targets: Vec<(StrokeTarget, wgpu::Texture, wgpu::TextureView)>,
+    /// Each target's paint ("before"), index-aligned with `Stroke::targets`: from
+    /// when the brush reached the tile, or for smudge from the start of the frame.
+    before: Vec<(wgpu::Texture, wgpu::TextureView)>,
     /// Smudge: motion not yet applied because it was under a texel.
     carry: [f32; 2],
     /// Projection tool: the image as seen on each texel.
     projected: Option<wgpu::TextureView>,
 }
 
+struct Stroke {
+    mode: StrokeMode,
+    opacity: f32,
+    targets: Vec<StrokeTarget>,
+    /// Texture size per UDIM tile.
+    resolution: BTreeMap<u32, u32>,
+    /// Fallback size for tiles not listed.
+    default_res: u32,
+    tiles: BTreeMap<u32, TileStroke>,
+    /// Projection tool: the image and where it sits.
+    projection: Option<(wgpu::TextureView, ProjectUniform)>,
+}
+
 pub struct PaintGpu {
     splat: wgpu::RenderPipeline,
+    /// Ribbons: the same splat, but texels keep the strongest dab (no build-up).
+    ribbon: wgpu::RenderPipeline,
     /// Fills whole triangles into the stroke mask (Polygon Fill).
     fill: wgpu::RenderPipeline,
     /// Projects the Projection tool's image into texture space.
@@ -167,6 +193,7 @@ impl PaintGpu {
                     S::FRAGMENT,
                     B::Sampler(wgpu::SamplerBindingType::Filtering),
                 ),
+                entry(4, S::VERTEX, uniform),
             ],
         });
         let apply_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -179,14 +206,14 @@ impl PaintGpu {
             ],
         });
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/paint.wgsl"));
-        let pipeline = |layout: Option<&wgpu::BindGroupLayout>,
+        let pipeline = |layout: &wgpu::BindGroupLayout,
                         vs: &str,
                         fs: &str,
                         buffers: &[Option<wgpu::VertexBufferLayout>],
                         target: wgpu::ColorTargetState| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(fs),
-                bind_group_layouts: &[layout],
+                bind_group_layouts: &[Some(layout)],
                 immediate_size: 0,
             });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -216,36 +243,54 @@ impl PaintGpu {
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
+        let strongest = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        };
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: size_of::<reetched_io::Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+            attributes: &VERTEX_ATTRIBUTES[..4],
         })];
-        let mask_target = wgpu::ColorTargetState {
+        let mask_target = |blend| wgpu::ColorTargetState {
             format: MASK_FORMAT,
             blend: Some(wgpu::BlendState {
-                color: accumulate,
-                alpha: accumulate,
+                color: blend,
+                alpha: blend,
             }),
             write_mask: wgpu::ColorWrites::ALL,
         };
         let splat = pipeline(
-            Some(&splat_layout),
+            &splat_layout,
             "vs_uv",
             "fs_splat",
             &vertex_layout,
-            mask_target.clone(),
+            mask_target(accumulate),
         );
-        let fill = pipeline(None, "vs_uv", "fs_fill", &vertex_layout, mask_target);
+        let ribbon = pipeline(
+            &splat_layout,
+            "vs_uv",
+            "fs_splat",
+            &vertex_layout,
+            mask_target(strongest),
+        );
+        let fill = pipeline(
+            &splat_layout,
+            "vs_uv",
+            "fs_fill",
+            &vertex_layout,
+            mask_target(accumulate),
+        );
         let project = pipeline(
-            Some(&splat_layout),
+            &splat_layout,
             "vs_uv",
             "fs_project",
             &vertex_layout,
             PAINT_FORMAT.into(),
         );
         let apply = pipeline(
-            Some(&apply_layout),
+            &apply_layout,
             "vs_full",
             "fs_apply",
             &[],
@@ -253,6 +298,7 @@ impl PaintGpu {
         );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("brush alpha"),
+            address_mode_u: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -296,6 +342,7 @@ impl PaintGpu {
             .create_view(&Default::default());
         Self {
             splat,
+            ribbon,
             fill,
             project,
             apply,
@@ -308,27 +355,121 @@ impl PaintGpu {
         }
     }
 
-    /// Starts a stroke on `targets` (texture-set size `res`).
-    #[allow(clippy::too_many_arguments)]
+    /// Starts a stroke on `targets` in texture set `set`. Nothing is touched on the
+    /// GPU until the brush reaches a tile.
     pub fn begin(
+        &mut self,
+        targets: Vec<StrokeTarget>,
+        set: &TextureSet,
+        mode: StrokeMode,
+        opacity: f32,
+    ) {
+        let mut resolution: BTreeMap<u32, u32> = set
+            .udim
+            .iter()
+            .map(|t| (t.number, set.tile_resolution(t.number)))
+            .collect();
+        resolution
+            .entry(reetched_doc::FIRST_UDIM)
+            .or_insert(set.resolution);
+        self.stroke = Some(Stroke {
+            mode,
+            opacity,
+            targets,
+            resolution,
+            default_res: set.resolution,
+            tiles: BTreeMap::new(),
+            projection: None,
+        });
+    }
+
+    /// Projection tool: the image this stroke paints and where it sits on screen.
+    pub fn set_projection(&mut self, image: wgpu::TextureView, u: ProjectUniform) {
+        if let Some(s) = &mut self.stroke {
+            s.projection = Some((image, u));
+        }
+    }
+
+    /// The splat bind group for tile `mesh` with uniform `contents`.
+    fn splat_group(
+        &self,
+        device: &wgpu::Device,
+        contents: &[u8],
+        depth: Option<&wgpu::TextureView>,
+        alpha: Option<&wgpu::TextureView>,
+        mesh: &MeshPart,
+    ) -> wgpu::BindGroup {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("splat"),
+            contents,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let [u, v] = mesh.uv_origin();
+        let tile = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tile"),
+            contents: bytemuck::bytes_of(&[u, v, 0.0f32, 0.0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.splat_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth.unwrap_or(&self.no_depth)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(alpha.unwrap_or(&self.white)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Sets up the stroke on tile `mesh.tile` the first time the brush reaches it:
+    /// syncs and snapshots each target's paint, clears the masks, projects the image.
+    fn ensure_tile(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         comp: &mut Compositor,
-        targets: Vec<StrokeTarget>,
-        res: u32,
+        mesh: &MeshPart,
+        depth: Option<&wgpu::TextureView>,
         resources: &Resources,
-        mode: StrokeMode,
-        opacity: f32,
     ) {
+        let tile = mesh.tile;
+        let Some(stroke) = &self.stroke else { return };
+        if stroke.tiles.contains_key(&tile) {
+            return;
+        }
+        let res = stroke
+            .resolution
+            .get(&tile)
+            .copied()
+            .unwrap_or(stroke.default_res);
         let mut enc = device.create_command_encoder(&Default::default());
-        let targets = targets
-            .into_iter()
+        let empty = TileMap::new(res);
+        let before = stroke
+            .targets
+            .iter()
             .map(|t| {
-                // Make sure the paint texture exists and holds the current tiles, then snapshot it.
-                comp.paint_view(device, queue, t.key, &t.old, res, resources);
-                let src = &comp.paint_texture(t.key).expect("just created").texture;
-                let before = device.create_texture(&wgpu::TextureDescriptor {
+                let key = t.paint_key(tile);
+                let old = t.old.get(&tile).unwrap_or(&empty);
+                comp.paint_view(device, queue, key, old, res, resources);
+                let src = &comp.paint_texture(key).expect("just created").texture;
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("stroke before"),
                     size: src.size(),
                     mip_level_count: 1,
@@ -340,11 +481,11 @@ impl PaintGpu {
                 });
                 enc.copy_texture_to_texture(
                     src.as_image_copy(),
-                    before.as_image_copy(),
+                    texture.as_image_copy(),
                     src.size(),
                 );
-                let view = before.create_view(&Default::default());
-                (t, before, view)
+                let view = texture.create_view(&Default::default());
+                (texture, view)
             })
             .collect();
         let new_mask = || {
@@ -367,8 +508,8 @@ impl PaintGpu {
         };
         let mask = new_mask();
         let mask_view = mask.create_view(&Default::default());
-        let frame_mask =
-            (mode == StrokeMode::Smudge).then(|| new_mask().create_view(&Default::default()));
+        let frame_mask = (stroke.mode == StrokeMode::Smudge)
+            .then(|| new_mask().create_view(&Default::default()));
         drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear stroke mask"),
             color_attachments: &[Some(attachment(
@@ -377,52 +518,99 @@ impl PaintGpu {
             ))],
             ..Default::default()
         }));
+        // Projection tool: the image as it lands on this tile's texels.
+        let projected = stroke.projection.as_ref().map(|(image, u)| {
+            let view = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("projected image"),
+                    size: wgpu::Extent3d {
+                        width: res,
+                        height: res,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: PAINT_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default());
+            let mut u = *u;
+            u.rot[2] = if depth.is_some() { 1.0 } else { 0.0 };
+            let group = self.splat_group(device, bytemuck::bytes_of(&u), depth, Some(image), mesh);
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("project image"),
+                color_attachments: &[Some(attachment(
+                    &view,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                ))],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.project);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(mesh.range.clone(), 0, 0..1);
+            drop(pass);
+            view
+        });
         queue.submit([enc.finish()]);
-        self.stroke = Some(Stroke {
+        let ts = TileStroke {
             res,
-            mode,
-            opacity,
             mask,
             mask_view,
             frame_mask,
-            targets,
+            before,
             carry: [0.0; 2],
-            projected: None,
-        });
+            projected,
+        };
+        if let Some(stroke) = &mut self.stroke {
+            stroke.tiles.insert(tile, ts);
+        }
     }
 
-    /// Stamps `dabs` and updates the target paint textures. `motion`: smudge
+    /// Stamps `dabs` on tile `mesh` and updates its paint textures. `motion`: smudge
     /// only, how far the brush moved this frame, in texels.
     #[allow(clippy::too_many_arguments)]
     pub fn dabs(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        comp: &Compositor,
+        comp: &mut Compositor,
         mesh: &MeshPart,
         camera: &Camera,
         depth: Option<&wgpu::TextureView>,
         shape: &BrushShape,
         dabs: &[Dab],
         motion: [f32; 2],
+        resources: &Resources,
     ) {
-        let Some(stroke) = &mut self.stroke else {
-            return;
-        };
-        if dabs.is_empty() {
+        if dabs.is_empty() || self.stroke.is_none() {
             return;
         }
+        self.ensure_tile(device, queue, comp, mesh, depth, resources);
         let mut enc = device.create_command_encoder(&Default::default());
+        // Smudge: drag from the paint as it is now, by whole texels.
         let mut offset = [0.0; 2];
-        if let Some(frame) = &stroke.frame_mask {
-            // Smudge: drag from the paint as it is now, by whole texels.
-            for (k, c) in stroke.carry.iter_mut().enumerate() {
+        if let Some(stroke) = &mut self.stroke
+            && let Some(ts) = stroke.tiles.get_mut(&mesh.tile)
+            && ts.frame_mask.is_some()
+        {
+            for (k, c) in ts.carry.iter_mut().enumerate() {
                 *c += motion[k];
                 offset[k] = -c.round();
                 *c += offset[k];
             }
-            for (target, before, _) in &stroke.targets {
-                if let Some(dst) = comp.paint_texture(target.key) {
+        }
+        let Some(stroke) = &self.stroke else { return };
+        let Some(ts) = stroke.tiles.get(&mesh.tile) else {
+            return;
+        };
+        if let Some(frame) = &ts.frame_mask {
+            for (target, (before, _)) in stroke.targets.iter().zip(&ts.before) {
+                if let Some(dst) = comp.paint_texture(target.paint_key(mesh.tile)) {
                     enc.copy_texture_to_texture(
                         dst.texture.as_image_copy(),
                         before.as_image_copy(),
@@ -439,19 +627,12 @@ impl PaintGpu {
                 ..Default::default()
             }));
         }
-        let masks: Vec<&wgpu::TextureView> = std::iter::once(&stroke.mask_view)
-            .chain(stroke.frame_mask.as_ref())
-            .collect();
-        for mask in masks {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat"),
-                color_attachments: &[Some(attachment(mask, wgpu::LoadOp::Load))],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.splat);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            for chunk in dabs.chunks(MAX_DABS) {
+        let ribbon = dabs
+            .first()
+            .is_some_and(|d| d.view_flags[3] as u32 & DAB_RIBBON != 0);
+        let groups: Vec<wgpu::BindGroup> = dabs
+            .chunks(MAX_DABS)
+            .map(|chunk| {
                 let mut u: SplatUniform = bytemuck::Zeroable::zeroed();
                 u.view_proj = camera.view_proj.to_cols_array_2d();
                 u.inv_view_proj = camera.view_proj.inverse().to_cols_array_2d();
@@ -470,186 +651,103 @@ impl PaintGpu {
                         dst.view_flags[3] = flags as f32;
                     }
                 }
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("dabs"),
-                    contents: bytemuck::bytes_of(&u),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.splat_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(
-                                depth.unwrap_or(&self.no_depth),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(
-                                shape.alpha.as_ref().unwrap_or(&self.white),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-                pass.set_bind_group(0, &group, &[]);
+                self.splat_group(
+                    device,
+                    bytemuck::bytes_of(&u),
+                    depth,
+                    shape.alpha.as_ref(),
+                    mesh,
+                )
+            })
+            .collect();
+        for mask in std::iter::once(&ts.mask_view).chain(ts.frame_mask.as_ref()) {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat"),
+                color_attachments: &[Some(attachment(mask, wgpu::LoadOp::Load))],
+                ..Default::default()
+            });
+            pass.set_pipeline(if ribbon { &self.ribbon } else { &self.splat });
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            for group in &groups {
+                pass.set_bind_group(0, group, &[]);
                 pass.draw_indexed(mesh.range.clone(), 0, 0..1);
             }
         }
-        self.apply(device, &mut enc, comp, offset);
+        self.apply(device, &mut enc, comp, mesh.tile, offset);
         queue.submit([enc.finish()]);
     }
 
-    /// Fills whole triangles (`indices`: three vertex indices each) with the
-    /// stroke's value, at the stroke's opacity.
+    /// Fills whole triangles (`indices`: three vertex indices each) of tile `mesh`
+    /// with the stroke's value, at the stroke's opacity.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_triangles(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        comp: &Compositor,
-        vertices: &wgpu::Buffer,
+        comp: &mut Compositor,
+        mesh: &MeshPart,
         indices: &[u32],
+        depth: Option<&wgpu::TextureView>,
+        resources: &Resources,
     ) {
-        let Some(stroke) = &self.stroke else { return };
-        if indices.is_empty() {
+        if indices.is_empty() || self.stroke.is_none() {
             return;
         }
+        self.ensure_tile(device, queue, comp, mesh, depth, resources);
+        let Some(ts) = self.stroke.as_ref().and_then(|s| s.tiles.get(&mesh.tile)) else {
+            return;
+        };
         let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("polygon fill"),
             contents: bytemuck::cast_slice(indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let zero: SplatUniform = bytemuck::Zeroable::zeroed();
+        let group = self.splat_group(device, bytemuck::bytes_of(&zero), None, None, mesh);
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fill triangles"),
-                color_attachments: &[Some(attachment(&stroke.mask_view, wgpu::LoadOp::Load))],
+                color_attachments: &[Some(attachment(&ts.mask_view, wgpu::LoadOp::Load))],
                 ..Default::default()
             });
             pass.set_pipeline(&self.fill);
-            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
         }
-        self.apply(device, &mut enc, comp, [0.0; 2]);
+        self.apply(device, &mut enc, comp, mesh.tile, [0.0; 2]);
         queue.submit([enc.finish()]);
     }
 
-    /// Projection tool: renders `image` as placed by `u` onto the mesh, in texture
-    /// space, as the color source of this stroke.
-    pub fn project(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        mesh: &MeshPart,
-        depth: Option<&wgpu::TextureView>,
-        image: &wgpu::TextureView,
-        mut u: ProjectUniform,
-    ) {
-        let Some(stroke) = &mut self.stroke else {
-            return;
-        };
-        let view = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("projected image"),
-                size: wgpu::Extent3d {
-                    width: stroke.res,
-                    height: stroke.res,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: PAINT_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&Default::default());
-        u.rot[2] = if depth.is_some() { 1.0 } else { 0.0 };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("project"),
-            contents: bytemuck::bytes_of(&u),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.splat_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(depth.unwrap_or(&self.no_depth)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(image),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("project image"),
-                color_attachments: &[Some(attachment(
-                    &view,
-                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                ))],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.project);
-            pass.set_bind_group(0, &group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(mesh.range.clone(), 0, 0..1);
-        }
-        queue.submit([enc.finish()]);
-        stroke.projected = Some(view);
-    }
-
-    /// Blends the stroke into every target: before + mask → paint texture.
+    /// Blends the stroke into every target of `tile`: before + mask → paint texture.
     /// `offset`: smudge's copy offset this frame (texels).
     fn apply(
         &self,
         device: &wgpu::Device,
         enc: &mut wgpu::CommandEncoder,
         comp: &Compositor,
+        tile: u32,
         offset: [f32; 2],
     ) {
         let Some(stroke) = &self.stroke else { return };
-        let (copy, offset, mask) = match stroke.mode {
-            StrokeMode::Clone { offset } => (1.0, offset, &stroke.mask_view),
-            StrokeMode::Smudge => (
-                1.0,
-                offset,
-                stroke.frame_mask.as_ref().unwrap_or(&stroke.mask_view),
-            ),
-            _ => (0.0, [0.0; 2], &stroke.mask_view),
+        let Some(ts) = stroke.tiles.get(&tile) else {
+            return;
         };
-        for (target, _, before) in &stroke.targets {
-            let Some(dst) = comp.paint_texture(target.key) else {
+        let (copy, offset, mask) = match stroke.mode {
+            StrokeMode::Clone { offset } => (1.0, offset, &ts.mask_view),
+            StrokeMode::Smudge => (1.0, offset, ts.frame_mask.as_ref().unwrap_or(&ts.mask_view)),
+            _ => (0.0, [0.0; 2], &ts.mask_view),
+        };
+        for (target, (_, before)) in stroke.targets.iter().zip(&ts.before) {
+            let Some(dst) = comp.paint_texture(target.paint_key(tile)) else {
                 continue;
             };
             let [r, g, b] = target.value;
-            let project = stroke.mode == StrokeMode::Project
-                && target.projected
-                && stroke.projected.is_some();
+            let project =
+                stroke.mode == StrokeMode::Project && target.projected && ts.projected.is_some();
             let u = ApplyUniform {
                 color: [r, g, b, if target.is_normal { 1.0 } else { 0.0 }],
                 params: [
@@ -688,7 +786,7 @@ impl PaintGpu {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(
-                            stroke.projected.as_ref().unwrap_or(&self.white),
+                            ts.projected.as_ref().unwrap_or(&self.white),
                         ),
                     },
                 ],
@@ -704,7 +802,8 @@ impl PaintGpu {
         }
     }
 
-    /// Ends the stroke: reads the touched tiles back and returns each target's new tiles.
+    /// Ends the stroke: reads the touched tiles back and returns each target's new
+    /// tiles, per UDIM tile the stroke reached.
     pub fn end(
         &mut self,
         device: &wgpu::Device,
@@ -715,61 +814,81 @@ impl PaintGpu {
         let Some(stroke) = self.stroke.take() else {
             return Ok(Vec::new());
         };
-        let res = stroke.res;
-        let per_side = res / TILE_SIZE;
-
-        // Which tiles did the stroke touch?
-        let mask_bytes = read_region(device, queue, &stroke.mask, 0, 0, res, res, 2)?;
-        let row = (res * 2) as usize;
-        let mut touched = Vec::new();
-        for ty in 0..per_side {
-            for tx in 0..per_side {
-                let hit = (0..TILE_SIZE).any(|y| {
-                    let start = (ty * TILE_SIZE + y) as usize * row + (tx * TILE_SIZE * 2) as usize;
-                    mask_bytes[start..start + (TILE_SIZE * 2) as usize]
-                        .iter()
-                        .any(|&b| b != 0)
-                });
-                if hit {
-                    touched.push((tx, ty));
-                }
-            }
-        }
-
         let mut out = Vec::new();
-        for (target, ..) in &stroke.targets {
-            let mut map = target.old.clone();
-            map.resolution = res;
-            let Some(pt) = comp.paint_texture(target.key) else {
-                continue;
-            };
-            for &(tx, ty) in &touched {
-                let bytes = read_region(
-                    device,
-                    queue,
-                    &pt.texture,
-                    tx * TILE_SIZE,
-                    ty * TILE_SIZE,
-                    TILE_SIZE,
-                    TILE_SIZE,
-                    8,
-                )?;
-                let key = TileMap::key(tx, ty);
-                // Alpha is the 4th half-float of every texel; ±0 means untouched.
-                let empty = bytes
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .all(|t| u16::from_le_bytes([t[6], t[7]]) & 0x7fff == 0);
-                if empty {
-                    map.tiles.remove(&key);
-                } else {
-                    debug_assert_eq!(bytes.len(), TILE_BYTES);
-                    map.tiles.insert(key, resources.add_tile(bytes));
+        for (&tile, ts) in &stroke.tiles {
+            let res = ts.res;
+            let per_side = res.div_ceil(TILE_SIZE);
+            // Which paint tiles did the stroke touch?
+            let mask_bytes = read_region(device, queue, &ts.mask, 0, 0, res, res, 2)?;
+            let row = (res * 2) as usize;
+            let mut touched = Vec::new();
+            for ty in 0..per_side {
+                for tx in 0..per_side {
+                    let (w, h) = (
+                        TILE_SIZE.min(res - tx * TILE_SIZE),
+                        TILE_SIZE.min(res - ty * TILE_SIZE),
+                    );
+                    let hit = (0..h).any(|y| {
+                        let start =
+                            (ty * TILE_SIZE + y) as usize * row + (tx * TILE_SIZE * 2) as usize;
+                        mask_bytes[start..start + (w * 2) as usize]
+                            .iter()
+                            .any(|&b| b != 0)
+                    });
+                    if hit {
+                        touched.push((tx, ty));
+                    }
                 }
             }
-            comp.mark_synced(target.key, map.clone());
-            out.push((target.key, map));
+            for target in &stroke.targets {
+                let key = target.paint_key(tile);
+                let mut map = target
+                    .old
+                    .get(&tile)
+                    .cloned()
+                    .unwrap_or_else(|| TileMap::new(res));
+                map.resolution = res;
+                let Some(pt) = comp.paint_texture(key) else {
+                    continue;
+                };
+                for &(tx, ty) in &touched {
+                    let (w, h) = (
+                        TILE_SIZE.min(res - tx * TILE_SIZE),
+                        TILE_SIZE.min(res - ty * TILE_SIZE),
+                    );
+                    let region = read_region(
+                        device,
+                        queue,
+                        &pt.texture,
+                        tx * TILE_SIZE,
+                        ty * TILE_SIZE,
+                        w,
+                        h,
+                        8,
+                    )?;
+                    // Pad partial tiles (texture sets under 256 px) to a full tile.
+                    let mut bytes = vec![0u8; TILE_BYTES];
+                    for y in 0..h as usize {
+                        let src = &region[y * w as usize * 8..(y + 1) * w as usize * 8];
+                        let at = y * TILE_SIZE as usize * 8;
+                        bytes[at..at + src.len()].copy_from_slice(src);
+                    }
+                    let key = TileMap::key(tx, ty);
+                    // Alpha is the 4th half-float of every texel; ±0 means untouched.
+                    let empty = bytes
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .all(|t| u16::from_le_bytes([t[6], t[7]]) & 0x7fff == 0);
+                    if empty {
+                        map.tiles.remove(&key);
+                    } else {
+                        map.tiles.insert(key, resources.add_tile(bytes));
+                    }
+                }
+                comp.mark_synced(key, map.clone());
+                out.push((key, map));
+            }
         }
         Ok(out)
     }
@@ -880,6 +999,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             uv: [u, w],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
         };
         let vertices = [v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)];
         let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
@@ -957,14 +1077,17 @@ mod tests {
             value: [1.0, 0.0, 0.0],
             is_normal: false,
             projected: false,
-            old,
+            old: BTreeMap::from([(reetched_doc::FIRST_UDIM, old)]),
         };
-        pg.begin(&g.device, &g.queue, comp, vec![target], RES, res, mode, 1.0);
+        let mut set = TextureSet::new("quad".into(), Vec::new());
+        set.resolution = RES;
+        pg.begin(vec![target], &set, mode, 1.0);
         let mesh = MeshPart {
             vertices: &g.vb,
             indices: &g.ib,
             range: 0..6,
             scale: 1.0,
+            tile: reetched_doc::FIRST_UDIM,
         };
         let camera = Camera {
             view_proj: Mat4::IDENTITY,
@@ -977,11 +1100,11 @@ mod tests {
         };
         for (dabs, motion) in frames {
             pg.dabs(
-                &g.device, &g.queue, comp, &mesh, &camera, None, &shape, dabs, *motion,
+                &g.device, &g.queue, comp, &mesh, &camera, None, &shape, dabs, *motion, res,
             );
         }
         if let Some(indices) = fill {
-            pg.fill_triangles(&g.device, &g.queue, comp, &g.vb, indices);
+            pg.fill_triangles(&g.device, &g.queue, comp, &mesh, indices, None, res);
         }
         let mut out = pg.end(&g.device, &g.queue, comp, res).unwrap();
         assert_eq!(out.len(), 1);
@@ -1027,17 +1150,16 @@ mod tests {
             indices: &g.ib,
             range: 0..6,
             scale: 1.0,
+            tile: reetched_doc::FIRST_UDIM,
         };
         let mut fresh = Compositor::new(&g.device, &g.queue);
-        let mut out = None;
+        let mut out = crate::compositor::GroupSets::default();
         assert!(
             fresh
                 .composite(&g.device, &g.queue, &mesh, &set, &resources, &mut out)
                 .is_empty()
         );
-        let d = fresh
-            .read_back(&g.device, &g.queue, out.as_ref().unwrap())
-            .unwrap();
+        let d = fresh.read_back(&g.device, &g.queue, &out).unwrap();
         let px = |x: u32, y: u32| d.base_color[(y * RES + x) as usize];
         assert!(
             (px(128, 128)[0] - 1.0).abs() < 0.01 && px(128, 128)[1] < 0.01,

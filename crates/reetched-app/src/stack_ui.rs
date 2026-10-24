@@ -11,7 +11,7 @@ use egui::{
 use egui_material_icons::icons as ic;
 use reetched_doc::{
     BlendMode, Channel, ChannelBlend, ChannelSource, Fill, Mask, MaskBackground, Node, NodeId,
-    NodeKind, Placement, Projection, ProjectionMode, RESOLUTIONS, ResourceId,
+    NodeKind, Placement, Projection, ProjectionMode, RESOLUTIONS, ResourceId, ShaderModel,
     export::{
         BitDepth, FileFormat, Padding, expand_name, export_texture_set, presets_from_spexp,
         presets_to_spexp,
@@ -33,6 +33,7 @@ enum StackAction {
 }
 
 /// A bitmap the user chose in the properties panel, applied after the UI pass.
+#[derive(Clone, Copy)]
 enum BitmapSlot {
     Channel(Channel),
     Mask,
@@ -49,12 +50,20 @@ impl State {
     pub fn layers_ui(&mut self, ui: &mut Ui) {
         let has_sel = self.selected.is_some();
         let sel_is_layer = self.selected.is_some_and(|s| !s.mask);
+        let channels = self
+            .doc
+            .texture_sets
+            .get(self.selected_part)
+            .map_or_else(|| Channel::CORE.to_vec(), |s| s.channels());
+        if !channels.contains(&self.layer_channel) {
+            self.layer_channel = Channel::BaseColor;
+        }
         ui.horizontal(|ui| {
             ComboBox::from_id_salt("layer_channel")
                 .selected_text(self.layer_channel.label())
                 .width(100.0)
                 .show_ui(ui, |ui| {
-                    for c in Channel::ALL {
+                    for &c in &channels {
                         ui.selectable_value(&mut self.layer_channel, c, c.label());
                     }
                 });
@@ -201,62 +210,178 @@ impl State {
             .parts
             .get(self.selected_part)
             .map_or(0, |p| p.triangles);
-        let Some(set) = self.doc.texture_sets.get_mut(self.selected_part) else {
+        let tiles = self.viewport.tiles(self.selected_part);
+        let mut load_shader = false;
+        if self.doc.texture_sets.get(self.selected_part).is_none() {
             ui.label(RichText::new("No texture set").color(theme::WEAK));
             return;
-        };
-        egui::Grid::new("tss")
-            .num_columns(2)
-            .spacing(vec2(12.0, 6.0))
-            .show(ui, |ui| {
-                ui.label("Texture set");
-                ui.label(RichText::new(&set.name).strong());
-                ui.end_row();
-                ui.label("Size");
-                ComboBox::from_id_salt("tss_size")
-                    .selected_text(format!("{0} × {0}", set.resolution))
-                    .show_ui(ui, |ui| {
-                        for r in RESOLUTIONS {
-                            ui.selectable_value(&mut set.resolution, r, format!("{r} × {r}"));
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let set = &mut self.doc.texture_sets[self.selected_part];
+            egui::Grid::new("tss")
+                .num_columns(2)
+                .spacing(vec2(12.0, 6.0))
+                .show(ui, |ui| {
+                    ui.label("Texture set");
+                    ui.label(RichText::new(&set.name).strong());
+                    ui.end_row();
+                    ui.label("Size");
+                    ComboBox::from_id_salt("tss_size")
+                        .selected_text(format!("{0} × {0}", set.resolution))
+                        .show_ui(ui, |ui| {
+                            for r in RESOLUTIONS {
+                                ui.selectable_value(&mut set.resolution, r, format!("{r} × {r}"));
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Triangles");
+                    ui.label(triangles.to_string());
+                    ui.end_row();
+                    ui.label("Shader");
+                    ComboBox::from_id_salt("tss_shader")
+                        .selected_text(set.shader.label())
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for m in [
+                                ShaderModel::MetalRough,
+                                ShaderModel::Asm,
+                                ShaderModel::OpenPbr,
+                            ] {
+                                let label = m.label();
+                                ui.selectable_value(&mut set.shader, m, label);
+                            }
+                            if ui.button("Painter GLSL shader…").clicked() {
+                                load_shader = true;
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Normal map format");
+                    ui.label("OpenGL");
+                    ui.end_row();
+                });
+            let missing: Vec<Channel> = set
+                .shader
+                .channels()
+                .iter()
+                .copied()
+                .filter(|c| !set.has_channel(*c))
+                .collect();
+            if !missing.is_empty()
+                && ui
+                    .button(format!(
+                        "Add the {} channels this shader reads",
+                        missing.len()
+                    ))
+                    .clicked()
+            {
+                set.extra_channels.extend(missing);
+            }
+            if set.resolution >= 8192 {
+                ui.label(
+                    RichText::new("8K uses about 1.5 GB of video memory per texture set.")
+                        .color(theme::WEAK),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.label(theme::header("CHANNELS"));
+            let mut remove = None;
+            egui::Grid::new("channels")
+                .num_columns(3)
+                .spacing(vec2(12.0, 4.0))
+                .show(ui, |ui| {
+                    for c in set.channels() {
+                        ui.label(c.label());
+                        let format = match c {
+                            Channel::Normal => "RGB16F",
+                            Channel::Height => "L16F",
+                            c if c.is_color() => "sRGB8",
+                            _ => "L8",
+                        };
+                        ui.label(RichText::new(format).color(theme::WEAK));
+                        if !c.is_core()
+                            && icon_button(ui, ic::ICON_CLOSE, false, "Remove this channel")
+                                .clicked()
+                        {
+                            remove = Some(c);
+                        }
+                        ui.end_row();
+                    }
+                });
+            if let Some(c) = remove {
+                set.extra_channels.retain(|&x| x != c);
+            }
+            let addable: Vec<Channel> = Channel::ALL
+                .into_iter()
+                .filter(|c| !set.has_channel(*c))
+                .collect();
+            if !addable.is_empty() {
+                ui.menu_button("Add channel", |ui| {
+                    for c in addable {
+                        if ui.button(c.label()).clicked() {
+                            set.extra_channels.push(c);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+
+            if tiles.len() > 1 || set.is_udim() {
+                ui.add_space(8.0);
+                ui.label(theme::header("UDIM TILES"));
+                // Every tile the mesh uses gets an entry.
+                for &t in &tiles {
+                    if !set.udim.iter().any(|u| u.number == t) {
+                        set.udim.push(reetched_doc::UdimTile {
+                            number: t,
+                            name: String::new(),
+                            resolution: None,
+                        });
+                    }
+                }
+                set.udim.sort_by_key(|u| u.number);
+                let base = set.resolution;
+                egui::Grid::new("udim")
+                    .num_columns(3)
+                    .spacing(vec2(12.0, 4.0))
+                    .show(ui, |ui| {
+                        for tile in &mut set.udim {
+                            ui.label(tile.number.to_string());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut tile.name)
+                                    .hint_text("name")
+                                    .desired_width(110.0),
+                            );
+                            let label = tile
+                                .resolution
+                                .map_or(format!("{base} (set)"), |r| r.to_string());
+                            ComboBox::from_id_salt(("udim_res", tile.number))
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut tile.resolution,
+                                        None,
+                                        "Same as the set",
+                                    );
+                                    for r in RESOLUTIONS {
+                                        ui.selectable_value(
+                                            &mut tile.resolution,
+                                            Some(r),
+                                            r.to_string(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
                         }
                     });
-                ui.end_row();
-                ui.label("Triangles");
-                ui.label(triangles.to_string());
-                ui.end_row();
-                ui.label("UV tiles");
-                ui.label("1001");
-                ui.end_row();
-                ui.label("Normal map format");
-                ui.label("OpenGL");
-                ui.end_row();
-            });
-        if set.resolution >= 8192 {
-            ui.label(
-                RichText::new("8K uses about 1.5 GB of video memory per texture set.")
-                    .color(theme::WEAK),
-            );
+            }
+            self.custom_shader_ui(ui);
+            ui.add_space(8.0);
+            self.mesh_maps_ui(ui);
+        });
+        if load_shader {
+            self.load_custom_shader();
         }
-        ui.add_space(8.0);
-        self.mesh_maps_ui(ui);
-        ui.add_space(8.0);
-        ui.label(theme::header("CHANNELS"));
-        egui::Grid::new("channels")
-            .num_columns(2)
-            .spacing(vec2(12.0, 4.0))
-            .show(ui, |ui| {
-                for (name, format) in [
-                    ("Base color", "sRGB8"),
-                    ("Metallic", "L8"),
-                    ("Roughness", "L8"),
-                    ("Normal", "RGB16F"),
-                    ("Height", "L16F"),
-                ] {
-                    ui.label(name);
-                    ui.label(RichText::new(format).color(theme::WEAK));
-                    ui.end_row();
-                }
-            });
     }
 
     pub fn properties_ui(&mut self, ui: &mut Ui) {
@@ -298,7 +423,21 @@ impl State {
             });
         let mut pick: Option<BitmapSlot> = None;
         let mut clear: Option<BitmapSlot> = None;
+        let mut text: Option<BitmapSlot> = None;
         let mut show_brush = false;
+        let channels = self
+            .doc
+            .texture_sets
+            .get(self.selected_part)
+            .map_or_else(|| Channel::CORE.to_vec(), |s| s.channels());
+        let tiles = self.viewport.tiles(self.selected_part);
+        let ocio_spaces: Option<Vec<String>> = self.color.ocio.as_ref().map(|o| {
+            o.config
+                .color_space_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
         let Some(node) = self.stack_mut().and_then(|s| find_node_mut(s, sel.node)) else {
             self.selected = None;
             return;
@@ -353,6 +492,7 @@ impl State {
                                 BitmapSlot::Mask,
                                 &mut pick,
                                 &mut clear,
+                                &mut text,
                             );
                             ui.end_row();
                         });
@@ -377,6 +517,29 @@ impl State {
                         ui.label("Name");
                         ui.text_edit_singleline(&mut node.name);
                         ui.end_row();
+                        if tiles.len() > 1 {
+                            ui.label("UDIM tiles")
+                                .on_hover_text("Geometry mask: the tiles this layer applies to");
+                            ui.horizontal_wrapped(|ui| {
+                                for &t in &tiles {
+                                    let mut on = node.on_tile(t);
+                                    if ui.toggle_value(&mut on, t.to_string()).changed() {
+                                        if node.udim_mask.is_empty() {
+                                            node.udim_mask = tiles.clone();
+                                        }
+                                        node.udim_mask.retain(|&x| x != t);
+                                        if on {
+                                            node.udim_mask.push(t);
+                                            node.udim_mask.sort_unstable();
+                                        }
+                                        if node.udim_mask.len() == tiles.len() {
+                                            node.udim_mask.clear();
+                                        }
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
                     });
                 let NodeKind::Fill(fill) = &mut node.kind else {
                     let hint = if matches!(node.kind, NodeKind::Paint(_)) {
@@ -406,12 +569,13 @@ impl State {
                 ui.add_space(8.0);
                 ui.label(theme::header("MATERIAL"));
                 ui.horizontal_wrapped(|ui| {
-                    for c in Channel::ALL {
+                    for &c in &channels {
                         let src = fill.channels.entry(c).or_insert_with(|| ChannelSource {
                             enabled: false,
                             value: c.empty_value(),
                             bitmap: None,
                             color_space: Default::default(),
+                            ocio: None,
                         });
                         ui.toggle_value(&mut src.enabled, c.label());
                     }
@@ -428,7 +592,7 @@ impl State {
                     .num_columns(2)
                     .spacing(vec2(12.0, 6.0))
                     .show(ui, |ui| {
-                        for c in Channel::ALL {
+                        for &c in &channels {
                             let Some(src) = fill.channels.get_mut(&c).filter(|s| s.enabled) else {
                                 continue;
                             };
@@ -443,14 +607,31 @@ impl State {
                                     BitmapSlot::Channel(c),
                                     &mut pick,
                                     &mut clear,
+                                    &mut text,
                                 );
                                 if src.bitmap.is_some() {
+                                    let label = match &src.ocio {
+                                        Some(n) if ocio_spaces.is_some() => n.clone(),
+                                        _ => src.color_space.label().to_owned(),
+                                    };
                                     ComboBox::from_id_salt(("color_space", c))
-                                        .width(70.0)
-                                        .selected_text(src.color_space.label())
+                                        .width(90.0)
+                                        .selected_text(label)
                                         .show_ui(ui, |ui| {
                                             for cs in reetched_doc::ColorSpace::ALL {
-                                                ui.selectable_value(&mut src.color_space, cs, cs.label());
+                                                if ui.selectable_label(src.ocio.is_none() && src.color_space == cs, cs.label()).clicked() {
+                                                    src.color_space = cs;
+                                                    src.ocio = None;
+                                                }
+                                            }
+                                            if let Some(spaces) = &ocio_spaces {
+                                                ui.separator();
+                                                ui.label(theme::header("OCIO"));
+                                                for n in spaces {
+                                                    if ui.selectable_label(src.ocio.as_ref() == Some(n), n).clicked() {
+                                                        src.ocio = Some(n.clone());
+                                                    }
+                                                }
                                             }
                                         })
                                         .response
@@ -478,12 +659,16 @@ impl State {
         if let Some(slot) = clear {
             self.set_bitmap(sel.node, slot, None);
         }
+        if let Some(slot) = text {
+            let target = match slot {
+                BitmapSlot::Channel(c) => crate::text_ui::TextTarget::Fill(sel.node, c),
+                BitmapSlot::Mask => crate::text_ui::TextTarget::Mask(sel.node),
+            };
+            self.text_ui = Some(crate::text_ui::TextUi::new(target));
+        }
         if let Some(slot) = pick
             && let Some(path) = rfd::FileDialog::new()
-                .add_filter(
-                    "Images",
-                    &["png", "jpg", "jpeg", "tga", "tif", "tiff", "exr", "hdr"],
-                )
+                .add_filter("Images", crate::images::IMAGE_EXTENSIONS)
                 .pick_file()
             && let Some(id) = self.import_resource(&path)
         {
@@ -663,7 +848,9 @@ impl State {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Files for the first texture set:").color(theme::WEAK));
                     for map in &preset.maps {
-                        let name = expand_name(&map.file_name, &names.0, &names.1, &set.name);
+                        let udim = set.is_udim().then_some("1001");
+                        let name =
+                            expand_name(&map.file_name, &names.0, &names.1, &set.name, udim);
                         ui.label(
                             RichText::new(format!("{name}.{}", e.settings.format.extension()))
                                 .monospace()
@@ -688,8 +875,13 @@ impl State {
                 ui.separator();
                 ui.label(theme::header("MESH WITH TEXTURES"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut e.mesh_usd, true, "USD (.usda)");
-                    ui.selectable_value(&mut e.mesh_usd, false, "OBJ");
+                    ComboBox::from_id_salt("mesh_format")
+                        .selected_text(e.mesh_format.label())
+                        .show_ui(ui, |ui| {
+                            for f in MeshFormat::ALL {
+                                ui.selectable_value(&mut e.mesh_format, f, f.label());
+                            }
+                        });
                     ui.label("Displacement");
                     ui.add(egui::DragValue::new(&mut e.displacement).speed(0.001).range(0.0..=10.0))
                         .on_hover_text("Moves vertices along their normals by the height channel × this (world units); 0 = off");
@@ -810,27 +1002,32 @@ impl State {
             if !self.export.include.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let result = self
-                .viewport
-                .read_back(&self.device, &self.queue, i)
-                .map(|mut data| {
-                    data.ambient_occlusion = baked_ao(set, &self.resources, data.width);
-                    data
-                })
-                .and_then(|data| {
-                    export_texture_set(
-                        &preset,
-                        &self.export.settings,
-                        &data,
-                        &dir,
-                        (&project, &mesh, &set.name),
-                    )
-                });
-            match result {
-                Ok(files) => written += files.len(),
-                Err(e) => {
-                    self.error(format!("Export of {} failed: {e:#}", set.name));
-                    return;
+            let tiles = self.viewport.tiles(i);
+            let udim = tiles.len() > 1 || set.is_udim();
+            for tile in tiles {
+                let result = self
+                    .viewport
+                    .read_back(&self.device, &self.queue, i, tile)
+                    .map(|mut data| {
+                        data.ambient_occlusion = baked_ao(set, tile, &self.resources, data.width);
+                        data
+                    })
+                    .and_then(|data| {
+                        export_texture_set(
+                            &preset,
+                            &self.export.settings,
+                            &data,
+                            &dir,
+                            (&project, &mesh, &set.name),
+                            udim.then_some(tile),
+                        )
+                    });
+                match result {
+                    Ok(files) => written += files.len(),
+                    Err(e) => {
+                        self.error(format!("Export of {} failed: {e:#}", set.name));
+                        return;
+                    }
                 }
             }
         }
@@ -839,9 +1036,10 @@ impl State {
 }
 
 impl State {
-    /// Writes the mesh (OBJ or USD) and the textures it references.
+    /// Writes the mesh (USD, USDZ or OBJ) and the textures it references.
     pub fn export_mesh(&mut self) {
-        use reetched_io::export::{MaterialFiles, write_obj, write_usda};
+        use reetched_doc::export::{UDIM_TOKEN, expand_name};
+        use reetched_io::export::{MaterialFiles, write_obj, write_usda, write_usdc, write_usdz};
         let dir = PathBuf::from(self.export.dir.trim());
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.error(format!("Could not create {}: {e}", dir.display()));
@@ -860,34 +1058,45 @@ impl State {
         let project = self.project_name();
         let mesh_name = mesh_name(&self.doc.mesh_source);
         let mut materials = Vec::new();
-        let mut heights = Vec::new();
+        // Height per (texture set, UDIM tile), for displacement.
+        let mut heights = std::collections::HashMap::new();
         for (i, set) in self.doc.texture_sets.clone().iter().enumerate() {
-            let result = self
-                .viewport
-                .read_back(&self.device, &self.queue, i)
-                .and_then(|data| {
-                    let files = export_texture_set(
-                        &preset,
-                        &self.export.settings,
-                        &data,
-                        &dir,
-                        (&project, &mesh_name, &set.name),
-                    )?;
-                    Ok((data, files))
-                });
-            let (data, files) = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    self.error(format!("Export of {} failed: {e:#}", set.name));
-                    return;
+            let tiles = self.viewport.tiles(i);
+            let udim = tiles.len() > 1 || set.is_udim();
+            for &tile in &tiles {
+                let result = self
+                    .viewport
+                    .read_back(&self.device, &self.queue, i, tile)
+                    .and_then(|data| {
+                        export_texture_set(
+                            &preset,
+                            &self.export.settings,
+                            &data,
+                            &dir,
+                            (&project, &mesh_name, &set.name),
+                            udim.then_some(tile),
+                        )?;
+                        Ok(data)
+                    });
+                match result {
+                    Ok(data) => {
+                        heights.insert((i, tile), (data.width, data.height_map));
+                    }
+                    Err(e) => {
+                        self.error(format!("Export of {} failed: {e:#}", set.name));
+                        return;
+                    }
                 }
-            };
-            // The preset's maps, in order: base color, metallic, roughness, normal, height, emissive, opacity.
+            }
+            // The preset's maps, in order: base color, metallic, roughness, normal, height,
+            // emissive, opacity. UDIM sets reference all tiles through the <UDIM> token.
+            let ext = self.export.settings.format.extension();
             let file = |k: usize| {
-                files
-                    .get(k)
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
+                preset.maps.get(k).map(|m| {
+                    let token = udim.then_some(UDIM_TOKEN);
+                    let name = expand_name(&m.file_name, &project, &mesh_name, &set.name, token);
+                    format!("{name}.{ext}")
+                })
             };
             materials.push(MaterialFiles {
                 name: set.name.clone(),
@@ -898,27 +1107,67 @@ impl State {
                 emissive: file(5),
                 opacity: file(6),
             });
-            heights.push((data.width, data.height_map));
         }
         let scale = self.export.displacement;
         let displace = |part: usize, uv: [f32; 2]| -> f32 {
-            let Some((res, h)) = heights.get(part) else {
+            let tile = reetched_doc::udim_of(uv);
+            let Some((res, h)) = heights.get(&(part, tile)) else {
                 return 0.0;
             };
-            let x = ((uv[0].rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
-            let y = (((1.0 - uv[1]).rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
+            let [u0, v0] = reetched_doc::udim_origin(tile);
+            let (u, v) = (uv[0] - u0, uv[1] - v0);
+            let x = ((u.rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
+            let y = (((1.0 - v).rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
             h[(y * res + x) as usize] * scale
         };
         let displace: Option<reetched_io::export::Displace> = (scale > 0.0).then_some(&displace);
-        let (ext, write): (&str, fn(_, _, _, _) -> _) = if self.export.mesh_usd {
-            ("usda", write_usda)
-        } else {
-            ("obj", write_obj)
+        let format = self.export.mesh_format;
+        let path = dir.join(format!("{mesh_name}.{}", format.extension()));
+        let result = match format {
+            MeshFormat::Usda => write_usda(&path, &self.mesh, displace, &materials),
+            MeshFormat::Usdc => write_usdc(&path, &self.mesh, displace, &materials),
+            MeshFormat::Usdz => write_usdz(&path, &self.mesh, displace, &materials, &dir),
+            MeshFormat::Obj => write_obj(&path, &self.mesh, displace, &materials),
         };
-        let path = dir.join(format!("{mesh_name}.{ext}"));
-        match write(&path, &self.mesh, displace, &materials) {
+        match result {
             Ok(()) => self.info(format!("Exported {}", path.display())),
             Err(e) => self.error(format!("Mesh export failed: {e:#}")),
+        }
+    }
+}
+
+/// Mesh export file types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeshFormat {
+    Usda,
+    Usdc,
+    Usdz,
+    Obj,
+}
+
+impl MeshFormat {
+    pub const ALL: [MeshFormat; 4] = [
+        MeshFormat::Usda,
+        MeshFormat::Usdc,
+        MeshFormat::Usdz,
+        MeshFormat::Obj,
+    ];
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            MeshFormat::Usda => "usda",
+            MeshFormat::Usdc => "usdc",
+            MeshFormat::Usdz => "usdz",
+            MeshFormat::Obj => "obj",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MeshFormat::Usda => "USD (.usda)",
+            MeshFormat::Usdc => "USD binary (.usdc)",
+            MeshFormat::Usdz => "USDZ package",
+            MeshFormat::Obj => "OBJ",
         }
     }
 }
@@ -926,17 +1175,18 @@ impl State {
 /// The texture set's baked AO, resized to `res` (empty if there is none).
 fn baked_ao(
     set: &reetched_doc::TextureSet,
+    tile: u32,
     resources: &reetched_doc::Resources,
     res: u32,
 ) -> Vec<f32> {
     let Some(bytes) = set
-        .mesh_maps
+        .mesh_maps_for(tile)
         .get(&reetched_doc::MeshMap::AmbientOcclusion)
         .and_then(|id| resources.files.get(id))
     else {
         return Vec::new();
     };
-    match image::load_from_memory(bytes) {
+    match crate::images::decode(bytes) {
         Ok(img) => image::imageops::resize(
             &img.to_luma32f(),
             res,
@@ -1204,7 +1454,7 @@ fn swatch(fill: &Fill, channel: Channel) -> Color32 {
 
 pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
     match c {
-        Channel::BaseColor | Channel::Emissive => {
+        _ if c.is_color() => {
             let mut rgba = egui::Rgba::from_rgb(value[0], value[1], value[2]);
             if egui::color_picker::color_edit_button_rgba(
                 ui,
@@ -1216,14 +1466,18 @@ pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
                 *value = [rgba.r(), rgba.g(), rgba.b()];
             }
         }
-        Channel::Metallic | Channel::Roughness | Channel::Opacity => {
-            if ui.add(Slider::new(&mut value[0], 0.0..=1.0)).changed() {
-                *value = [value[0]; 3];
-            }
-        }
         Channel::Height => {
             if ui.add(Slider::new(&mut value[0], -1.0..=1.0)).changed() {
                 *value = [value[0]; 3];
+            }
+        }
+        Channel::AnisotropyAngle => {
+            let mut deg = value[0] * 360.0;
+            if ui
+                .add(Slider::new(&mut deg, 0.0..=360.0).suffix("°"))
+                .changed()
+            {
+                *value = [deg / 360.0; 3];
             }
         }
         Channel::Normal => {
@@ -1231,6 +1485,11 @@ pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
                 .on_hover_text(
                     "Uniform normals are flat (0, 0, 1); load a normal map image to add detail.",
                 );
+        }
+        _ => {
+            if ui.add(Slider::new(&mut value[0], 0.0..=1.0)).changed() {
+                *value = [value[0]; 3];
+            }
         }
     }
 }
@@ -1241,6 +1500,7 @@ fn bitmap_buttons(
     slot: BitmapSlot,
     pick: &mut Option<BitmapSlot>,
     clear: &mut Option<BitmapSlot>,
+    text: &mut Option<BitmapSlot>,
 ) {
     match current {
         Some(name) => {
@@ -1253,6 +1513,9 @@ fn bitmap_buttons(
         None => {
             if icon_button(ui, ic::ICON_IMAGE, false, "Use an image…").clicked() {
                 *pick = Some(slot);
+            }
+            if icon_button(ui, ic::ICON_TEXT_FIELDS, false, "Use text…").clicked() {
+                *text = Some(slot);
             }
         }
     }
@@ -1296,7 +1559,7 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
                 ui.add(DragValue::new(&mut p.offset[1]).speed(0.005));
             });
             ui.end_row();
-            if p.mode != ProjectionMode::Uv {
+            if !p.mode.is_uv() {
                 ui.label("Size");
                 ui.add(
                     DragValue::new(&mut p.size)
@@ -1320,7 +1583,7 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
                 });
                 ui.end_row();
             }
-            if p.mode != ProjectionMode::Uv {
+            if !p.mode.is_uv() {
                 ui.label("Symmetry");
                 ui.horizontal(|ui| {
                     for (m, axis) in p.mirror.iter_mut().zip(["X", "Y", "Z"]) {
@@ -1333,6 +1596,16 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
             if p.mode == ProjectionMode::Triplanar {
                 ui.label("Hardness");
                 ui.add(Slider::new(&mut p.hardness, 0.0..=1.0));
+                ui.end_row();
+            }
+            if p.mode == ProjectionMode::Warp {
+                ui.label("Warp grid");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Drag its points in the 2D view").color(theme::WEAK));
+                    if ui.small_button("Reset").clicked() {
+                        p.warp = reetched_doc::warp_identity();
+                    }
+                });
                 ui.end_row();
             }
         });

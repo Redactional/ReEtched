@@ -1,12 +1,13 @@
-//! Evaluates a texture set's layer stack on the GPU into a "channel set":
-//! four rgba16float textures (see `shaders/compositor.wgsl` for the layout).
+//! Evaluates a texture set's layer stack on the GPU into "channel sets": per
+//! channel group (see `CHANNEL_GROUPS`), four rgba16float textures (layouts in
+//! `shaders/compositor.wgsl`). UDIM sets are composited one tile at a time.
 
 use glam::{EulerRot, Mat3};
 use reetched_doc::export::ChannelData;
 use reetched_doc::{
-    Channel, GeneratorKind, MAX_MASK_EFFECTS, MaskBackground, MaskBlend, MaskEffectKind, MeshMap,
-    Node, NodeId, NodeKind, Projection, ProjectionMode, ResourceId, Resources, TILE_BYTES,
-    TILE_SIZE, TextureSet, TileMap,
+    CHANNEL_GROUPS, Channel, GeneratorKind, MAX_MASK_EFFECTS, MaskBackground, MaskBlend,
+    MaskEffectKind, MeshMap, Node, NodeId, NodeKind, Projection, ProjectionMode, ResourceId,
+    Resources, TILE_BYTES, TILE_SIZE, TextureSet, TileMap,
 };
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -15,13 +16,21 @@ pub const SET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Padding (in texels) grown around UV islands for display.
 const DISPLAY_DILATION: u32 = 8;
 
-/// Identifies a paint buffer: a paint layer's channel (slot = channel index) or a mask.
-pub type PaintKey = (NodeId, u8);
+/// Identifies a paint buffer: (layer, channel index in `Channel::ALL` or `MASK_SLOT`, UDIM tile).
+pub type PaintKey = (NodeId, u8, u32);
 pub const MASK_SLOT: u8 = 99;
-/// Channel textures in a set: base+metal, normal+rough, height/coverage/filled/opacity, emissive.
+/// Textures in a channel set.
 const SET_TEXTURES: usize = 4;
+/// Channel groups, each composited into its own channel set.
+pub const GROUPS: usize = CHANNEL_GROUPS.len();
+/// One texture set tile's composited channels; `None` for groups the set doesn't use.
+pub type GroupSets = [Option<ChannelSet>; GROUPS];
 const CHANNELS: usize = Channel::ALL.len();
+/// Channels per group (and channel bitmaps per pass).
+const SLOTS: usize = 7;
 pub const PAINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Vertex attributes the UV-space passes read (position, normal, uv, tangent, uv1).
+pub const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x2];
 
 /// GPU copy of one paint buffer, kept in sync with its tiles.
 pub struct PaintTexture {
@@ -32,7 +41,7 @@ pub struct PaintTexture {
     synced: TileMap,
 }
 
-/// Composited channels of one texture set.
+/// Composited channels of one group of one texture set (tile).
 pub struct ChannelSet {
     pub resolution: u32,
     textures: [wgpu::Texture; SET_TEXTURES],
@@ -50,6 +59,7 @@ struct ProjUniform {
     r0: [f32; 4],
     r1: [f32; 4],
     r2: [f32; 4],
+    warp: [[f32; 4]; 8],
 }
 
 #[repr(C)]
@@ -71,18 +81,18 @@ const BOUND_MAPS: [MeshMap; 6] = [
     MeshMap::Id,
 ];
 
-/// Texture views for one pass: 0–6 channel bitmaps/paint, 7 mask bitmap,
-/// 8 painted mask, 9–14 mesh maps.
+/// Texture views for one pass: 0–6 the group's channel bitmaps/paint, 7 mask
+/// bitmap, 8 painted mask, 9–14 mesh maps.
 type PassTextures = [Option<wgpu::TextureView>; 15];
-const MASK_BITMAP: usize = CHANNELS;
-const MASK_PAINT: usize = CHANNELS + 1;
-const FIRST_MAP: usize = CHANNELS + 2;
+const MASK_BITMAP: usize = SLOTS;
+const MASK_PAINT: usize = SLOTS + 1;
+const FIRST_MAP: usize = SLOTS + 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
-    values: [[f32; 4]; CHANNELS],
-    blend: [[f32; 4]; CHANNELS],
+    values: [[f32; 4]; SLOTS],
+    blend: [[f32; 4]; SLOTS],
     mask: [f32; 4],
     proj: ProjUniform,
     mask_proj: ProjUniform,
@@ -90,24 +100,46 @@ struct Params {
     maps: [f32; 4],
     maps2: [f32; 4],
     fx: [MaskFx; MAX_MASK_EFFECTS],
+    tile: [f32; 4],
+    defaults: [[f32; 4]; 4],
 }
 
-/// The mesh triangles of one texture set.
+/// The mesh triangles of one texture set (UDIM tile).
 pub struct MeshPart<'a> {
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
     pub range: std::ops::Range<u32>,
     /// Mesh size (bounding-box diagonal), for scaling procedural noise.
     pub scale: f32,
+    /// UDIM tile these triangles are in.
+    pub tile: u32,
 }
 
-struct Pipelines {
+impl MeshPart<'_> {
+    pub fn uv_origin(&self) -> [f32; 2] {
+        reetched_doc::udim_origin(self.tile)
+    }
+}
+
+/// Render pipelines of one group layout (core or extra channels).
+struct GroupPipelines {
     init: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
     folder: wgpu::RenderPipeline,
     paint: wgpu::RenderPipeline,
-    finalize: wgpu::RenderPipeline,
     dilate: wgpu::RenderPipeline,
+}
+
+struct Pipelines {
+    core: GroupPipelines,
+    ext: GroupPipelines,
+    finalize: wgpu::RenderPipeline,
+}
+
+impl Pipelines {
+    fn group(&self, g: usize) -> &GroupPipelines {
+        if g == 0 { &self.core } else { &self.ext }
+    }
 }
 
 pub struct Compositor {
@@ -116,17 +148,21 @@ pub struct Compositor {
     pipelines: Pipelines,
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
-    /// Decoded bitmaps, keyed by (resource, is sRGB color data).
-    bitmaps: HashMap<(ResourceId, bool), Option<wgpu::TextureView>>,
+    /// Decoded bitmaps, keyed by (resource, how it's decoded).
+    bitmaps: HashMap<(ResourceId, Decode), Option<wgpu::TextureView>>,
+    /// The OCIO config bitmaps can be read through.
+    ocio: Option<crate::color_ui::Ocio>,
     /// Scratch sets, reused between passes and frames.
     pool: Vec<ChannelSet>,
     /// 1×1 set bound where a pass reads nothing (a pass can't read its own target).
     dummy: ChannelSet,
+    /// 1×1 sets holding each group's empty-stack values, for groups a set doesn't use.
+    defaults: [ChannelSet; GROUPS],
     /// Paint layers' and masks' painted texels on the GPU.
     paint: HashMap<PaintKey, PaintTexture>,
     /// Rendered procedural materials by render key: one texture per channel.
     procedural: HashMap<String, [Option<wgpu::TextureView>; CHANNELS]>,
-    /// Resolution and mesh maps of the set being composited (for render keys).
+    /// Resolution and mesh maps of the tile being composited (for render keys).
     proc_ctx: (
         u32,
         std::collections::BTreeMap<reetched_doc::MeshMap, ResourceId>,
@@ -148,7 +184,8 @@ impl Compositor {
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                // The vertex stage reads the UDIM tile offset.
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -182,7 +219,7 @@ impl Compositor {
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<reetched_io::Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+            attributes: &VERTEX_ATTRIBUTES,
         };
         let targets: [Option<wgpu::ColorTargetState>; SET_TEXTURES] =
             std::array::from_fn(|_| Some(SET_FORMAT.into()));
@@ -213,13 +250,17 @@ impl Compositor {
                 cache: None,
             })
         };
+        let group = |suffix: &str| GroupPipelines {
+            init: pipeline("vs_uv", &format!("fs_init{suffix}"), true),
+            fill: pipeline("vs_uv", &format!("fs_fill{suffix}"), true),
+            folder: pipeline("vs_uv", &format!("fs_folder{suffix}"), true),
+            paint: pipeline("vs_uv", &format!("fs_paint{suffix}"), true),
+            dilate: pipeline("vs_full", &format!("fs_dilate{suffix}"), false),
+        };
         let pipelines = Pipelines {
-            init: pipeline("vs_uv", "fs_init", true),
-            fill: pipeline("vs_uv", "fs_fill", true),
-            folder: pipeline("vs_uv", "fs_folder", true),
-            paint: pipeline("vs_uv", "fs_paint", true),
+            core: group(""),
+            ext: group("_ex"),
             finalize: pipeline("vs_full", "fs_finalize", false),
-            dilate: pipeline("vs_full", "fs_dilate", false),
         };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bitmaps"),
@@ -238,6 +279,13 @@ impl Compositor {
             false,
         );
         let dummy = make_set(device, &set_layout, 1);
+        let defaults: [ChannelSet; GROUPS] =
+            std::array::from_fn(|_| make_set(device, &set_layout, 1));
+        let mut enc = device.create_command_encoder(&Default::default());
+        for (g, set) in defaults.iter().enumerate() {
+            drop(begin(&mut enc, set, g, true));
+        }
+        queue.submit([enc.finish()]);
         Self {
             params_layout,
             set_layout,
@@ -245,12 +293,19 @@ impl Compositor {
             sampler,
             white,
             bitmaps: HashMap::new(),
+            ocio: None,
             pool: Vec::new(),
             dummy,
+            defaults,
             paint: HashMap::new(),
             procedural: HashMap::new(),
             proc_ctx: Default::default(),
         }
+    }
+
+    /// Views of group `g`'s channel set: `set`'s, or the empty-stack defaults.
+    pub fn group_views<'a>(&'a self, sets: &'a GroupSets, g: usize) -> &'a [wgpu::TextureView; 4] {
+        &sets[g].as_ref().unwrap_or(&self.defaults[g]).views
     }
 
     /// The GPU texture for paint buffer `key`, created and synced with `map` as needed.
@@ -303,8 +358,8 @@ impl Compositor {
         }
     }
 
-    /// Re-evaluates `set` into `out` (created or resized as needed).
-    /// Returns warnings, e.g. bitmaps that couldn't be decoded.
+    /// Re-evaluates `set` on `mesh` (one UDIM tile) into `out` (created or
+    /// resized as needed). Returns warnings, e.g. bitmaps that couldn't be decoded.
     pub fn composite(
         &mut self,
         device: &wgpu::Device,
@@ -312,23 +367,20 @@ impl Compositor {
         mesh: &MeshPart,
         set: &TextureSet,
         resources: &Resources,
-        out: &mut Option<ChannelSet>,
+        out: &mut GroupSets,
     ) -> Vec<String> {
-        let res = set.resolution;
-        self.proc_ctx = (res, set.mesh_maps.clone());
-        if out.as_ref().is_none_or(|o| o.resolution != res) {
-            *out = Some(self.new_set(device, res));
-            // Different-sized scratch sets are dead weight now.
-            self.pool.retain(|s| s.resolution == res);
-        }
+        let tile = mesh.tile;
+        let res = set.tile_resolution(tile);
+        let mesh_maps = set.mesh_maps_for(tile).clone();
+        self.proc_ctx = (res, mesh_maps.clone());
         let mut warnings = Vec::new();
         let mut enc = device.create_command_encoder(&Default::default());
 
-        // Baked mesh maps, shared by every pass of this set.
+        // Baked mesh maps, shared by every pass of this tile.
         let mut maps: [Option<wgpu::TextureView>; 6] = Default::default();
         for (slot, kind) in BOUND_MAPS.into_iter().enumerate() {
-            if let Some(id) = set.mesh_maps.get(&kind) {
-                maps[slot] = self.bitmap(device, queue, resources, id, false, &mut warnings);
+            if let Some(id) = mesh_maps.get(&kind) {
+                maps[slot] = self.bitmap(device, queue, resources, id, Decode::Raw, &mut warnings);
             }
         }
         let flag = |i: usize| if maps[i].is_some() { 1.0 } else { 0.0 };
@@ -336,76 +388,102 @@ impl Compositor {
             [flag(0), flag(1), flag(2), flag(3)],
             [flag(4), flag(5), 0.0, 0.0],
         );
-        let with_maps = |mut p: Params, mut t: PassTextures| {
+        let [u0, v0] = mesh.uv_origin();
+        let with_maps = |g: usize, mut p: Params, mut t: PassTextures| {
             (p.maps, p.maps2) = map_flags;
             p.misc[2] = mesh.scale;
+            p.tile = [u0, v0, 0.0, 0.0];
+            p.defaults = group_values(g, true);
             for (slot, view) in maps.iter().enumerate() {
                 t[FIRST_MAP + slot] = view.clone();
             }
             (p, t)
         };
 
-        let start = self.take(device, res);
-        let (init, init_tex) = with_maps(Params::default(), Default::default());
-        let default_params = self.params(device, queue, &init, &init_tex);
-        self.mesh_pass(
-            &mut enc,
-            &self.pipelines.init,
-            &default_params,
-            &self.dummy,
-            &self.dummy,
-            &start,
-            mesh,
-        );
-        let result = self.eval(
-            device,
-            queue,
-            &mut enc,
-            mesh,
-            &set.stack,
-            start,
-            resources,
-            &mut warnings,
-            &with_maps,
-        );
-
-        // Height → normal, then grow the islands a few texels, ending in `out`.
-        let finalize = Params {
-            misc: [res as f32 / 256.0, 0.0, 0.0, 0.0],
-            ..Default::default()
-        };
-        let finalize = self.params(device, queue, &finalize, &Default::default());
-        let mut cur = self.take(device, res);
-        self.full_pass(&mut enc, &self.pipelines.finalize, &finalize, &result, &cur);
-        self.pool.push(result);
-        for i in 0..DISPLAY_DILATION {
-            let last = i + 1 == DISPLAY_DILATION;
-            if last {
-                self.full_pass(
-                    &mut enc,
-                    &self.pipelines.dilate,
-                    &default_params,
-                    &cur,
-                    out.as_ref().unwrap(),
-                );
-            } else {
-                let next = self.take(device, res);
-                self.full_pass(
-                    &mut enc,
-                    &self.pipelines.dilate,
-                    &default_params,
-                    &cur,
-                    &next,
-                );
-                self.pool.push(std::mem::replace(&mut cur, next));
+        for (g, out) in out.iter_mut().enumerate() {
+            if !set.uses_group(g) {
+                if let Some(old) = out.take() {
+                    self.pool.push(old);
+                }
+                continue;
             }
+            if out.as_ref().is_none_or(|o| o.resolution != res) {
+                *out = Some(self.new_set(device, res));
+            }
+            let start = self.take(device, res);
+            let (init, init_tex) = with_maps(g, Params::default(), Default::default());
+            let default_params = self.params(device, &init, &init_tex);
+            self.mesh_pass(
+                &mut enc,
+                &self.pipelines.group(g).init,
+                &default_params,
+                &self.dummy,
+                &self.dummy,
+                &start,
+                mesh,
+                g,
+            );
+            let result = self.eval(
+                device,
+                queue,
+                &mut enc,
+                mesh,
+                g,
+                &set.stack,
+                start,
+                resources,
+                &mut warnings,
+                &with_maps,
+            );
+
+            // Core: height → normal. Then grow the islands a few texels, ending in `out`.
+            let mut cur = if g == 0 {
+                let finalize = Params {
+                    misc: [res as f32 / 256.0, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                };
+                let finalize = self.params(device, &finalize, &Default::default());
+                let cur = self.take(device, res);
+                self.full_pass(
+                    &mut enc,
+                    &self.pipelines.finalize,
+                    &finalize,
+                    &result,
+                    &cur,
+                    g,
+                );
+                self.pool.push(result);
+                cur
+            } else {
+                result
+            };
+            for i in 0..DISPLAY_DILATION {
+                let last = i + 1 == DISPLAY_DILATION;
+                if last {
+                    self.full_pass(
+                        &mut enc,
+                        &self.pipelines.group(g).dilate,
+                        &default_params,
+                        &cur,
+                        out.as_ref().unwrap(),
+                        g,
+                    );
+                } else {
+                    let next = self.take(device, res);
+                    let dilate = &self.pipelines.group(g).dilate;
+                    self.full_pass(&mut enc, dilate, &default_params, &cur, &next, g);
+                    self.pool.push(std::mem::replace(&mut cur, next));
+                }
+            }
+            self.pool.push(cur);
         }
-        self.pool.push(cur);
+        // Different-sized scratch sets are dead weight now.
+        self.pool.retain(|s| s.resolution == res);
         queue.submit([enc.finish()]);
         warnings
     }
 
-    /// Composites `nodes` (top first) on top of `cur`; returns the result.
+    /// Composites `nodes` (top first) of group `g` on top of `cur`; returns the result.
     #[allow(clippy::too_many_arguments)]
     fn eval(
         &mut self,
@@ -413,56 +491,42 @@ impl Compositor {
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
         mesh: &MeshPart,
+        g: usize,
         nodes: &[Node],
         mut cur: ChannelSet,
         resources: &Resources,
         warnings: &mut Vec<String>,
-        with_maps: &dyn Fn(Params, PassTextures) -> (Params, PassTextures),
+        with_maps: &dyn Fn(usize, Params, PassTextures) -> (Params, PassTextures),
     ) -> ChannelSet {
         let res = cur.resolution;
-        for node in nodes.iter().rev().filter(|n| n.visible) {
-            let (params, bitmaps) = self.node_params(device, queue, node, res, resources, warnings);
-            let (params, bitmaps) = with_maps(params, bitmaps);
-            let group = self.params(device, queue, &params, &bitmaps);
+        for node in nodes
+            .iter()
+            .rev()
+            .filter(|n| n.visible && n.on_tile(mesh.tile))
+        {
+            let (params, bitmaps) =
+                self.node_params(device, queue, node, g, mesh.tile, res, resources, warnings);
+            let (params, bitmaps) = with_maps(g, params, bitmaps);
+            let group = self.params(device, &params, &bitmaps);
             let dst = self.take(device, res);
             match &node.kind {
                 NodeKind::Fill(_) => {
-                    self.mesh_pass(
-                        enc,
-                        &self.pipelines.fill,
-                        &group,
-                        &cur,
-                        &self.dummy,
-                        &dst,
-                        mesh,
-                    );
+                    let pl = &self.pipelines.group(g).fill;
+                    self.mesh_pass(enc, pl, &group, &cur, &self.dummy, &dst, mesh, g);
                 }
                 NodeKind::Paint(_) => {
-                    self.mesh_pass(
-                        enc,
-                        &self.pipelines.paint,
-                        &group,
-                        &cur,
-                        &self.dummy,
-                        &dst,
-                        mesh,
-                    );
+                    let pl = &self.pipelines.group(g).paint;
+                    self.mesh_pass(enc, pl, &group, &cur, &self.dummy, &dst, mesh, g);
                 }
                 NodeKind::Folder { children } => {
                     let start = self.take(device, res);
                     copy_set(enc, &cur, &start);
                     let inner = self.eval(
-                        device, queue, enc, mesh, children, start, resources, warnings, with_maps,
+                        device, queue, enc, mesh, g, children, start, resources, warnings,
+                        with_maps,
                     );
-                    self.mesh_pass(
-                        enc,
-                        &self.pipelines.folder,
-                        &group,
-                        &cur,
-                        &inner,
-                        &dst,
-                        mesh,
-                    );
+                    let pl = &self.pipelines.group(g).folder;
+                    self.mesh_pass(enc, pl, &group, &cur, &inner, &dst, mesh, g);
                     self.pool.push(inner);
                 }
             }
@@ -471,37 +535,39 @@ impl Compositor {
         cur
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn node_params(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         node: &Node,
+        g: usize,
+        tile: u32,
         res: u32,
         resources: &Resources,
         warnings: &mut Vec<String>,
     ) -> (Params, PassTextures) {
         let mut p = Params::default();
         let mut bitmaps: PassTextures = Default::default();
-        for (i, c) in Channel::ALL.into_iter().enumerate() {
+        let channels = CHANNEL_GROUPS[g];
+        for (i, &c) in channels.iter().enumerate() {
             let b = node.blend(c);
             p.blend[i] = [b.mode.index() as f32, b.opacity, 0.0, 0.0];
         }
         if let NodeKind::Fill(fill) = &node.kind {
-            for (i, c) in Channel::ALL.into_iter().enumerate() {
+            for (i, &c) in channels.iter().enumerate() {
                 let Some(src) = fill.channels.get(&c) else {
                     continue;
                 };
                 let [x, y, z] = src.value;
                 p.values[i] = [x, y, z, if src.enabled { 1.0 } else { 0.0 }];
                 if let Some(id) = &src.bitmap {
-                    bitmaps[i] = self.bitmap(
-                        device,
-                        queue,
-                        resources,
-                        id,
-                        src.color_space.is_srgb(c),
-                        warnings,
-                    );
+                    let decode = match &src.ocio {
+                        Some(name) if self.ocio.is_some() => Decode::Ocio(name.clone()),
+                        _ if src.color_space.is_srgb(c) => Decode::Srgb,
+                        _ => Decode::Raw,
+                    };
+                    bitmaps[i] = self.bitmap(device, queue, resources, id, decode, warnings);
                     p.blend[i][2] = if bitmaps[i].is_some() { 1.0 } else { 0.0 };
                 }
             }
@@ -511,8 +577,8 @@ impl Compositor {
                     .procedural
                     .get(&proc.render_key(self.proc_ctx.0, &self.proc_ctx.1))
             {
-                for (i, v) in views.iter().enumerate() {
-                    if let Some(v) = v {
+                for (i, &c) in channels.iter().enumerate() {
+                    if let Some(v) = &views[c.index()] {
                         bitmaps[i] = Some(v.clone());
                         p.blend[i][2] = 1.0;
                     }
@@ -520,12 +586,12 @@ impl Compositor {
             }
         }
         if let NodeKind::Paint(paint) = &node.kind {
-            for (i, c) in Channel::ALL.into_iter().enumerate() {
-                if let Some(map) = paint.channels.get(&c).filter(|m| !m.tiles.is_empty()) {
+            for (i, &c) in channels.iter().enumerate() {
+                if let Some(map) = paint.map(tile, c).filter(|m| !m.tiles.is_empty()) {
                     bitmaps[i] = Some(self.paint_view(
                         device,
                         queue,
-                        (node.id, i as u8),
+                        (node.id, c.index() as u8, tile),
                         map,
                         res,
                         resources,
@@ -546,7 +612,8 @@ impl Compositor {
                 if mask.invert { 1.0 } else { 0.0 },
             ];
             if let Some(id) = &mask.bitmap {
-                bitmaps[MASK_BITMAP] = self.bitmap(device, queue, resources, id, false, warnings);
+                bitmaps[MASK_BITMAP] =
+                    self.bitmap(device, queue, resources, id, Decode::Raw, warnings);
                 p.mask[2] = if bitmaps[MASK_BITMAP].is_some() {
                     1.0
                 } else {
@@ -560,20 +627,33 @@ impl Compositor {
             {
                 *fx = mask_fx(e);
             }
-            if let Some(map) = mask.paint.as_ref().filter(|m| !m.tiles.is_empty()) {
-                bitmaps[MASK_PAINT] =
-                    Some(self.paint_view(device, queue, (node.id, MASK_SLOT), map, res, resources));
+            if let Some(map) = mask.paint_for(tile).filter(|m| !m.tiles.is_empty()) {
+                bitmaps[MASK_PAINT] = Some(self.paint_view(
+                    device,
+                    queue,
+                    (node.id, MASK_SLOT, tile),
+                    map,
+                    res,
+                    resources,
+                ));
                 p.misc[1] = 1.0;
             }
         }
         (p, bitmaps)
     }
 
+    /// Sets the OCIO config bitmaps with an OCIO color space are read through.
+    pub fn set_ocio(&mut self, ocio: Option<crate::color_ui::Ocio>) {
+        self.ocio = ocio;
+        self.bitmaps
+            .retain(|(_, d), _| !matches!(d, Decode::Ocio(_)));
+    }
+
     pub fn has_procedural(&self, key: &str) -> bool {
         self.procedural.contains_key(key)
     }
 
-    /// Stores a procedural material's rendered channels (RGBA8; base color is sRGB).
+    /// Stores a procedural material's rendered channels (RGBA8; color channels are sRGB).
     pub fn set_procedural(
         &mut self,
         device: &wgpu::Device,
@@ -583,8 +663,7 @@ impl Compositor {
     ) {
         let mut views: [Option<wgpu::TextureView>; CHANNELS] = Default::default();
         for (c, img) in outputs {
-            let i = Channel::ALL.iter().position(|x| x == c).unwrap_or(0);
-            views[i] = Some(upload_rgba8(device, queue, img, c.is_color()));
+            views[c.index()] = Some(upload_rgba8(device, queue, img, c.is_color()));
         }
         self.procedural.insert(key, views);
     }
@@ -602,7 +681,7 @@ impl Compositor {
         resources: &Resources,
         id: &ResourceId,
     ) -> Option<wgpu::TextureView> {
-        self.bitmap(device, queue, resources, id, true, &mut Vec::new())
+        self.bitmap(device, queue, resources, id, Decode::Srgb, &mut Vec::new())
     }
 
     /// A linear (non-sRGB) image resource as a texture, e.g. a brush alpha.
@@ -613,7 +692,7 @@ impl Compositor {
         resources: &Resources,
         id: &ResourceId,
     ) -> Option<wgpu::TextureView> {
-        self.bitmap(device, queue, resources, id, false, &mut Vec::new())
+        self.bitmap(device, queue, resources, id, Decode::Raw, &mut Vec::new())
     }
 
     fn bitmap(
@@ -622,19 +701,35 @@ impl Compositor {
         queue: &wgpu::Queue,
         resources: &Resources,
         id: &ResourceId,
-        srgb: bool,
+        decode: Decode,
         warnings: &mut Vec<String>,
     ) -> Option<wgpu::TextureView> {
+        let ocio = self.ocio.as_ref();
         self.bitmaps
-            .entry((id.clone(), srgb))
+            .entry((id.clone(), decode.clone()))
             .or_insert_with(|| {
                 let bytes = resources.files.get(id)?;
-                match image::load_from_memory(bytes) {
-                    Ok(img) => Some(upload_rgba8(device, queue, &img.to_rgba8(), srgb)),
+                let img = match crate::images::decode(bytes) {
+                    Ok(img) => img,
                     Err(e) => {
-                        warnings.push(format!("could not decode an image: {e}"));
-                        None
+                        warnings.push(format!("could not decode an image: {e:#}"));
+                        return None;
                     }
+                };
+                match (&decode, ocio) {
+                    (Decode::Ocio(space), Some(ocio)) => {
+                        let mut px = img.to_rgba32f();
+                        if let Err(e) = ocio.to_working(space, &mut px) {
+                            warnings.push(format!("OCIO conversion from {space} failed: {e:#}"));
+                        }
+                        Some(upload_rgba32f(device, queue, &px))
+                    }
+                    (d, _) => Some(upload_rgba8(
+                        device,
+                        queue,
+                        &img.to_rgba8(),
+                        !matches!(d, Decode::Raw),
+                    )),
                 }
             })
             .clone()
@@ -643,7 +738,6 @@ impl Compositor {
     fn params(
         &self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
         params: &Params,
         bitmaps: &PassTextures,
     ) -> wgpu::BindGroup {
@@ -687,8 +781,9 @@ impl Compositor {
         other: &ChannelSet,
         dst: &ChannelSet,
         mesh: &MeshPart,
+        g: usize,
     ) {
-        let mut pass = begin(enc, dst);
+        let mut pass = begin(enc, dst, g, false);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, params, &[]);
         pass.set_bind_group(1, &src.read, &[]);
@@ -705,8 +800,9 @@ impl Compositor {
         params: &wgpu::BindGroup,
         src: &ChannelSet,
         dst: &ChannelSet,
+        g: usize,
     ) {
-        let mut pass = begin(enc, dst);
+        let mut pass = begin(enc, dst, g, false);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, params, &[]);
         pass.set_bind_group(1, &src.read, &[]);
@@ -714,74 +810,20 @@ impl Compositor {
         pass.draw(0..3, 0..1);
     }
 
-    /// Copies a channel set back to the CPU for export.
+    /// Copies a tile's channel sets back to the CPU for export.
     pub fn read_back(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        set: &ChannelSet,
+        sets: &GroupSets,
     ) -> anyhow::Result<ChannelData> {
-        let res = set.resolution;
-        let row = res * 8; // rgba16float
-        let padded_row =
-            row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let buffers: Vec<wgpu::Buffer> = (0..SET_TEXTURES)
-            .map(|_| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("readback"),
-                    size: (padded_row * res) as u64,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-        let mut enc = device.create_command_encoder(&Default::default());
-        for (texture, buffer) in set.textures.iter().zip(&buffers) {
-            enc.copy_texture_to_buffer(
-                texture.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded_row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: res,
-                    height: res,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        queue.submit([enc.finish()]);
-        for b in &buffers {
-            b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        }
-        device.poll(wgpu::PollType::wait_indefinitely())?;
-
-        let texels = (res * res) as usize;
-        let mut planes: Vec<Vec<[f32; 4]>> = Vec::with_capacity(SET_TEXTURES);
-        for b in &buffers {
-            let mapped = b
-                .slice(..)
-                .get_mapped_range()
-                .map_err(|e| anyhow::anyhow!("could not read GPU data: {e:?}"))?;
-            let mut px = Vec::with_capacity(texels);
-            for y in 0..res as usize {
-                let start = y * padded_row as usize;
-                let line = &mapped[start..start + row as usize];
-                px.extend(line.as_chunks::<8>().0.iter().map(|c| {
-                    let h: [half::f16; 4] = bytemuck::pod_read_unaligned(c);
-                    h.map(f32::from)
-                }));
-            }
-            drop(mapped);
-            b.unmap();
-            planes.push(px);
-        }
+        let core = sets[0]
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("nothing composited yet"))?;
+        let res = core.resolution;
+        let planes = read_planes(device, queue, core)?;
         let (t0, t1, t2, t3) = (&planes[0], &planes[1], &planes[2], &planes[3]);
-        Ok(ChannelData {
+        let mut data = ChannelData {
             width: res,
             height: res,
             base_color: t0.iter().map(|p| [p[0], p[1], p[2]]).collect(),
@@ -793,34 +835,132 @@ impl Compositor {
             opacity: t2.iter().map(|p| p[3]).collect(),
             coverage: t2.iter().map(|p| p[1] > 0.5).collect(),
             ambient_occlusion: Vec::new(),
-        })
+            extra: Default::default(),
+        };
+        for (g, set) in sets.iter().enumerate().skip(1) {
+            let Some(set) = set else { continue };
+            let pl = read_planes(device, queue, set)?;
+            let group = CHANNEL_GROUPS[g];
+            let rgb = |k: usize| pl[k].iter().map(|p| [p[0], p[1], p[2]]).collect();
+            let scalar = |k: usize, c: usize| pl[k].iter().map(|p| [p[c]; 3]).collect();
+            data.extra.insert(group[0], rgb(0));
+            data.extra.insert(group[1], rgb(1));
+            data.extra.insert(group[2], scalar(0, 3));
+            data.extra.insert(group[3], scalar(1, 3));
+            data.extra.insert(group[4], scalar(2, 0));
+            data.extra.insert(group[5], scalar(2, 1));
+            data.extra.insert(group[6], scalar(2, 2));
+        }
+        Ok(data)
     }
 }
 
-fn begin<'a>(enc: &'a mut wgpu::CommandEncoder, dst: &'a ChannelSet) -> wgpu::RenderPass<'a> {
-    // Outside the islands: the empty stack's values, coverage 0 (matches empty() in the shader).
-    let clears = [
-        wgpu::Color {
-            r: 0.214,
-            g: 0.214,
-            b: 0.214,
-            a: 0.0,
-        },
-        wgpu::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 1.0,
-            a: 0.5,
-        },
-        // Height 0, coverage 0, not filled, opacity 1.
-        wgpu::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 1.0,
-        },
-        wgpu::Color::TRANSPARENT,
-    ];
+/// A channel set's four textures as RGBA f32 rows (row 0 = top).
+fn read_planes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    set: &ChannelSet,
+) -> anyhow::Result<Vec<Vec<[f32; 4]>>> {
+    let res = set.resolution;
+    let row = res * 8; // rgba16float
+    let padded_row =
+        row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffers: Vec<wgpu::Buffer> = (0..SET_TEXTURES)
+        .map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: (padded_row * res) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
+    let mut enc = device.create_command_encoder(&Default::default());
+    for (texture, buffer) in set.textures.iter().zip(&buffers) {
+        enc.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: res,
+                height: res,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    queue.submit([enc.finish()]);
+    for b in &buffers {
+        b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    }
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+
+    let texels = (res * res) as usize;
+    let mut planes: Vec<Vec<[f32; 4]>> = Vec::with_capacity(SET_TEXTURES);
+    for b in &buffers {
+        let mapped = b
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| anyhow::anyhow!("could not read GPU data: {e:?}"))?;
+        let mut px = Vec::with_capacity(texels);
+        for y in 0..res as usize {
+            let start = y * padded_row as usize;
+            let line = &mapped[start..start + row as usize];
+            px.extend(line.as_chunks::<8>().0.iter().map(|c| {
+                let h: [half::f16; 4] = bytemuck::pod_read_unaligned(c);
+                h.map(f32::from)
+            }));
+        }
+        drop(mapped);
+        b.unmap();
+        planes.push(px);
+    }
+    Ok(planes)
+}
+
+/// Group `g`'s empty-stack values packed like its textures (see compositor.wgsl);
+/// `inside`: within the UV islands (coverage and filled set).
+fn group_values(g: usize, inside: bool) -> [[f32; 4]; 4] {
+    let e = |slot: usize| CHANNEL_GROUPS[g][slot].empty_value();
+    let k = if inside { 1.0 } else { 0.0 };
+    if g == 0 {
+        let (base, metal, rough, normal) = (e(0), e(1)[0], e(2)[0], e(3));
+        [
+            [base[0], base[1], base[2], metal],
+            [normal[0], normal[1], normal[2], rough],
+            [e(4)[0], k, k, e(6)[0]],
+            [e(5)[0], e(5)[1], e(5)[2], 1.0],
+        ]
+    } else {
+        let (a, b) = (e(0), e(1));
+        [
+            [a[0], a[1], a[2], e(2)[0]],
+            [b[0], b[1], b[2], e(3)[0]],
+            [e(4)[0], e(5)[0], e(6)[0], 0.0],
+            [k, k, 0.0, 0.0],
+        ]
+    }
+}
+
+/// A pass writing `dst`, cleared to group `g`'s empty values outside the islands
+/// (`inside`: as inside, for the 1×1 default sets).
+fn begin<'a>(
+    enc: &'a mut wgpu::CommandEncoder,
+    dst: &'a ChannelSet,
+    g: usize,
+    inside: bool,
+) -> wgpu::RenderPass<'a> {
+    let clears = group_values(g, inside).map(|[r, gr, b, a]| wgpu::Color {
+        r: r as f64,
+        g: gr as f64,
+        b: b as f64,
+        a: a as f64,
+    });
     let attachments: Vec<_> = dst
         .views
         .iter()
@@ -863,6 +1003,8 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         ProjectionMode::Planar => 2.0,
         ProjectionMode::Spherical => 3.0,
         ProjectionMode::Cylindrical => 4.0,
+        ProjectionMode::Warp => 5.0,
+        ProjectionMode::UvSet2 => 6.0,
     };
     let [px, py, pz] = p.position;
     let mirror = p
@@ -871,6 +1013,7 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         .enumerate()
         .map(|(i, &m)| if m { 1 << i } else { 0 })
         .sum::<u32>() as f32;
+    let w = &p.warp;
     ProjUniform {
         a: [
             mode,
@@ -883,7 +1026,60 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         r0: row(0),
         r1: row(1),
         r2: row(2),
+        warp: std::array::from_fn(|k| [w[2 * k][0], w[2 * k][1], w[2 * k + 1][0], w[2 * k + 1][1]]),
     }
+}
+
+/// How a bitmap's values become linear texture values.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Decode {
+    Raw,
+    Srgb,
+    /// Through the OCIO config, from this color space to the working space.
+    Ocio(String),
+}
+
+/// Uploads a float image (as rgba16f) with a box-filtered mip chain.
+fn upload_rgba32f(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &image::Rgba32FImage,
+) -> wgpu::TextureView {
+    let mut mips = vec![img.clone()];
+    while let Some(last) = mips.last().filter(|m| m.width() > 1 || m.height() > 1) {
+        let (w, h) = ((last.width() / 2).max(1), (last.height() / 2).max(1));
+        mips.push(image::imageops::resize(
+            last,
+            w,
+            h,
+            image::imageops::FilterType::Triangle,
+        ));
+    }
+    let data: Vec<half::f16> = mips
+        .iter()
+        .flat_map(|m| m.as_raw().iter().map(|&v| half::f16::from_f32(v)))
+        .collect();
+    device
+        .create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("bitmap (OCIO)"),
+                size: wgpu::Extent3d {
+                    width: img.width(),
+                    height: img.height(),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: mips.len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&data),
+        )
+        .create_view(&Default::default())
 }
 
 /// Uploads an image with a box-filtered mip chain.
@@ -1068,7 +1264,7 @@ fn upload_tiles(queue: &wgpu::Queue, pt: &mut PaintTexture, map: &TileMap, resou
     if map.resolution == res || map.tiles.is_empty() {
         // Same size: tile-by-tile diff. A full rewrite if the texture held resampled data.
         let full = pt.synced.resolution != res;
-        let tiles_per_side = res / TILE_SIZE;
+        let tiles_per_side = res.div_ceil(TILE_SIZE);
         for ty in 0..tiles_per_side {
             for tx in 0..tiles_per_side {
                 let key = TileMap::key(tx, ty);
@@ -1079,7 +1275,22 @@ fn upload_tiles(queue: &wgpu::Queue, pt: &mut PaintTexture, map: &TileMap, resou
                 let bytes = new
                     .and_then(|id| resources.tiles.get(id).cloned())
                     .unwrap_or_else(zero);
-                write(tx * TILE_SIZE, ty * TILE_SIZE, TILE_SIZE, TILE_SIZE, &bytes);
+                // Textures under 256 px use the top-left part of their one tile.
+                let (w, h) = (
+                    TILE_SIZE.min(res - tx * TILE_SIZE),
+                    TILE_SIZE.min(res - ty * TILE_SIZE),
+                );
+                if w == TILE_SIZE && h == TILE_SIZE {
+                    write(tx * TILE_SIZE, ty * TILE_SIZE, w, h, &bytes);
+                } else {
+                    let rows: Vec<u8> = (0..h as usize)
+                        .flat_map(|y| {
+                            let at = y * TILE_SIZE as usize * 8;
+                            bytes[at..at + w as usize * 8].iter().copied()
+                        })
+                        .collect();
+                    write(tx * TILE_SIZE, ty * TILE_SIZE, w, h, &rows);
+                }
             }
         }
     } else {
@@ -1144,6 +1355,7 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
             uv: [u, w],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [w, u],
         };
         let vertices = [v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)];
         let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
@@ -1166,6 +1378,16 @@ mod tests {
     }
 
     fn run_at(stack: Vec<Node>, resources: &Resources, pos: fn(f32) -> f32) -> Option<ChannelData> {
+        let mut set = TextureSet::new("t".into(), stack);
+        set.resolution = RES;
+        run_set(&set, resources, pos)
+    }
+
+    fn run_set(
+        set: &TextureSet,
+        resources: &Resources,
+        pos: fn(f32) -> f32,
+    ) -> Option<ChannelData> {
         let _gpu = crate::gpu_test_lock();
         let (device, queue) = gpu()?;
         let (vb, ib) = quad_at(&device, pos);
@@ -1174,21 +1396,13 @@ mod tests {
             indices: &ib,
             range: 0..6,
             scale: 1.0,
-        };
-        let set = TextureSet {
-            name: "t".into(),
-            resolution: RES,
-            stack,
-            mesh_maps: Default::default(),
+            tile: reetched_doc::FIRST_UDIM,
         };
         let mut comp = Compositor::new(&device, &queue);
-        let mut out = None;
-        let warnings = comp.composite(&device, &queue, &mesh, &set, resources, &mut out);
+        let mut out = GroupSets::default();
+        let warnings = comp.composite(&device, &queue, &mesh, set, resources, &mut out);
         assert!(warnings.is_empty(), "{warnings:?}");
-        Some(
-            comp.read_back(&device, &queue, out.as_ref().unwrap())
-                .unwrap(),
-        )
+        Some(comp.read_back(&device, &queue, &out).unwrap())
     }
 
     fn at(d: &ChannelData, x: u32, y: u32) -> usize {
@@ -1302,6 +1516,7 @@ mod tests {
             &d,
             &dir,
             ("p", "m", "t"),
+            None,
         )
         .unwrap();
         let base = image::open(&files[0]).unwrap().to_rgb8();
@@ -1410,5 +1625,192 @@ mod tests {
             "sRGB 128 → linear 0.216: {srgb}"
         );
         assert!((raw - 0.502).abs() < 0.01, "raw 128 → 0.502: {raw}");
+    }
+
+    /// A 2×2 PNG: top row red, green; bottom row blue, white.
+    fn quadrants(resources: &mut Resources) -> reetched_doc::ResourceId {
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        resources.add(png)
+    }
+
+    #[test]
+    fn extra_channels_composite_in_their_groups() {
+        let mut doc = Document::new(None, &[]);
+        let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+        for (c, v) in [
+            (Channel::SpecularLevel, [0.8; 3]),
+            (Channel::CoatColor, [1.0, 0.0, 0.0]),
+            (Channel::Sheen, [0.6; 3]),
+        ] {
+            let src = fill.channels.get_mut(&c).unwrap();
+            src.enabled = true;
+            src.value = v;
+        }
+        let mut set = TextureSet::new("t".into(), vec![doc.new_fill("rich".into(), fill)]);
+        set.resolution = RES;
+        set.extra_channels = vec![
+            Channel::SpecularLevel,
+            Channel::CoatColor,
+            Channel::Sheen,
+            Channel::Coat,
+        ];
+        let Some(d) = run_set(&set, &Resources::default(), |u| u) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let i = at(&d, 32, 32);
+        let get = |c: Channel| d.extra.get(&c).unwrap_or_else(|| panic!("{c:?} read back"))[i];
+        assert!((get(Channel::SpecularLevel)[0] - 0.8).abs() < 0.01);
+        assert!(close(get(Channel::CoatColor), [1.0, 0.0, 0.0]));
+        assert!((get(Channel::Sheen)[0] - 0.6).abs() < 0.01);
+        // Untouched channels of a composited group keep their empty value.
+        assert_eq!(get(Channel::Coat)[0], 0.0);
+        assert!(close(get(Channel::SpecularColor), [1.0; 3]));
+        // Group 2 is composited for Coat/CoatColor/Sheen, group 1 for SpecularLevel.
+        assert!(d.extra.contains_key(&Channel::Transmission));
+        // The core channels are unaffected.
+        assert!(close(d.base_color[i], [1.0; 3]));
+    }
+
+    #[test]
+    fn warp_and_second_uv_set_projections() {
+        let mut resources = Resources::default();
+        let id = quadrants(&mut resources);
+        let layer = |mode: ProjectionMode, warp: Option<[[f32; 2]; 16]>| {
+            let mut doc = Document::new(None, &[]);
+            let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+            fill.channels.get_mut(&Channel::BaseColor).unwrap().bitmap = Some(id.clone());
+            fill.projection.mode = mode;
+            if let Some(w) = warp {
+                fill.projection.warp = w;
+            }
+            doc.new_fill("img".into(), fill)
+        };
+        let Some(plain) = run(vec![layer(ProjectionMode::Uv, None)], &resources) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.06);
+        // The identity lattice changes nothing.
+        let warped = run(vec![layer(ProjectionMode::Warp, None)], &resources).unwrap();
+        for (x, y) in [(16, 16), (48, 16), (16, 48), (48, 48)] {
+            assert!(
+                near(
+                    warped.base_color[at(&warped, x, y)],
+                    plain.base_color[at(&plain, x, y)]
+                ),
+                "({x}, {y})"
+            );
+        }
+        // Squeeze the lattice into the left half: the whole image lands there, so
+        // the left quarter shows what was the image's left half (red at the top).
+        let mut squeezed = reetched_doc::warp_identity();
+        for p in &mut squeezed {
+            p[0] *= 0.5;
+        }
+        let s = run(
+            vec![layer(ProjectionMode::Warp, Some(squeezed))],
+            &resources,
+        )
+        .unwrap();
+        assert!(near(s.base_color[at(&s, 8, 16)], [1.0, 0.0, 0.0]));
+        assert!(
+            near(s.base_color[at(&s, 24, 16)], [0.0, 1.0, 0.0]),
+            "{:?}",
+            s.base_color[at(&s, 24, 16)]
+        );
+        // The test quad's second UV set is the first one transposed: top-left
+        // samples what is bottom-right in UV set 1.
+        let t = run(vec![layer(ProjectionMode::UvSet2, None)], &resources).unwrap();
+        assert!(near(plain.base_color[at(&plain, 16, 16)], [1.0, 0.0, 0.0]));
+        assert!(
+            near(t.base_color[at(&t, 16, 16)], [1.0; 3]),
+            "{:?}",
+            t.base_color[at(&t, 16, 16)]
+        );
+    }
+
+    #[test]
+    fn udim_tiles_composite_their_own_paint() {
+        let _gpu = crate::gpu_test_lock();
+        let Some((device, queue)) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        // The unit quad moved to tile 1002 (u in 1..2).
+        let v = |u: f32, w: f32| Vertex {
+            position: [u, w, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [u + 1.0, w],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
+        };
+        let vertices = [v(0.0, 0.0), v(1.0, 0.0), v(1.0, 1.0), v(0.0, 1.0)];
+        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        let buf = |bytes: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytes,
+                usage,
+            })
+        };
+        let vb = buf(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
+        let ib = buf(bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
+        let mesh = MeshPart {
+            vertices: &vb,
+            indices: &ib,
+            range: 0..6,
+            scale: 1.0,
+            tile: 1002,
+        };
+        // Paint on tile 1002 only: one red tile at a smaller tile resolution.
+        let mut resources = Resources::default();
+        let mut doc = Document::new(None, &["t".to_string()]);
+        let mut set = doc.texture_sets[0].clone();
+        set.resolution = 128;
+        set.udim = vec![
+            reetched_doc::UdimTile {
+                number: 1001,
+                name: String::new(),
+                resolution: None,
+            },
+            reetched_doc::UdimTile {
+                number: 1002,
+                name: "Head".into(),
+                resolution: Some(RES),
+            },
+        ];
+        let red = TileMap::from_fn(RES, &mut resources, |_, _| [1.0, 0.0, 0.0, 1.0]);
+        let NodeKind::Paint(paint) = &mut set.stack[0].kind else {
+            panic!("paint layer")
+        };
+        paint.set_map(1002, Channel::BaseColor, red);
+        let mut comp = Compositor::new(&device, &queue);
+        let mut out = GroupSets::default();
+        let warnings = comp.composite(&device, &queue, &mesh, &set, &resources, &mut out);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let d = comp.read_back(&device, &queue, &out).unwrap();
+        assert_eq!(d.width, RES, "the tile's own resolution");
+        let i = at(&d, 32, 32);
+        assert!(d.coverage[i], "the triangles land inside the tile");
+        assert!(
+            close(d.base_color[i], [1.0, 0.0, 0.0]),
+            "{:?}",
+            d.base_color[i]
+        );
+        // A layer masked to tile 1001 doesn't show here.
+        set.stack[0].udim_mask = vec![1001];
+        let mut out = GroupSets::default();
+        comp.composite(&device, &queue, &mesh, &set, &resources, &mut out);
+        let d = comp.read_back(&device, &queue, &out).unwrap();
+        assert!(close(d.base_color[at(&d, 32, 32)], [0.214; 3]));
+        let _ = doc.new_paint("x".into());
     }
 }

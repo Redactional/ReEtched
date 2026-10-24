@@ -120,16 +120,10 @@ pub struct Imported {
 }
 
 pub fn channel(name: &str) -> Option<Channel> {
-    Some(match name {
-        "basecolor" => Channel::BaseColor,
-        "metallic" => Channel::Metallic,
-        "roughness" => Channel::Roughness,
-        "normal" => Channel::Normal,
-        "height" => Channel::Height,
-        "emissive" => Channel::Emissive,
-        "opacity" => Channel::Opacity,
-        _ => return None,
-    })
+    match name {
+        "ao" => Some(Channel::AmbientOcclusion),
+        _ => Channel::from_id(name),
+    }
 }
 
 fn mesh_map(name: &str) -> Option<MeshMap> {
@@ -267,9 +261,7 @@ fn solve(c: Channel, e0: [f32; 3], e1: [f32; 3], b0: [f32; 3], b1: [f32; 3]) -> 
     }
     let v: [f32; 3] = std::array::from_fn(|i| ((e0[i] - b0[i] * (1.0 - a)) / a).clamp(0.0, 1.0));
     match c {
-        Channel::BaseColor | Channel::Emissive => {
-            [to_linear(v[0]), to_linear(v[1]), to_linear(v[2]), a]
-        }
+        _ if c.is_color() => [to_linear(v[0]), to_linear(v[1]), to_linear(v[2]), a],
         Channel::Normal => {
             let n = [v[0] * 2.0 - 1.0, v[1] * 2.0 - 1.0, v[2] * 2.0 - 1.0];
             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -299,19 +291,11 @@ fn node(doc: &mut Document, cx: &mut Ctx, b: &BNode) -> Node {
             let mut fill = Fill::new([0.5; 3], 0.0, 0.5);
             for (c, src) in &mut fill.channels {
                 src.enabled = false;
-                let name = match c {
-                    Channel::BaseColor => "basecolor",
-                    Channel::Metallic => "metallic",
-                    Channel::Roughness => "roughness",
-                    Channel::Normal => "normal",
-                    Channel::Height => "height",
-                    Channel::Emissive => "emissive",
-                    Channel::Opacity => "opacity",
-                };
+                let name = c.id();
                 if let Some(v) = values.get(name) {
                     src.enabled = true;
                     src.value = match c {
-                        Channel::BaseColor | Channel::Emissive => *v,
+                        c if c.is_color() => *v,
                         Channel::Normal => {
                             let n = v.map(|x| x * 2.0 - 1.0);
                             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);

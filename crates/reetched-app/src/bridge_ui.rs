@@ -98,7 +98,10 @@ impl State {
         }
         let mut checks = Vec::new();
         for r in refs {
-            let Ok(data) = self.viewport.read_back(&self.device, &self.queue, r.set) else {
+            let Ok(data) =
+                self.viewport
+                    .read_back(&self.device, &self.queue, r.set, reetched_doc::FIRST_UDIM)
+            else {
                 continue;
             };
             if (data.width, data.height) != (r.width, r.height) {
@@ -114,6 +117,14 @@ impl State {
                     Channel::Height => [data.height_map[i]; 3],
                     Channel::Emissive => data.emissive[i].map(linear_to_srgb),
                     Channel::Opacity => [data.opacity[i]; 3],
+                    c => {
+                        let v = data.extra.get(&c).map_or(c.empty_value(), |v| v[i]);
+                        if c.is_color() {
+                            v.map(linear_to_srgb)
+                        } else {
+                            v
+                        }
+                    }
                 }
             };
             let comps = if r.channel.is_vector() { 3 } else { 1 };

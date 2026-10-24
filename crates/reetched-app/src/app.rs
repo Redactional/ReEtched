@@ -27,7 +27,7 @@ use std::{
     time::Instant,
 };
 
-pub const MESH_EXTENSIONS: &[&str] = &["fbx", "obj", "gltf", "glb"];
+pub const MESH_EXTENSIONS: &[&str] = &["fbx", "obj", "gltf", "glb", "usd", "usda", "usdc", "usdz"];
 pub const ENV_EXTENSIONS: &[&str] = &["hdr", "exr"];
 const THUMB_SIZE: usize = 96;
 
@@ -173,11 +173,16 @@ pub struct State {
     pub clone_offset: Option<glam::Vec2>,
     /// Path tool points (object space) and whether committing erases.
     pub path_points: Vec<Vec3>,
-    pub path_erase: bool,
+    pub path_mode: crate::tools_ui::PathMode,
     /// The Projection tool's image.
     pub stencil: crate::tools_ui::Stencil,
     /// Polygon Fill rectangle selection: where the drag started.
     pub marquee: Option<egui::Pos2>,
+    /// Warp projection point being dragged in the 2D view.
+    pub warp_drag: Option<usize>,
+    /// The text resource window, while open.
+    pub text_ui: Option<crate::text_ui::TextUi>,
+    pub color: crate::color_ui::ColorUi,
     /// Properties shows the tool (true) or the selected layer (false).
     pub properties_tool: bool,
     /// Latest pen pressure (1 with a mouse).
@@ -217,8 +222,8 @@ pub struct ExportUi {
     pub settings: ExportSettings,
     /// Which texture sets to export.
     pub include: Vec<bool>,
-    /// Mesh export: USD (true) or OBJ, and displacement from the height channel (world units).
-    pub mesh_usd: bool,
+    /// Mesh export file type, and displacement from the height channel (world units).
+    pub mesh_format: crate::stack_ui::MeshFormat,
     pub displacement: f32,
 }
 
@@ -266,7 +271,7 @@ impl App {
                 preset: 0,
                 settings: ExportSettings::default(),
                 include: Vec::new(),
-                mesh_usd: true,
+                mesh_format: crate::stack_ui::MeshFormat::Usda,
                 displacement: 0.0,
             },
             exposure_ev: 0.0,
@@ -287,9 +292,12 @@ impl App {
             clone_source: None,
             clone_offset: None,
             path_points: Vec::new(),
-            path_erase: false,
+            path_mode: crate::tools_ui::PathMode::Paint,
             stencil: Default::default(),
             marquee: None,
+            text_ui: None,
+            warp_drag: None,
+            color: Default::default(),
             properties_tool: false,
             pressure: 1.0,
             last_stroke_end: None,
@@ -400,6 +408,7 @@ impl App {
             .show(ui, |ui| self.tree.ui(&mut self.state, ui));
         self.state.export_window(&ctx);
         self.state.bake_window(&ctx);
+        self.state.text_window(&ctx);
 
         // A whole drag or text edit becomes one undo step.
         let interacting =
@@ -547,9 +556,12 @@ impl App {
         egui: &mut egui_wgpu::Renderer,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        let view_proj = {
+        let (view, proj) = {
             let [w, h] = self.state.viewport.view3d.requested_size;
-            self.state.view_proj(w.max(1) as f32 / h.max(1) as f32)
+            let radius = (self.state.bounds.1 - self.state.bounds.0).length() * 0.5;
+            self.state
+                .camera
+                .view_and_proj(w.max(1) as f32 / h.max(1) as f32, radius)
         };
         let s = &mut self.state;
         let warnings = s.viewport.sync(
@@ -563,7 +575,14 @@ impl App {
             s.warn(w);
         }
         let params = FrameParams {
-            view_proj,
+            view,
+            proj,
+            target_distance: s.camera.distance,
+            fov_y: if s.camera.orthographic {
+                0.0
+            } else {
+                s.camera.fov_y_deg.to_radians()
+            },
             eye: s.camera.eye(),
             exposure_ev: s.exposure_ev,
             env_rotation: s.env_rotation_deg.to_radians(),
@@ -656,6 +675,17 @@ impl State {
             self.load_environment(path);
         } else if ext == project::EXTENSION {
             self.open_project(path);
+        } else if ext == "glsl" {
+            self.load_custom_shader_file(path);
+        } else if ext == "ocio" {
+            match reetched_color::Config::from_file(path) {
+                Ok(c) => {
+                    self.color.ocio =
+                        Some(crate::color_ui::Ocio::new(c, path.display().to_string()));
+                    self.apply_ocio();
+                }
+                Err(e) => self.error(format!("Could not load {}: {e:#}", path.display())),
+            }
         } else if ext == "sbs" {
             self.import_sbs(path);
         } else if path.is_dir() || file_name(path) == reetched_substance::bridge::MANIFEST {
@@ -807,7 +837,9 @@ impl State {
     }
 
     /// Shows `mesh` with `doc`, or a fresh document (one texture set per material).
-    pub fn set_mesh(&mut self, mesh: Mesh, name: String, doc: Option<Document>) {
+    pub fn set_mesh(&mut self, mut mesh: Mesh, name: String, doc: Option<Document>) {
+        // UDIM tiles must be contiguous index ranges (projects from before UDIM support).
+        mesh.sort_by_udim();
         self.bounds = mesh.bounds();
         self.camera.frame(self.bounds);
         self.uv_camera.zoom = 0.0;
@@ -823,6 +855,23 @@ impl State {
             let names: Vec<String> = mesh.parts.iter().map(|p| p.material.clone()).collect();
             Document::new(None, &names)
         });
+        // Texture sets whose UVs leave the 0..1 tile become UDIM sets.
+        for (k, set) in self.doc.texture_sets.iter_mut().enumerate() {
+            let Some(_) = mesh.parts.get(k) else { continue };
+            let tiles: Vec<u32> = mesh.udim_tiles(k).into_iter().map(|(t, _)| t).collect();
+            if tiles != [reetched_doc::FIRST_UDIM] {
+                for t in tiles {
+                    if !set.udim.iter().any(|u| u.number == t) {
+                        set.udim.push(reetched_doc::UdimTile {
+                            number: t,
+                            name: String::new(),
+                            resolution: None,
+                        });
+                    }
+                }
+                set.udim.sort_by_key(|u| u.number);
+            }
+        }
         self.resources = Resources::default();
         self.history = History::new(&self.doc);
         self.stroke = None;
@@ -916,7 +965,7 @@ impl State {
                 return None;
             }
         };
-        if let Err(e) = image::load_from_memory(&bytes) {
+        if let Err(e) = crate::images::decode(&bytes) {
             self.error(format!("{} isn't a readable image: {e}", file_name(path)));
             return None;
         }
@@ -1293,6 +1342,12 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32, scene_radius: f32) -> Mat4 {
+        let (view, proj) = self.view_and_proj(aspect, scene_radius);
+        proj * view
+    }
+
+    /// View and projection matrices separately (depth of field shifts the view).
+    pub fn view_and_proj(&self, aspect: f32, scene_radius: f32) -> (Mat4, Mat4) {
         let near = (self.distance - scene_radius * 2.0).max(self.distance * 0.001);
         let far = self.distance * 20.0 + scene_radius * 20.0;
         let fov = self.fov_y_deg.to_radians();
@@ -1304,7 +1359,8 @@ impl OrbitCamera {
         } else {
             directx::perspective(fov, aspect, near, far)
         };
-        proj * glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Y)
+        let view = glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Y);
+        (view, proj)
     }
 }
 
@@ -1549,6 +1605,7 @@ mod tests {
                         normal: nrm.into(),
                         uv: uv.into(),
                         tangent: [u.x, u.y, u.z, 1.0],
+                        uv1: [0.0; 2],
                     });
                 }
             }
@@ -1592,8 +1649,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let maps =
-            reetched_bake::bake(&low, 0, Some(&high), &settings, &Default::default()).unwrap();
+        let maps = reetched_bake::bake(&low, 0, 1001, Some(&high), &settings, &Default::default())
+            .unwrap();
         for (kind, img) in maps {
             let id = h
                 .app
@@ -1610,7 +1667,7 @@ mod tests {
             .app
             .state
             .viewport
-            .read_back(&h.device, &h.queue, 0)
+            .read_back(&h.device, &h.queue, 0, reetched_doc::FIRST_UDIM)
             .unwrap();
         // Walk across the middle of face 0's cell: painted in the middle, steel at the bevels.
         let row = (256.0 * (1.0 - (0.025 + 0.225))) as u32;
@@ -1669,7 +1726,7 @@ mod tests {
             h.app
                 .state
                 .viewport
-                .read_back(&h.device, &h.queue, 0)
+                .read_back(&h.device, &h.queue, 0, reetched_doc::FIRST_UDIM)
                 .unwrap()
         };
         let d = read(&h);
@@ -1975,8 +2032,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         h.app.state.export.dir = dir.display().to_string();
         h.app.state.export.displacement = 0.1;
-        for usd in [true, false] {
-            h.app.state.export.mesh_usd = usd;
+        for f in crate::stack_ui::MeshFormat::ALL {
+            h.app.state.export.mesh_format = f;
             h.app.state.export_mesh();
         }
         let names: Vec<String> = std::fs::read_dir(&dir)
@@ -2121,5 +2178,368 @@ mod tests {
             (200..20_000).contains(&filled),
             "the rectangle fills some front faces, not the whole texture: {filled}"
         );
+    }
+
+    /// Two quads side by side facing +z: x in -1..0 uses UDIM tile 1001, x in 0..1 tile 1002.
+    fn two_tiles() -> Mesh {
+        let v = |x: f32, y: f32| reetched_io::Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [x + 1.0, (y + 1.0) * 0.5],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
+        };
+        let vertices = vec![
+            v(-1.0, -1.0),
+            v(0.0, -1.0),
+            v(1.0, -1.0),
+            v(-1.0, 1.0),
+            v(0.0, 1.0),
+            v(1.0, 1.0),
+        ];
+        let indices = vec![0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4];
+        let mut mesh = Mesh {
+            vertices,
+            indices,
+            parts: vec![reetched_io::MeshPart {
+                material: "panel".into(),
+                indices: 0..12,
+            }],
+            has_uvs: true,
+        };
+        mesh.sort_by_udim();
+        mesh
+    }
+
+    fn center_pixel(h: &Harness) -> [u8; 3] {
+        let ([w, ht], px) = h.app.state.viewport.read_display(&h.device, &h.queue);
+        let i = ((ht / 2 * w + w / 2) * 4) as usize;
+        [px[i], px[i + 1], px[i + 2]]
+    }
+
+    #[test]
+    fn udim_sets_paint_and_export_per_tile() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.set_mesh(two_tiles(), "panel".into(), None);
+        let s = &mut h.app.state;
+        let tiles: Vec<u32> = s.doc.texture_sets[0]
+            .udim
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(tiles, [1001, 1002]);
+        assert_eq!(s.viewport.tiles(0), [1001, 1002]);
+        s.doc.texture_sets[0].resolution = 256;
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        // Polygon Fill on the whole mesh paints both tiles.
+        let rect = h.app.state.view3d_rect;
+        h.app.state.tool = Tool::PolygonFill;
+        h.app.state.polygon_mode = reetched_io::topology::Selection::Mesh;
+        h.click(rect.center());
+        let s = &h.app.state;
+        let NodeKind::Paint(p) = &s.doc.texture_sets[0].stack[0].kind else {
+            panic!("paint layer")
+        };
+        assert!(
+            p.map(1001, Channel::BaseColor)
+                .is_some_and(|m| !m.tiles.is_empty())
+        );
+        assert!(
+            p.map(1002, Channel::BaseColor)
+                .is_some_and(|m| !m.tiles.is_empty())
+        );
+        // Each tile composites on its own.
+        for tile in [1001, 1002] {
+            let d = s.viewport.read_back(&h.device, &h.queue, 0, tile).unwrap();
+            assert!(
+                d.coverage.iter().filter(|c| **c).count() > 1000,
+                "tile {tile}"
+            );
+        }
+
+        // Textures come out per tile; the mesh references them through <UDIM>.
+        let dir = std::env::temp_dir().join("reetched-udim-export");
+        let _ = std::fs::remove_dir_all(&dir);
+        h.app.state.export.dir = dir.display().to_string();
+        h.app.state.export.include = vec![true];
+        h.app.state.export.mesh_format = crate::stack_ui::MeshFormat::Usda;
+        h.app.state.export_mesh();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for want in ["_BaseColor.1001.png", "_BaseColor.1002.png"] {
+            assert!(
+                names.iter().any(|n| n.ends_with(want)),
+                "{want} in {names:?}"
+            );
+        }
+        let usda = names.iter().find(|n| n.ends_with(".usda")).unwrap();
+        let text = std::fs::read_to_string(dir.join(usda)).unwrap();
+        assert!(text.contains("_BaseColor.<UDIM>.png"), "{text}");
+
+        // Baking runs per tile.
+        let settings = reetched_bake::Settings {
+            resolution: 64,
+            maps: vec![reetched_bake::MapKind::Position],
+            ..Default::default()
+        };
+        let mesh = h.app.state.mesh.clone();
+        let maps =
+            reetched_bake::bake(&mesh, 0, 1002, None, &settings, &Default::default()).unwrap();
+        let (_, img) = &maps[0];
+        // Tile 1002 holds the x > 0 half: its baked positions lean to +x.
+        let mid = &img.pixels[(32 * 64 + 32) as usize];
+        assert!(mid[0] > 0.5, "position map of the right half: {mid:?}");
+    }
+
+    #[test]
+    fn shader_models_ocio_and_painter_shaders_render() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.doc.texture_sets[0].resolution = 128;
+        let mut fill = reetched_doc::Fill::new([0.05, 0.05, 0.05], 0.0, 0.9);
+        for (c, v) in [
+            (Channel::Coat, [1.0; 3]),
+            (Channel::CoatRoughness, [0.02; 3]),
+        ] {
+            let src = fill.channels.get_mut(&c).unwrap();
+            src.enabled = true;
+            src.value = v;
+        }
+        let node = h.app.state.doc.new_fill("coated".into(), fill);
+        h.app.state.doc.texture_sets[0].stack = vec![node];
+        h.app.state.render.accumulate = false;
+        for _ in 0..4 {
+            h.frame(vec![]);
+        }
+        let plain = center_pixel(&h);
+
+        // ASM with its channels: the coat adds a sharp reflection on the dark rough base.
+        let set = &mut h.app.state.doc.texture_sets[0];
+        set.shader = reetched_doc::ShaderModel::Asm;
+        set.extra_channels = reetched_doc::ShaderModel::Asm.channels().to_vec();
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let coated = center_pixel(&h);
+        let sum = |p: [u8; 3]| p.iter().map(|&v| v as u32).sum::<u32>();
+        assert!(
+            sum(coated) > sum(plain) + 10,
+            "coat: {plain:?} → {coated:?}"
+        );
+        // OpenPBR shades too.
+        h.app.state.doc.texture_sets[0].shader = reetched_doc::ShaderModel::OpenPbr;
+        h.frame(vec![]);
+        h.frame(vec![]);
+
+        // An OCIO display transform (ACES 2.0 SDR) is baked into the LUT.
+        let (name, _) = reetched_color::builtin_configs()
+            .iter()
+            .find(|(n, _)| n.contains("aces-v2.0"))
+            .unwrap();
+        let config = reetched_color::Config::builtin(name).unwrap();
+        h.app.state.color.ocio = Some(crate::color_ui::Ocio::new(
+            config,
+            format!("builtin:{name}"),
+        ));
+        h.app.state.apply_ocio();
+        assert_eq!(h.app.state.render.tone_map, crate::viewport::ToneMap::Ocio);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let aces2 = center_pixel(&h);
+        assert!(sum(aces2) > 0, "the display transform shows something");
+
+        // A Painter shader: the toon example from the translator's tests.
+        let toon = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../reetched-shader/tests/shaders/toon_unlit.glsl");
+        h.app.state.load_custom_shader_file(&toon);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let reetched_doc::ShaderModel::Custom { shader, .. } =
+            h.app.state.doc.texture_sets[0].shader.clone()
+        else {
+            panic!("custom shader set")
+        };
+        match h.app.state.viewport.custom_shader(&shader) {
+            Some(Ok(c)) => assert!(c.shader.params.iter().any(|p| p.name == "bands")),
+            Some(Err(e)) => panic!("toon shader: {e}"),
+            None => panic!("not compiled"),
+        }
+        let toon_px = center_pixel(&h);
+        assert_ne!(toon_px, aces2, "the custom shader draws the mesh");
+    }
+
+    #[test]
+    fn transparency_scattering_and_depth_of_field_render() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let set_fill = |h: &mut Harness, opacity: f32, scatter: f32| {
+            let mut fill = reetched_doc::Fill::new([0.9, 0.2, 0.1], 0.0, 0.5);
+            for (c, v) in [
+                (Channel::Opacity, [opacity; 3]),
+                (Channel::Scattering, [scatter; 3]),
+            ] {
+                let src = fill.channels.get_mut(&c).unwrap();
+                src.enabled = true;
+                src.value = v;
+            }
+            let node = h.app.state.doc.new_fill("test".into(), fill);
+            let set = &mut h.app.state.doc.texture_sets[0];
+            set.resolution = 128;
+            set.stack = vec![node];
+            set.shader = reetched_doc::ShaderModel::Asm;
+            set.extra_channels = vec![Channel::Scattering, Channel::ScatteringColor];
+            for _ in 0..4 {
+                h.frame(vec![]);
+            }
+        };
+        h.app.state.render.accumulate = false;
+        set_fill(&mut h, 1.0, 0.0);
+        let opaque = center_pixel(&h);
+        // Half transparent, blended: between the surface and the background.
+        h.app.state.render.alpha = crate::viewport::AlphaMode::Blend;
+        set_fill(&mut h, 0.5, 0.0);
+        let half = center_pixel(&h);
+        assert!(
+            half[0] < opaque[0] && half[0] > 0x26,
+            "blended: {opaque:?} → {half:?}"
+        );
+        // Scattering on and off light the surface about the same overall.
+        h.app.state.render.alpha = crate::viewport::AlphaMode::Opaque;
+        set_fill(&mut h, 1.0, 1.0);
+        let with_sss = center_pixel(&h);
+        assert!(
+            with_sss[0] > 0x40,
+            "scattered light reaches the screen: {with_sss:?}"
+        );
+        // Depth of field accumulates lens samples.
+        h.app.state.render.accumulate = true;
+        h.app.state.render.dof = true;
+        h.app.state.render.aperture = 0.1;
+        for _ in 0..8 {
+            h.frame(vec![]);
+        }
+        assert!(h.app.state.viewport.accumulating(&h.app.state.render));
+    }
+
+    #[test]
+    fn loop_ribbon_filled_path_dynamics_and_text() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.set_mesh(cube(4, 0.0), "cube".into(), None);
+        h.app.state.doc.texture_sets[0].resolution = 256;
+        h.app.state.camera.yaw = 0.0;
+        h.app.state.camera.pitch = 0.0;
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let rect = h.app.state.view3d_rect;
+        let painted = |h: &Harness| -> usize {
+            let s = &h.app.state;
+            let NodeKind::Paint(p) = &s.doc.texture_sets[0].stack[0].kind else {
+                panic!("paint layer")
+            };
+            p.channels.get(&Channel::BaseColor).map_or(0, |m| {
+                (0..256 * 256)
+                    .filter(|k| m.texel(&s.resources, k % 256, k / 256)[3] > 0.5)
+                    .count()
+            })
+        };
+        let undo = |h: &mut Harness| {
+            h.app.state.history.undo(&mut h.app.state.doc);
+            h.frame(vec![]);
+        };
+
+        // Loop: a ring of quads around the cube, many times one triangle.
+        h.app.state.tool = Tool::PolygonFill;
+        h.app.state.polygon_mode = reetched_io::topology::Selection::Triangle;
+        h.click(rect.center() + vec2(5.0, 5.0));
+        let one = painted(&h);
+        assert!(one > 0);
+        undo(&mut h);
+        h.app.state.polygon_mode = reetched_io::topology::Selection::Loop;
+        h.click(rect.center() + vec2(5.0, 5.0));
+        let ring = painted(&h);
+        // 4 quads per face × 4 faces = 32 triangles.
+        assert!(ring >= one * 24, "loop {ring} vs triangle {one}");
+        undo(&mut h);
+
+        // Ribbon, filled and smudge paths.
+        h.app.state.tool = Tool::Path;
+        for mode in [
+            crate::tools_ui::PathMode::Ribbon,
+            crate::tools_ui::PathMode::Fill,
+        ] {
+            h.app.state.path_mode = mode;
+            for d in [vec2(-60.0, -40.0), vec2(60.0, -40.0), vec2(0.0, 60.0)] {
+                h.click(rect.center() + d);
+            }
+            h.key(egui::Key::Enter);
+            assert!(painted(&h) > 0, "{mode:?} painted");
+            undo(&mut h);
+        }
+
+        // A dynamic stroke scatters dabs around the stroke.
+        h.app.state.tool = Tool::Paint;
+        h.app.state.brush.dynamics = Some(crate::dynamics::Dynamics::presets()[0].clone());
+        h.stroke(
+            rect.center() - vec2(30.0, 0.0),
+            rect.center() + vec2(30.0, 0.0),
+        );
+        assert!(painted(&h) > 0, "dynamic stroke painted");
+
+        // Text as a fill bitmap.
+        let svg = crate::images::text_svg(&crate::images::TextStyle {
+            text: "Hi".into(),
+            family: "Ubuntu".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let s = &mut h.app.state;
+        let node = s
+            .doc
+            .new_fill("text".into(), reetched_doc::Fill::new([0.0; 3], 0.0, 0.5));
+        let id = node.id;
+        s.doc.texture_sets[0].stack.insert(0, node);
+        let rid = s.resources.add(svg.into_bytes());
+        s.doc.resources.insert(
+            rid.clone(),
+            reetched_doc::ResourceInfo {
+                name: "Text.svg".into(),
+            },
+        );
+        let ctx = h.ctx.clone();
+        h.app.state.use_resource(
+            crate::text_ui::TextTarget::Fill(id, Channel::BaseColor),
+            rid,
+            &ctx,
+        );
+        h.frame(vec![]);
+        let d = h
+            .app
+            .state
+            .viewport
+            .read_back(&h.device, &h.queue, 0, reetched_doc::FIRST_UDIM)
+            .unwrap();
+        let white = d
+            .base_color
+            .iter()
+            .zip(&d.coverage)
+            .filter(|(c, cov)| **cov && c[0] > 0.8)
+            .count();
+        assert!(white > 50, "the text shows up white: {white}");
     }
 }

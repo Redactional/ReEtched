@@ -14,9 +14,13 @@ use std::collections::BTreeMap;
 /// Current `.retx` format version. Bump it and add a migration when the layout changes.
 /// v2: paint layers and painted masks.
 /// v3: mesh maps and mask effects.
-pub const FORMAT_VERSION: u32 = 4;
+/// v4: emissive and opacity, procedural fills.
+/// v5: extra channels, shader models, UDIM tiles, warp projections, OCIO bitmap spaces.
+pub const FORMAT_VERSION: u32 = 5;
 
-/// Texture channels of the metal/roughness workflow.
+/// Texture channels. The first seven (metal/roughness) every texture set has;
+/// the rest are added per texture set for the richer shader models.
+/// Append new channels at the end: paint data is keyed by position in `ALL`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Channel {
     BaseColor,
@@ -26,10 +30,31 @@ pub enum Channel {
     Height,
     Emissive,
     Opacity,
+    /// Dielectric reflectivity; 0.5 = 4 % (IOR 1.5).
+    SpecularLevel,
+    /// Specular tint (Painter's specular edge color, OpenPBR's specular color).
+    SpecularColor,
+    Anisotropy,
+    /// 0..1 = 0..360°.
+    AnisotropyAngle,
+    Transmission,
+    /// Subsurface scattering amount.
+    Scattering,
+    ScatteringColor,
+    Coat,
+    CoatColor,
+    CoatRoughness,
+    Sheen,
+    SheenColor,
+    SheenRoughness,
+    /// Painted ambient occlusion, multiplied with the baked one.
+    AmbientOcclusion,
 }
 
-impl Channel {
-    pub const ALL: [Channel; 7] = [
+/// Channels the compositor evaluates together in one pass (`compositor.wgsl`).
+/// Group 0 has the core layout; groups 1 and 2 are two colors, then five scalars.
+pub const CHANNEL_GROUPS: [[Channel; 7]; 3] = [
+    [
         Channel::BaseColor,
         Channel::Metallic,
         Channel::Roughness,
@@ -37,7 +62,73 @@ impl Channel {
         Channel::Height,
         Channel::Emissive,
         Channel::Opacity,
+    ],
+    [
+        Channel::SpecularColor,
+        Channel::ScatteringColor,
+        Channel::SpecularLevel,
+        Channel::Anisotropy,
+        Channel::AnisotropyAngle,
+        Channel::Transmission,
+        Channel::Scattering,
+    ],
+    [
+        Channel::CoatColor,
+        Channel::SheenColor,
+        Channel::Coat,
+        Channel::CoatRoughness,
+        Channel::Sheen,
+        Channel::SheenRoughness,
+        Channel::AmbientOcclusion,
+    ],
+];
+
+impl Channel {
+    pub const ALL: [Channel; 21] = [
+        Channel::BaseColor,
+        Channel::Metallic,
+        Channel::Roughness,
+        Channel::Normal,
+        Channel::Height,
+        Channel::Emissive,
+        Channel::Opacity,
+        Channel::SpecularLevel,
+        Channel::SpecularColor,
+        Channel::Anisotropy,
+        Channel::AnisotropyAngle,
+        Channel::Transmission,
+        Channel::Scattering,
+        Channel::ScatteringColor,
+        Channel::Coat,
+        Channel::CoatColor,
+        Channel::CoatRoughness,
+        Channel::Sheen,
+        Channel::SheenColor,
+        Channel::SheenRoughness,
+        Channel::AmbientOcclusion,
     ];
+
+    /// The channels every texture set has.
+    pub const CORE: [Channel; 7] = CHANNEL_GROUPS[0];
+
+    pub fn is_core(self) -> bool {
+        self.index() < 7
+    }
+
+    /// Position in `ALL`.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// (group, slot) in `CHANNEL_GROUPS`.
+    pub fn group_slot(self) -> (usize, usize) {
+        for (g, group) in CHANNEL_GROUPS.iter().enumerate() {
+            if let Some(s) = group.iter().position(|&c| c == self) {
+                return (g, s);
+            }
+        }
+        unreachable!("every channel is in a group")
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -48,18 +139,71 @@ impl Channel {
             Channel::Height => "Height",
             Channel::Emissive => "Emissive",
             Channel::Opacity => "Opacity",
+            Channel::SpecularLevel => "Specular level",
+            Channel::SpecularColor => "Specular color",
+            Channel::Anisotropy => "Anisotropy",
+            Channel::AnisotropyAngle => "Anisotropy angle",
+            Channel::Transmission => "Transmission",
+            Channel::Scattering => "Scattering",
+            Channel::ScatteringColor => "Scattering color",
+            Channel::Coat => "Coat",
+            Channel::CoatColor => "Coat color",
+            Channel::CoatRoughness => "Coat roughness",
+            Channel::Sheen => "Sheen",
+            Channel::SheenColor => "Sheen color",
+            Channel::SheenRoughness => "Sheen roughness",
+            Channel::AmbientOcclusion => "Ambient occlusion",
         }
+    }
+
+    /// Lower-case id, as Painter names its channels (bridge bundles, shaders).
+    pub fn id(self) -> &'static str {
+        match self {
+            Channel::BaseColor => "basecolor",
+            Channel::Metallic => "metallic",
+            Channel::Roughness => "roughness",
+            Channel::Normal => "normal",
+            Channel::Height => "height",
+            Channel::Emissive => "emissive",
+            Channel::Opacity => "opacity",
+            Channel::SpecularLevel => "specularlevel",
+            Channel::SpecularColor => "specularedgecolor",
+            Channel::Anisotropy => "anisotropylevel",
+            Channel::AnisotropyAngle => "anisotropyangle",
+            Channel::Transmission => "transmissive",
+            Channel::Scattering => "scattering",
+            Channel::ScatteringColor => "scatteringcolor",
+            Channel::Coat => "coatopacity",
+            Channel::CoatColor => "coatcolor",
+            Channel::CoatRoughness => "coatroughness",
+            Channel::Sheen => "sheenopacity",
+            Channel::SheenColor => "sheencolor",
+            Channel::SheenRoughness => "sheenroughness",
+            Channel::AmbientOcclusion => "ambientocclusion",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Channel> {
+        let id = id.to_ascii_lowercase();
+        Channel::ALL.into_iter().find(|c| c.id() == id)
     }
 
     /// Three-component channels; the rest use only `x`.
     pub fn is_vector(self) -> bool {
         matches!(
             self,
-            Channel::BaseColor | Channel::Normal | Channel::Emissive
+            Channel::BaseColor
+                | Channel::Normal
+                | Channel::Emissive
+                | Channel::SpecularColor
+                | Channel::ScatteringColor
+                | Channel::CoatColor
+                | Channel::SheenColor
         )
     }
 
     /// Value of an empty layer stack (base color is linear RGB, normal is tangent space).
+    /// Must match `empty()` and the group defaults the compositor clears to.
     pub fn empty_value(self) -> [f32; 3] {
         match self {
             Channel::BaseColor => [0.214, 0.214, 0.214], // sRGB 128 grey, like Painter
@@ -69,12 +213,21 @@ impl Channel {
             Channel::Height => [0.0; 3],
             Channel::Emissive => [0.0; 3],
             Channel::Opacity => [1.0; 3],
+            Channel::SpecularLevel => [0.5; 3],
+            Channel::SpecularColor | Channel::ScatteringColor => [1.0; 3],
+            Channel::Anisotropy | Channel::AnisotropyAngle => [0.0; 3],
+            Channel::Transmission | Channel::Scattering => [0.0; 3],
+            Channel::Coat | Channel::Sheen => [0.0; 3],
+            Channel::CoatColor | Channel::SheenColor => [1.0; 3],
+            Channel::CoatRoughness => [0.1; 3],
+            Channel::SheenRoughness => [0.3; 3],
+            Channel::AmbientOcclusion => [1.0; 3],
         }
     }
 
     /// Color channels hold linear RGB (and are sRGB-encoded in 8/16-bit images).
     pub fn is_color(self) -> bool {
-        matches!(self, Channel::BaseColor | Channel::Emissive)
+        self.is_vector() && self != Channel::Normal
     }
 
     /// Painter's default blend mode for a new layer in this channel.
@@ -353,7 +506,73 @@ impl TileMap {
 /// A paint layer: hand-painted texels per channel.
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
 pub struct Paint {
+    /// UDIM tile 1001 (the only tile of a non-UDIM texture set).
     pub channels: BTreeMap<Channel, TileMap>,
+    /// Other UDIM tiles, by tile number.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub udim: BTreeMap<u32, BTreeMap<Channel, TileMap>>,
+}
+
+impl Paint {
+    pub fn map(&self, tile: u32, c: Channel) -> Option<&TileMap> {
+        if tile == FIRST_UDIM {
+            self.channels.get(&c)
+        } else {
+            self.udim.get(&tile)?.get(&c)
+        }
+    }
+
+    pub fn set_map(&mut self, tile: u32, c: Channel, map: TileMap) {
+        if tile == FIRST_UDIM {
+            self.channels.insert(c, map);
+        } else {
+            self.udim.entry(tile).or_default().insert(c, map);
+        }
+    }
+
+    /// Every painted map: (tile, channel, map).
+    pub fn maps(&self) -> impl Iterator<Item = (u32, Channel, &TileMap)> {
+        let first = self.channels.iter().map(|(c, m)| (FIRST_UDIM, *c, m));
+        let rest = self
+            .udim
+            .iter()
+            .flat_map(|(t, maps)| maps.iter().map(move |(c, m)| (*t, *c, m)));
+        first.chain(rest)
+    }
+
+    pub fn maps_mut(&mut self) -> impl Iterator<Item = &mut TileMap> {
+        self.channels
+            .values_mut()
+            .chain(self.udim.values_mut().flat_map(|m| m.values_mut()))
+    }
+}
+
+/// UDIM numbering: tile 1001 covers UV 0..1; +1 per unit in u (10 per row), +10 per unit in v.
+pub const FIRST_UDIM: u32 = 1001;
+
+/// The UDIM tile containing `uv`.
+pub fn udim_of(uv: [f32; 2]) -> u32 {
+    let u = (uv[0].floor() as i64).clamp(0, 9) as u32;
+    let v = (uv[1].floor() as i64).clamp(0, 99) as u32;
+    FIRST_UDIM + u + 10 * v
+}
+
+/// UV of tile `number`'s lower-left corner.
+pub fn udim_origin(number: u32) -> [f32; 2] {
+    let k = number.saturating_sub(FIRST_UDIM);
+    [(k % 10) as f32, (k / 10) as f32]
+}
+
+/// One UDIM tile of a texture set.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct UdimTile {
+    pub number: u32,
+    /// Optional name shown next to the number.
+    #[serde(default)]
+    pub name: String,
+    /// Texture size for this tile; `None` uses the texture set's.
+    #[serde(default)]
+    pub resolution: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -363,15 +582,21 @@ pub enum ProjectionMode {
     Planar,
     Spherical,
     Cylindrical,
+    /// UV projection through a deformable 4×4 lattice (`Projection::warp`).
+    Warp,
+    /// UV projection using the mesh's second UV set.
+    UvSet2,
 }
 
 impl ProjectionMode {
-    pub const ALL: [ProjectionMode; 5] = [
+    pub const ALL: [ProjectionMode; 7] = [
         ProjectionMode::Uv,
         ProjectionMode::Triplanar,
         ProjectionMode::Planar,
         ProjectionMode::Spherical,
         ProjectionMode::Cylindrical,
+        ProjectionMode::Warp,
+        ProjectionMode::UvSet2,
     ];
 
     pub fn label(self) -> &'static str {
@@ -381,8 +606,23 @@ impl ProjectionMode {
             ProjectionMode::Planar => "Planar projection",
             ProjectionMode::Spherical => "Spherical projection",
             ProjectionMode::Cylindrical => "Cylindrical projection",
+            ProjectionMode::Warp => "Warp projection",
+            ProjectionMode::UvSet2 => "UV set to UV set projection",
         }
     }
+
+    /// Placed by UV coordinates (scale/rotation/offset) rather than in 3D.
+    pub fn is_uv(self) -> bool {
+        matches!(
+            self,
+            ProjectionMode::Uv | ProjectionMode::Warp | ProjectionMode::UvSet2
+        )
+    }
+}
+
+/// The identity 4×4 warp lattice: row-major, row 0 at v = 0.
+pub fn warp_identity() -> [[f32; 2]; 16] {
+    std::array::from_fn(|k| [(k % 4) as f32 / 3.0, (k / 4) as f32 / 3.0])
 }
 
 /// How bitmaps are mapped onto the mesh (Painter's fill projection).
@@ -403,6 +643,9 @@ pub struct Projection {
     /// Fill symmetry: mirror the projection across the object's X, Y, Z = 0 planes.
     #[serde(default)]
     pub mirror: [bool; 3],
+    /// Warp projection lattice points in UV space (see `warp_identity`).
+    #[serde(default = "warp_identity")]
+    pub warp: [[f32; 2]; 16],
 }
 
 impl Default for Projection {
@@ -417,6 +660,7 @@ impl Default for Projection {
             rotation3d_deg: [0.0; 3],
             size: 1.0,
             mirror: [false; 3],
+            warp: warp_identity(),
         }
     }
 }
@@ -463,6 +707,10 @@ pub struct ChannelSource {
     pub bitmap: Option<ResourceId>,
     #[serde(default)]
     pub color_space: ColorSpace,
+    /// An OCIO color space the bitmap is in (overrides `color_space` while an
+    /// OCIO config is loaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocio: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -546,6 +794,7 @@ impl Fill {
             value,
             bitmap: None,
             color_space: ColorSpace::Auto,
+            ocio: None,
         };
         let channels = Channel::ALL
             .into_iter()
@@ -803,6 +1052,9 @@ pub struct Mask {
     /// Generators, levels, … applied after the background/bitmap, before the paint.
     #[serde(default)]
     pub effects: Vec<MaskEffect>,
+    /// Painted texels of UDIM tiles other than 1001.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub udim_paint: BTreeMap<u32, TileMap>,
 }
 
 impl Mask {
@@ -815,7 +1067,33 @@ impl Mask {
             invert: false,
             paint: None,
             effects: Vec::new(),
+            udim_paint: BTreeMap::new(),
         }
+    }
+
+    pub fn paint_for(&self, tile: u32) -> Option<&TileMap> {
+        if tile == FIRST_UDIM {
+            self.paint.as_ref()
+        } else {
+            self.udim_paint.get(&tile)
+        }
+    }
+
+    pub fn set_paint(&mut self, tile: u32, map: TileMap) {
+        if tile == FIRST_UDIM {
+            self.paint = Some(map);
+        } else {
+            self.udim_paint.insert(tile, map);
+        }
+    }
+
+    /// Every painted map, any tile.
+    pub fn paint_maps(&self) -> impl Iterator<Item = &TileMap> {
+        self.paint.iter().chain(self.udim_paint.values())
+    }
+
+    pub fn paint_maps_mut(&mut self) -> impl Iterator<Item = &mut TileMap> {
+        self.paint.iter_mut().chain(self.udim_paint.values_mut())
     }
 }
 
@@ -837,6 +1115,9 @@ pub struct Node {
     pub blend: BTreeMap<Channel, ChannelBlend>,
     pub mask: Option<Mask>,
     pub kind: NodeKind,
+    /// Geometry mask by UDIM tile: the layer only applies to these tiles (empty = all).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udim_mask: Vec<u32>,
 }
 
 impl Node {
@@ -860,7 +1141,13 @@ impl Node {
             blend,
             mask: None,
             kind,
+            udim_mask: Vec::new(),
         }
+    }
+
+    /// Does the layer apply to UDIM tile `tile`?
+    pub fn on_tile(&self, tile: u32) -> bool {
+        self.udim_mask.is_empty() || self.udim_mask.contains(&tile)
     }
 
     pub fn blend(&self, c: Channel) -> ChannelBlend {
@@ -881,6 +1168,169 @@ pub struct TextureSet {
     /// Baked or imported mesh maps (image resources).
     #[serde(default)]
     pub mesh_maps: BTreeMap<MeshMap, ResourceId>,
+    /// Channels beyond the core seven this set has (Painter's texture set channel list).
+    #[serde(default)]
+    pub extra_channels: Vec<Channel>,
+    /// How the viewport shades this set.
+    #[serde(default)]
+    pub shader: ShaderModel,
+    /// UDIM tiles; empty for a set that only uses the 0..1 tile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udim: Vec<UdimTile>,
+    /// Mesh maps of UDIM tiles other than 1001.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub udim_mesh_maps: BTreeMap<u32, BTreeMap<MeshMap, ResourceId>>,
+}
+
+static NO_MAPS: BTreeMap<MeshMap, ResourceId> = BTreeMap::new();
+
+impl TextureSet {
+    pub fn new(name: String, stack: Vec<Node>) -> Self {
+        Self {
+            name,
+            resolution: 2048,
+            stack,
+            mesh_maps: BTreeMap::new(),
+            extra_channels: Vec::new(),
+            shader: ShaderModel::default(),
+            udim: Vec::new(),
+            udim_mesh_maps: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_udim(&self) -> bool {
+        !self.udim.is_empty()
+    }
+
+    /// The set's UDIM tile numbers (just 1001 for a regular set).
+    pub fn tiles(&self) -> Vec<u32> {
+        if self.udim.is_empty() {
+            vec![FIRST_UDIM]
+        } else {
+            self.udim.iter().map(|t| t.number).collect()
+        }
+    }
+
+    pub fn tile_resolution(&self, tile: u32) -> u32 {
+        self.udim
+            .iter()
+            .find(|t| t.number == tile)
+            .and_then(|t| t.resolution)
+            .unwrap_or(self.resolution)
+    }
+
+    pub fn mesh_maps_for(&self, tile: u32) -> &BTreeMap<MeshMap, ResourceId> {
+        if tile == FIRST_UDIM {
+            &self.mesh_maps
+        } else {
+            self.udim_mesh_maps.get(&tile).unwrap_or(&NO_MAPS)
+        }
+    }
+
+    pub fn mesh_maps_for_mut(&mut self, tile: u32) -> &mut BTreeMap<MeshMap, ResourceId> {
+        if tile == FIRST_UDIM {
+            &mut self.mesh_maps
+        } else {
+            self.udim_mesh_maps.entry(tile).or_default()
+        }
+    }
+
+    /// Display name of a tile: "1002" or "1002 Head".
+    pub fn tile_label(&self, tile: u32) -> String {
+        match self.udim.iter().find(|t| t.number == tile) {
+            Some(t) if !t.name.is_empty() => format!("{} {}", t.number, t.name),
+            _ => tile.to_string(),
+        }
+    }
+
+    /// The set's channels: the core seven, then its extra channels, in `Channel::ALL` order.
+    pub fn channels(&self) -> Vec<Channel> {
+        Channel::ALL
+            .into_iter()
+            .filter(|&c| self.has_channel(c))
+            .collect()
+    }
+
+    pub fn has_channel(&self, c: Channel) -> bool {
+        c.is_core() || self.extra_channels.contains(&c)
+    }
+
+    /// Does channel group `g` (see `CHANNEL_GROUPS`) need compositing?
+    pub fn uses_group(&self, g: usize) -> bool {
+        g == 0
+            || CHANNEL_GROUPS[g]
+                .iter()
+                .any(|c| self.extra_channels.contains(c))
+    }
+}
+
+/// How the viewport shades a texture set.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum ShaderModel {
+    /// Metal/roughness PBR (Painter's classic default).
+    #[default]
+    MetalRough,
+    /// Adobe Standard Material: specular level, edge color, anisotropy, coat, sheen,
+    /// scattering, transmission.
+    Asm,
+    /// OpenPBR Surface 1.1 (Painter's current default).
+    OpenPbr,
+    /// A Painter-style GLSL shader (a resource), with its parameter values.
+    Custom {
+        shader: ResourceId,
+        name: String,
+        #[serde(default)]
+        params: BTreeMap<String, Vec<f32>>,
+        #[serde(default)]
+        textures: BTreeMap<String, ResourceId>,
+    },
+}
+
+impl ShaderModel {
+    pub fn label(&self) -> String {
+        match self {
+            ShaderModel::MetalRough => "PBR Metal/Rough".into(),
+            ShaderModel::Asm => "Adobe Standard Material".into(),
+            ShaderModel::OpenPbr => "OpenPBR".into(),
+            ShaderModel::Custom { name, .. } => name.clone(),
+        }
+    }
+
+    /// Extra channels the model reads.
+    pub fn channels(&self) -> &'static [Channel] {
+        use Channel::*;
+        match self {
+            ShaderModel::MetalRough | ShaderModel::Custom { .. } => &[AmbientOcclusion],
+            ShaderModel::Asm | ShaderModel::OpenPbr => &[
+                SpecularLevel,
+                SpecularColor,
+                Anisotropy,
+                AnisotropyAngle,
+                Transmission,
+                Scattering,
+                ScatteringColor,
+                Coat,
+                CoatColor,
+                CoatRoughness,
+                Sheen,
+                SheenColor,
+                SheenRoughness,
+                AmbientOcclusion,
+            ],
+        }
+    }
+
+    /// Resources the model references.
+    pub fn resource_ids(&self) -> Vec<ResourceId> {
+        match self {
+            ShaderModel::Custom {
+                shader, textures, ..
+            } => std::iter::once(shader.clone())
+                .chain(textures.values().cloned())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 pub const RESOLUTIONS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
@@ -908,12 +1358,8 @@ impl Document {
         for name in texture_set_names {
             // Like a new Painter project: one empty paint layer.
             let layer = doc.new_paint("Layer 1".into());
-            doc.texture_sets.push(TextureSet {
-                name: name.clone(),
-                resolution: 2048,
-                stack: vec![layer],
-                mesh_maps: BTreeMap::new(),
-            });
+            doc.texture_sets
+                .push(TextureSet::new(name.clone(), vec![layer]));
         }
         doc
     }
@@ -932,12 +1378,12 @@ impl Document {
     pub fn tile_ids(&self) -> std::collections::BTreeSet<TileId> {
         fn walk(nodes: &[Node], out: &mut std::collections::BTreeSet<TileId>) {
             for n in nodes {
-                if let Some(p) = n.mask.as_ref().and_then(|m| m.paint.as_ref()) {
+                for p in n.mask.iter().flat_map(|m| m.paint_maps()) {
                     out.extend(p.tiles.values().cloned());
                 }
                 match &n.kind {
                     NodeKind::Paint(p) => {
-                        for map in p.channels.values() {
+                        for (_, _, map) in p.maps() {
                             out.extend(map.tiles.values().cloned());
                         }
                     }

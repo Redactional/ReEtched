@@ -12,6 +12,7 @@ use egui::{Color32, ComboBox, Rect, RichText, Slider, Stroke, Ui, vec2};
 use egui_material_icons::icons as ic;
 use glam::{Mat4, Vec2};
 use reetched_doc::{Channel, NodeId, NodeKind, TileMap, find_node, find_node_mut};
+use std::collections::BTreeMap;
 
 /// A stroke in progress.
 pub struct ActiveStroke {
@@ -23,6 +24,12 @@ pub struct ActiveStroke {
     shape: BrushShape,
     /// Smudge: UV under the brush at the end of the last frame.
     last_uv: Option<Vec2>,
+    /// Dynamic stroke: the compiled expressions, stamps so far, distance (brush
+    /// diameters) and the last stamp's screen point.
+    dynamics: Option<crate::dynamics::Compiled>,
+    stamps: u32,
+    travelled: f32,
+    last_point: Option<Vec2>,
 }
 
 impl State {
@@ -188,10 +195,10 @@ impl State {
         let Some(set) = self.doc.texture_sets.get(set_index) else {
             return false;
         };
-        let res = set.resolution;
         let Some(node) = find_node(&set.stack, sel.node) else {
             return false;
         };
+        let tiles = self.viewport.tiles(set_index);
         let mut targets = Vec::new();
         if sel.mask {
             let Some(mask) = &node.mask else { return false };
@@ -200,7 +207,10 @@ impl State {
                 value: [self.brush.mask_value; 3],
                 is_normal: false,
                 projected: project,
-                old: mask.paint.clone().unwrap_or_else(|| TileMap::new(res)),
+                old: tiles
+                    .iter()
+                    .filter_map(|&t| Some((t, mask.paint_for(t)?.clone())))
+                    .collect(),
             });
         } else {
             let NodeKind::Paint(paint) = &node.kind else {
@@ -210,12 +220,15 @@ impl State {
                 ));
                 return false;
             };
-            for (i, c) in Channel::ALL.into_iter().enumerate() {
-                let existing = paint.channels.get(&c);
+            for c in set.channels() {
+                let existing: BTreeMap<u32, TileMap> = tiles
+                    .iter()
+                    .filter_map(|&t| Some((t, paint.map(t, c)?.clone())))
+                    .collect();
                 let brush = &self.brush.channels[&c];
                 // The eraser clears every channel the layer has; the brush paints its enabled ones.
                 let wanted = if erase {
-                    existing.is_some_and(|m| !m.tiles.is_empty())
+                    existing.values().any(|m| !m.tiles.is_empty())
                 } else {
                     // The projected image always goes into base color.
                     brush.enabled || (project && c == Channel::BaseColor)
@@ -228,11 +241,11 @@ impl State {
                     value = glam::Vec3::from(value).normalize_or(glam::Vec3::Z).into();
                 }
                 targets.push(StrokeTarget {
-                    key: (node.id, i as u8),
+                    key: (node.id, c.index() as u8),
                     value,
                     is_normal: c == Channel::Normal,
                     projected: project && c == Channel::BaseColor,
-                    old: existing.cloned().unwrap_or_else(|| TileMap::new(res)),
+                    old: existing,
                 });
             }
         }
@@ -252,16 +265,18 @@ impl State {
             alpha,
         };
         let node_id = node.id;
-        self.viewport.paint_begin(
-            &self.device,
-            &self.queue,
-            targets,
-            res,
-            &self.resources,
-            mode,
-            self.brush.opacity,
-        );
-        if project && !self.project_stencil(set_index) {
+        let set = set.clone();
+        let dynamics = match self.brush.dynamics.as_ref().map(|d| d.compile()) {
+            Some(Ok(c)) => Some(c),
+            Some(Err(e)) => {
+                self.warn(format!("Dynamic stroke: {e}"));
+                None
+            }
+            None => None,
+        };
+        self.viewport
+            .paint_begin(targets, &set, mode, self.brush.opacity);
+        if project && !self.project_stencil() {
             self.viewport
                 .paint_end(&self.device, &self.queue, &mut self.resources)
                 .ok();
@@ -274,34 +289,72 @@ impl State {
             path: StrokePath::default(),
             shape,
             last_uv: None,
+            dynamics,
+            stamps: 0,
+            travelled: 0.0,
+            last_point: None,
         });
         true
     }
 
     /// Turns stamp positions (screen points) into dabs and paints them.
     pub fn stamp(&mut self, points: &[Vec2], rect: Rect) {
-        let Some(stroke) = &self.stroke else { return };
+        self.stamp_with(points, rect, None);
+    }
+
+    /// `ribbon`: (path direction on screen, distance along the path in brush radii)
+    /// for ribbon dabs.
+    pub fn stamp_with(&mut self, points: &[Vec2], rect: Rect, ribbon: Option<(Vec2, f32)>) {
+        if self.stroke.is_none() {
+            return;
+        }
         if points.is_empty() {
             return;
         }
+        // Dynamic strokes turn each stamp into several dabs, each with its own brush.
+        let mut placed: Vec<(Vec2, crate::brush::Brush)> = Vec::new();
+        let stroke_mut = self.stroke.as_mut().expect("checked above");
+        for &p in points {
+            let dir = stroke_mut
+                .last_point
+                .map_or(Vec2::X, |l| (p - l).normalize_or(Vec2::X));
+            if let Some(l) = stroke_mut.last_point {
+                stroke_mut.travelled += p.distance(l) / (2.0 * self.brush.size.max(1.0));
+            }
+            stroke_mut.last_point = Some(p);
+            match (&stroke_mut.dynamics, ribbon) {
+                (Some(dynamics), None) => {
+                    let mods =
+                        dynamics.dabs(stroke_mut.stamps, stroke_mut.travelled, self.pressure);
+                    for m in mods {
+                        let r = self.brush.size;
+                        // x along the stroke, y across it.
+                        let off = dir * m.offset[0] * r + dir.perp() * m.offset[1] * r;
+                        let mut b = self.brush.clone();
+                        b.size *= m.size;
+                        b.angle_deg += m.angle_deg;
+                        b.flow *= m.flow;
+                        placed.push((p + off, b));
+                    }
+                }
+                _ => placed.push((p, self.brush.clone())),
+            }
+            stroke_mut.stamps += 1;
+        }
+        let stroke = self.stroke.as_ref().expect("checked above");
         let mut dabs: Vec<Dab> = Vec::new();
         let mut end_uv = None;
         if stroke.uv {
             let cam = &self.uv_camera;
-            for p in points {
+            for (p, brush) in &placed {
                 let uv =
                     cam.center + Vec2::new(p.x - rect.center().x, rect.center().y - p.y) / cam.zoom;
-                dabs.push(uv_dab(
-                    &self.brush,
-                    uv,
-                    self.brush.size / cam.zoom,
-                    self.pressure,
-                ));
+                dabs.push(uv_dab(brush, uv, brush.size / cam.zoom, self.pressure));
                 end_uv = Some(uv);
             }
         } else {
             let view = self.view_info(rect);
-            for p in points {
+            for (p, brush) in &placed {
                 let ndc = Vec2::new(
                     (p.x - rect.min.x) / rect.width() * 2.0 - 1.0,
                     1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
@@ -309,7 +362,21 @@ impl State {
                 let (origin, dir) = view_ray(view.view_proj, ndc);
                 if let Some(hit) = raycast(&self.mesh, origin, dir).filter(|h| h.part == stroke.set)
                 {
-                    dabs.extend(world_dabs(&self.brush, &view, &hit, self.pressure));
+                    let mut new = world_dabs(brush, &view, &hit, self.pressure);
+                    if let Some((d, arc)) = ribbon {
+                        // Brush x along the path; y across it (screen y points down).
+                        let right = (view.right * d.x - view.up * d.y).normalize_or(view.right);
+                        let up = (view.right * d.y + view.up * d.x).normalize_or(view.up);
+                        for dab in &mut new {
+                            dab.right_flow = right.extend(dab.right_flow[3]).into();
+                            dab.up_angle = up.extend(0.0).into();
+                            dab.view_flags[3] =
+                                (dab.view_flags[3] as u32 | crate::paint_gpu::DAB_RIBBON) as f32;
+                            dab.uv[3] = arc;
+                        }
+                        new.truncate(1); // ponytail: no symmetry for ribbons
+                    }
+                    dabs.extend(new);
                     end_uv = Some(hit.uv);
                 }
             }
@@ -354,6 +421,7 @@ impl State {
             &shape,
             &dabs,
             motion,
+            &self.resources,
         );
     }
 
@@ -380,13 +448,13 @@ impl State {
         else {
             return;
         };
-        for ((_, slot), map) in results {
+        for ((_, slot, tile), map) in results {
             if slot == MASK_SLOT {
                 if let Some(mask) = &mut node.mask {
-                    mask.paint = Some(map);
+                    mask.set_paint(tile, map);
                 }
             } else if let NodeKind::Paint(paint) = &mut node.kind {
-                paint.channels.insert(Channel::ALL[slot as usize], map);
+                paint.set_map(tile, Channel::ALL[slot as usize], map);
             }
         }
     }
@@ -412,7 +480,7 @@ impl State {
             .mesh_maps
             .get(&reetched_doc::MeshMap::Id)
             .and_then(|id| self.resources.files.get(id))
-            .and_then(|b| image::load_from_memory(b).ok())
+            .and_then(|b| crate::images::decode(b).ok())
             .map(|i| i.to_rgb32f())
         else {
             self.warn("This texture set has no ID map — bake one first".into());
@@ -466,7 +534,13 @@ impl State {
     pub fn brush_ui(&mut self, ui: &mut Ui) {
         let target = self.paint_target_label();
         let names = self.doc.resources.clone();
+        let channels = self
+            .doc
+            .texture_sets
+            .get(self.selected_part)
+            .map_or_else(|| Channel::CORE.to_vec(), |s| s.channels());
         let mut pick_alpha = false;
+        let mut text_alpha = false;
         ui.label(theme::header(match self.tool {
             Tool::Eraser => "ERASER",
             Tool::PolygonFill => "POLYGON FILL",
@@ -551,12 +625,62 @@ impl State {
                                 {
                                     pick_alpha = true;
                                 }
+                                if icon_button(
+                                    ui,
+                                    ic::ICON_TEXT_FIELDS,
+                                    false,
+                                    "Use text as the brush shape…",
+                                )
+                                .clicked()
+                                {
+                                    text_alpha = true;
+                                }
                             }
                         });
                         ui.end_row();
                         ui.label("Symmetry");
                         symmetry_ui(ui, &mut b.symmetry);
                         ui.end_row();
+                        ui.label("Dynamic stroke");
+                        ComboBox::from_id_salt("dynamics")
+                            .selected_text(b.dynamics.as_ref().map_or("Off", |d| d.name.as_str()))
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(b.dynamics.is_none(), "Off").clicked() {
+                                    b.dynamics = None;
+                                }
+                                for d in crate::dynamics::Dynamics::presets() {
+                                    let on = b.dynamics.as_ref().is_some_and(|x| x.name == d.name);
+                                    if ui.selectable_label(on, &d.name).clicked() {
+                                        b.dynamics = Some(d);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        if let Some(d) = &mut b.dynamics {
+                            for (label, field, tip) in [
+                                ("Dabs", &mut d.count, "Dabs per stamp"),
+                                ("Along", &mut d.x, "Offset along the stroke, in brush radii"),
+                                ("Across", &mut d.y, "Offset across the stroke, in brush radii"),
+                                ("Size", &mut d.size, "Size multiplier"),
+                                ("Angle", &mut d.angle, "Added rotation, degrees"),
+                                ("Flow", &mut d.flow, "Flow multiplier"),
+                            ] {
+                                ui.label(label).on_hover_text(tip);
+                                if ui
+                                    .add(egui::TextEdit::singleline(field).code_editor().desired_width(160.0))
+                                    .on_hover_text("Inputs: i, n, t, s, p, r1..r4 (see the tooltip of Dynamic stroke)")
+                                    .changed()
+                                {
+                                    d.name = "Custom".into();
+                                }
+                                ui.end_row();
+                            }
+                            if let Err(e) = d.compile() {
+                                ui.label("");
+                                ui.label(RichText::new(e.to_string()).color(theme::ERROR));
+                                ui.end_row();
+                            }
+                        }
                     });
 
                 if matches!(self.tool, Tool::Paint | Tool::PolygonFill | Tool::Path) {
@@ -574,7 +698,7 @@ impl State {
                             });
                     } else {
                         ui.horizontal_wrapped(|ui| {
-                            for c in Channel::ALL {
+                            for &c in &channels {
                                 let ch = b.channels.get_mut(&c).unwrap();
                                 ui.toggle_value(&mut ch.enabled, c.label());
                             }
@@ -583,7 +707,7 @@ impl State {
                             .num_columns(2)
                             .spacing(vec2(12.0, 6.0))
                             .show(ui, |ui| {
-                                for c in Channel::ALL {
+                                for &c in &channels {
                                     let ch = b.channels.get_mut(&c).unwrap();
                                     if !ch.enabled {
                                         continue;
@@ -601,9 +725,14 @@ impl State {
                         .color(theme::WEAK),
                 );
             });
+        if text_alpha {
+            self.text_ui = Some(crate::text_ui::TextUi::new(
+                crate::text_ui::TextTarget::BrushAlpha,
+            ));
+        }
         if pick_alpha
             && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Images", &["png", "jpg", "jpeg", "tga", "tif", "tiff"])
+                .add_filter("Images", crate::images::IMAGE_EXTENSIONS)
                 .pick_file()
             && let Some(id) = self.import_resource(&path)
         {
