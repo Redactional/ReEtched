@@ -2809,8 +2809,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
+ "reetched-doc",
  "reetched-graph",
+ "reetched-io",
  "roxmltree",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

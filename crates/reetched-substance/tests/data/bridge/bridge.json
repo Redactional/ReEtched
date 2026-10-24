@@ -1,0 +1,276 @@
+{
+ "format": "reetched-bridge",
+ "version": 1,
+ "painter": "fake",
+ "mesh": "mesh.obj",
+ "backgrounds": {
+  "basecolor": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
+  "metallic": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
+  "roughness": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
+  "height": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
+  "normal": [
+   [
+    0.5,
+    0.5,
+    1.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ]
+ },
+ "texture_sets": [
+  {
+   "name": "Body",
+   "resolution": [
+    4,
+    4
+   ],
+   "mesh_maps": {
+    "ambient_occlusion": "captures/Body_meshmaps/Body_ambient_occlusion.png"
+   },
+   "reference": {
+    "basecolor": "captures/Body_reference/Body_basecolor.png",
+    "metallic": "captures/Body_reference/Body_metallic.png",
+    "roughness": "captures/Body_reference/Body_roughness.png",
+    "normal": "captures/Body_reference/Body_normal.png",
+    "height": "captures/Body_reference/Body_height.png"
+   },
+   "layers": [
+    {
+     "name": "Scratches",
+     "visible": true,
+     "blend": {
+      "basecolor": {
+       "mode": "Multiply",
+       "opacity": 0.8
+      },
+      "metallic": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "roughness": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "normal": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "height": {
+       "mode": "Normal",
+       "opacity": 1.0
+      }
+     },
+     "type": "paint",
+     "content": {
+      "black": {
+       "basecolor": "captures/Body_101_black/Body_basecolor.png",
+       "metallic": "captures/Body_101_black/Body_metallic.png",
+       "roughness": "captures/Body_101_black/Body_roughness.png",
+       "normal": "captures/Body_101_black/Body_normal.png",
+       "height": "captures/Body_101_black/Body_height.png"
+      },
+      "white": {
+       "basecolor": "captures/Body_101_white/Body_basecolor.png",
+       "metallic": "captures/Body_101_white/Body_metallic.png",
+       "roughness": "captures/Body_101_white/Body_roughness.png",
+       "normal": "captures/Body_101_white/Body_normal.png",
+       "height": "captures/Body_101_white/Body_height.png"
+      }
+     },
+     "mask": {
+      "background": "black",
+      "enabled": true,
+      "capture": {
+       "black": {
+        "basecolor": "captures/Body_101_mask_black/Body_basecolor.png"
+       },
+       "white": {
+        "basecolor": "captures/Body_101_mask_white/Body_basecolor.png"
+       }
+      }
+     }
+    },
+    {
+     "name": "Base",
+     "visible": true,
+     "blend": {
+      "basecolor": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "metallic": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "roughness": {
+       "mode": "Normal",
+       "opacity": 0.9
+      },
+      "normal": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "height": {
+       "mode": "Normal",
+       "opacity": 1.0
+      }
+     },
+     "type": "group",
+     "children": [
+      {
+       "name": "Steel",
+       "visible": true,
+       "blend": {
+        "basecolor": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "metallic": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "roughness": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "normal": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "height": {
+         "mode": "Normal",
+         "opacity": 1.0
+        }
+       },
+       "type": "fill",
+       "fill": {
+        "basecolor": [
+         0.8,
+         0.8,
+         0.8
+        ],
+        "metallic": [
+         1.0,
+         1.0,
+         1.0
+        ],
+        "roughness": [
+         0.25,
+         0.25,
+         0.25
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "Rust",
+     "visible": false,
+     "blend": {
+      "basecolor": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "metallic": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "roughness": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "normal": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "height": {
+       "mode": "Normal",
+       "opacity": 1.0
+      }
+     },
+     "type": "fill",
+     "substance": {
+      "resource://starter_assets/rust": {
+       "age": 0.7
+      }
+     },
+     "content": {
+      "black": {
+       "basecolor": "captures/Body_104_black/Body_basecolor.png",
+       "metallic": "captures/Body_104_black/Body_metallic.png",
+       "roughness": "captures/Body_104_black/Body_roughness.png",
+       "normal": "captures/Body_104_black/Body_normal.png",
+       "height": "captures/Body_104_black/Body_height.png"
+      },
+      "white": {
+       "basecolor": "captures/Body_104_white/Body_basecolor.png",
+       "metallic": "captures/Body_104_white/Body_metallic.png",
+       "roughness": "captures/Body_104_white/Body_roughness.png",
+       "normal": "captures/Body_104_white/Body_normal.png",
+       "height": "captures/Body_104_white/Body_height.png"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "log": [
+  "Body: channels not carried over: Emissive",
+  "Body: export of Body_meshmaps produced no curvature map",
+  "Body: export of Body_meshmaps produced no normal map",
+  "Body: export of Body_meshmaps produced no world_normal map",
+  "Body: export of Body_meshmaps produced no id map",
+  "Body: export of Body_meshmaps produced no position map",
+  "Body: export of Body_meshmaps produced no thickness map",
+  "Body: export of Body_meshmaps produced no height map",
+  "Body: export of Body_meshmaps produced no opacity map"
+ ]
+}

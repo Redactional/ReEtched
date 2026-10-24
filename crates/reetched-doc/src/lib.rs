@@ -283,6 +283,54 @@ impl TileMap {
         let (x, y) = key.split_once(',')?;
         Some((x.parse().ok()?, y.parse().ok()?))
     }
+
+    /// Tiles covering a `resolution`² texture, from `px(x, y)` → RGBA (row 0 at
+    /// the top). Tiles with no coverage (alpha 0 everywhere) are left out.
+    pub fn from_fn(
+        resolution: u32,
+        resources: &mut Resources,
+        px: impl Fn(u32, u32) -> [f32; 4],
+    ) -> TileMap {
+        let mut map = TileMap::new(resolution);
+        let n = resolution.div_ceil(TILE_SIZE);
+        for ty in 0..n {
+            for tx in 0..n {
+                let mut bytes = Vec::with_capacity(TILE_BYTES);
+                let mut covered = false;
+                for y in 0..TILE_SIZE {
+                    for x in 0..TILE_SIZE {
+                        let (gx, gy) = (tx * TILE_SIZE + x, ty * TILE_SIZE + y);
+                        let c = if gx < resolution && gy < resolution {
+                            px(gx, gy)
+                        } else {
+                            [0.0; 4]
+                        };
+                        covered |= c[3] > 0.0;
+                        for v in c {
+                            bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+                        }
+                    }
+                }
+                if covered {
+                    map.tiles
+                        .insert(TileMap::key(tx, ty), resources.add_tile(bytes));
+                }
+            }
+        }
+        map
+    }
+
+    /// The texel at (x, y) as RGBA (0 where no tile was painted).
+    pub fn texel(&self, resources: &Resources, x: u32, y: u32) -> [f32; 4] {
+        let key = TileMap::key(x / TILE_SIZE, y / TILE_SIZE);
+        let Some(bytes) = self.tiles.get(&key).and_then(|id| resources.tiles.get(id)) else {
+            return [0.0; 4];
+        };
+        let i = (((y % TILE_SIZE) * TILE_SIZE + x % TILE_SIZE) * 8) as usize;
+        std::array::from_fn(|c| {
+            half::f16::from_le_bytes([bytes[i + c * 2], bytes[i + c * 2 + 1]]).to_f32()
+        })
+    }
 }
 
 /// A paint layer: hand-painted texels per channel.

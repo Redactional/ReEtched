@@ -342,6 +342,14 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
 - Bridge for smart materials and smart masks: load the `.spsm`/`.spmsk` in Painter and save it through `export_as_smart_material`, or apply it to a temporary project and dump it.
 - **Exit:** the test corpus of 20+ varied projects, all created by us, imports with zero structural differences and pixel differences under tolerance.
 
+- **Status (first pass):**
+  - Built: the ReEtched Bridge plugin (`tools/painter-bridge/reetched_bridge.py`), the importer (`reetched-substance::bridge`) and File > Import Painter bridge, which re-composites the import and compares each channel with Painter's export (pass/fail per texture set and channel in the log).
+  - The plugin writes its own small bundle (`bridge.json` + 16-bit PNG captures), not `.retx`, so it doesn't depend on our internal format; ReEtched converts it.
+  - Exact: structure, names, visibility, per-channel blend and opacity, uniform fills, mask backgrounds, baked mesh maps. Captured as editable pixels: paint layers, bitmap/Substance fills, content effects, instances, anchors and masks with effects. Each capture is exported over two backgrounds, so value and coverage are both recovered. Substance parameters are recorded in the bundle for later.
+  - Tests: the plugin runs against a fake Painter API (`tools/painter-bridge/tests`), which also writes the bundle the Rust importer and app tests read.
+  - **Not verified:** the plugin has not run in Painter (no install here). API calls follow Adobe's documentation for API 0.3.x; export map names (`documentMap`/`meshMap`), `InsertPosition`, and uniform colors being linear are assumptions to check first. Painter may blend base color in sRGB-encoded space while our compositor blends linear; the bridge check will show it if so (the fake test already does).
+  - **Deferred:** the 20-project corpus (needs Painter), `.sbsar` metadata and `sbsrender` re-rendering of Substance fills (captures already make them look right), GLSL shader import (moving to Phase 6), `resource://` lookup in the user's Painter install, smart material/mask bridging, UDIMs, multiple material layers per texture set, and channels beyond the five we have.
+
 ### Phase 6: Advanced tools and rendering parity (≈4–6 months)
 - **Tools**:
   - Polygon Fill (triangle, polygon, mesh, UV chunk; marquee and loop selection)

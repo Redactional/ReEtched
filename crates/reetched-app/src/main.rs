@@ -6,6 +6,7 @@
 
 mod app;
 mod bake_ui;
+mod bridge_ui;
 mod brush;
 mod compositor;
 mod effects_ui;

@@ -426,6 +426,9 @@ impl App {
             if ui.button("Import Substance graph (.sbs)…").clicked() {
                 self.state.import_sbs_dialog();
             }
+            if ui.button("Import Painter bridge…").clicked() {
+                self.state.import_bridge_dialog();
+            }
             ui.separator();
             if ui.button("Quit").clicked() {
                 self.state.quit = true;
@@ -615,6 +618,8 @@ impl State {
             self.open_project(path);
         } else if ext == "sbs" {
             self.import_sbs(path);
+        } else if path.is_dir() || file_name(path) == reetched_substance::bridge::MANIFEST {
+            self.import_bridge(path);
         } else {
             self.load_mesh(path);
         }
@@ -756,7 +761,7 @@ impl State {
     }
 
     /// Shows `mesh` with `doc`, or a fresh document (one texture set per material).
-    fn set_mesh(&mut self, mesh: Mesh, name: String, doc: Option<Document>) {
+    pub fn set_mesh(&mut self, mesh: Mesh, name: String, doc: Option<Document>) {
         self.bounds = mesh.bounds();
         self.camera.frame(self.bounds);
         self.uv_camera.zoom = 0.0;
@@ -1718,5 +1723,31 @@ mod tests {
         assert!(h.app.state.viewport.compositor().has_procedural(&key));
         let w = warnings(&h);
         assert_eq!(w.len(), 1, "only the missing library package: {w:?}");
+    }
+
+    #[test]
+    fn painter_bridge_bundle_imports_and_checks_against_painter() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../reetched-substance/tests/data/bridge");
+        let checks = h.app.state.import_bridge(&dir);
+        let s = &h.app.state;
+        assert_eq!(s.doc.texture_sets[0].stack.len(), 3);
+        assert_eq!(checks.len(), 5);
+        for c in &checks {
+            eprintln!(
+                "{} {:?}: mean {:.4}, off {:.3}",
+                c.set, c.channel, c.mean, c.off
+            );
+        }
+        // The fake Painter in the plugin test blends like ours for these channels.
+        for ch in [Channel::Metallic, Channel::Roughness] {
+            let c = checks.iter().find(|c| c.channel == ch).unwrap();
+            assert!(c.passed(), "{ch:?}: mean {}, off {}", c.mean, c.off);
+        }
+        h.frame(vec![]);
     }
 }
