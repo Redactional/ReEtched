@@ -507,6 +507,18 @@ impl Viewport {
         self.compositor.bitmap_view(device, queue, resources, id)
     }
 
+    pub fn compositor(&mut self) -> &mut crate::compositor::Compositor {
+        &mut self.compositor
+    }
+
+    /// Re-composites every texture set on the next sync (e.g. a procedural
+    /// material finished rendering).
+    pub fn invalidate(&mut self) {
+        for part in &mut self.parts {
+            part.composited = None;
+        }
+    }
+
     /// Forgets GPU paint data (a different document was loaded).
     pub fn clear_paint_cache(&mut self) {
         self.compositor.clear_paint();

@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test package written by hand for ReEtched's .sbs reader tests. -->
+<package>
+ <identifier v="main"/>
+ <formatVersion v="1.1.0.3"/>
+ <dependencies>
+  <dependency><filename v="?himself"/><uid v="100"/></dependency>
+  <dependency><filename v="lib/shapes.sbs"/><uid v="200"/></dependency>
+  <dependency><filename v="sbs://pattern_missing.sbs"/><uid v="300"/></dependency>
+ </dependencies>
+ <content>
+  <function>
+   <identifier v="double"/>
+   <paraminputs>
+    <paraminput><identifier v="x"/><type v="256"/><defaultValue><constantValueFloat1 v="0"/></defaultValue></paraminput>
+   </paraminputs>
+   <paramValue>
+    <dynamicValue>
+     <paramNodes>
+      <paramNode>
+       <uid v="1"/><function v="get_float1"/>
+       <funcDatas><funcData><name v="get_float1"/><constantValue><constantValueString v="x"/></constantValue></funcData></funcDatas>
+      </paramNode>
+      <paramNode>
+       <uid v="2"/><function v="add"/>
+       <connections>
+        <connection><identifier v="a"/><connRef v="1"/></connection>
+        <connection><identifier v="b"/><connRef v="1"/></connection>
+       </connections>
+      </paramNode>
+     </paramNodes>
+     <rootnode v="2"/>
+    </dynamicValue>
+   </paramValue>
+  </function>
+  <group>
+   <identifier v="Resources"/>
+   <content>
+    <resource><identifier v="checker"/><type v="bitmap"/><filepath v="checker.png"/></resource>
+   </content>
+  </group>
+  <graph>
+   <identifier v="invert"/>
+   <paraminputs>
+    <paraminput><identifier v="input"/><uid v="11"/><type v="2"/></paraminput>
+   </paraminputs>
+   <graphOutputs>
+    <graphoutput><identifier v="output"/><uid v="12"/></graphoutput>
+   </graphOutputs>
+   <compNodes>
+    <compNode>
+     <uid v="13"/>
+     <compOutputs><compOutput><uid v="14"/></compOutput></compOutputs>
+     <compImplementation><compInputBridge><entry v="11"/></compInputBridge></compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="15"/>
+     <connections><connection><identifier v="input1"/><connRef v="13"/><connRefOutput v="14"/></connection></connections>
+     <compOutputs><compOutput><uid v="16"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="levels"/>
+       <parameters>
+        <parameter><name v="leveloutlow"/><paramValue><constantValueFloat4 v="1 1 1 1"/></paramValue></parameter>
+        <parameter><name v="levelouthigh"/><paramValue><constantValueFloat4 v="0 0 0 0"/></paramValue></parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="17"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="15"/><connRefOutput v="16"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="12"/></compOutputBridge></compImplementation>
+    </compNode>
+   </compNodes>
+  </graph>
+  <graph>
+   <identifier v="main"/>
+   <attributes><label v="Main material"/></attributes>
+   <paraminputs>
+    <paraminput>
+     <identifier v="tint"/><uid v="21"/><type v="2048"/><group v="Color"/>
+     <defaultValue><constantValueFloat4 v="1 0.5 0.25 1"/></defaultValue>
+     <defaultWidget><name v="color"/></defaultWidget>
+    </paraminput>
+    <paraminput>
+     <identifier v="amount"/><uid v="22"/><type v="256"/>
+     <defaultValue><constantValueFloat1 v="0.25"/></defaultValue>
+     <defaultWidget>
+      <name v="slider"/>
+      <options>
+       <option><name v="min"/><value v="0"/></option>
+       <option><name v="max"/><value v="0.5"/></option>
+       <option><name v="clamp"/><value v="1"/></option>
+      </options>
+     </defaultWidget>
+    </paraminput>
+   </paraminputs>
+   <graphOutputs>
+    <graphoutput><identifier v="basecolor"/><uid v="31"/><usages><usage><components v="RGBA"/><name v="baseColor"/></usage></usages></graphoutput>
+    <graphoutput><identifier v="height"/><uid v="32"/><usages><usage><components v="RGBA"/><name v="height"/></usage></usages></graphoutput>
+    <graphoutput><identifier v="missing"/><uid v="33"/></graphoutput>
+    <graphoutput><identifier v="bitmap"/><uid v="34"/></graphoutput>
+   </graphOutputs>
+   <baseParameters>
+    <parameter><name v="outputsize"/><relativeTo v="2"/><paramValue><constantValueInt2 v="0 0"/></paramValue></parameter>
+   </baseParameters>
+   <compNodes>
+    <!-- Uniform color driven by the "tint" input through a function. -->
+    <compNode>
+     <uid v="41"/>
+     <compOutputs><compOutput><uid v="42"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="uniform"/>
+       <parameters>
+        <parameter>
+         <name v="outputcolor"/>
+         <paramValue>
+          <dynamicValue>
+           <paramNodes>
+            <paramNode>
+             <uid v="1"/><function v="get_float4"/>
+             <funcDatas><funcData><name v="get_float4"/><constantValue><constantValueString v="tint"/></constantValue></funcData></funcDatas>
+            </paramNode>
+           </paramNodes>
+           <rootnode v="1"/>
+          </dynamicValue>
+         </paramValue>
+        </parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <!-- Pixel processor: double($pos.x), through the "double" function package. -->
+    <compNode>
+     <uid v="43"/>
+     <compOutputs><compOutput><uid v="44"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="pixelprocessor"/>
+       <parameters>
+        <parameter><name v="colorswitch"/><paramValue><constantValueBool v="0"/></paramValue></parameter>
+        <parameter>
+         <name v="perpixel"/>
+         <paramValue>
+          <dynamicValue>
+           <paramNodes>
+            <paramNode>
+             <uid v="1"/><function v="get_float2"/>
+             <funcDatas><funcData><name v="get_float2"/><constantValue><constantValueString v="$pos"/></constantValue></funcData></funcDatas>
+            </paramNode>
+            <paramNode>
+             <uid v="2"/><function v="swizzle1"/>
+             <funcDatas><funcData><name v="__constant__"/><constantValue><constantValueInt1 v="0"/></constantValue></funcData></funcDatas>
+             <connections><connection><identifier v="vector"/><connRef v="1"/></connection></connections>
+            </paramNode>
+            <paramNode>
+             <uid v="3"/><function v="instance"/>
+             <funcDatas><funcData><name v="instance"/><constantValue><constantValueString v="pkg:///double?dependency=100"/></constantValue></funcData></funcDatas>
+             <connections><connection><identifier v="x"/><connRef v="2"/></connection></connections>
+            </paramNode>
+           </paramNodes>
+           <rootnode v="3"/>
+          </dynamicValue>
+         </paramValue>
+        </parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <!-- Instance of "invert" from this same package. -->
+    <compNode>
+     <uid v="45"/>
+     <connections><connection><identifier v="input"/><connRef v="43"/><connRefOutput v="44"/></connection></connections>
+     <compOutputs><compOutput><uid v="46"/></compOutput></compOutputs>
+     <compImplementation>
+      <compInstance>
+       <path v="pkg:///invert?dependency=100"/>
+       <outputBridgings><outputBridging><uid v="46"/><identifier v="output"/></outputBridging></outputBridgings>
+      </compInstance>
+     </compImplementation>
+    </compNode>
+    <!-- Instance of "square" from lib/shapes.sbs. -->
+    <compNode>
+     <uid v="47"/>
+     <compOutputs><compOutput><uid v="48"/></compOutput></compOutputs>
+     <compImplementation>
+      <compInstance>
+       <path v="pkg:///square?dependency=200"/>
+       <outputBridgings><outputBridging><uid v="48"/><identifier v="out"/></outputBridging></outputBridgings>
+      </compInstance>
+     </compImplementation>
+    </compNode>
+    <!-- tint multiplied onto the square at opacity "amount". -->
+    <compNode>
+     <uid v="49"/>
+     <connections>
+      <connection><identifier v="source"/><connRef v="41"/><connRefOutput v="42"/></connection>
+      <connection><identifier v="destination"/><connRef v="47"/><connRefOutput v="48"/></connection>
+     </connections>
+     <compOutputs><compOutput><uid v="50"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="blend"/>
+       <parameters>
+        <parameter><name v="blendingmode"/><paramValue><constantValueInt32 v="3"/></paramValue></parameter>
+        <parameter>
+         <name v="opacitymult"/>
+         <paramValue>
+          <dynamicValue>
+           <paramNodes>
+            <paramNode>
+             <uid v="1"/><function v="get_float1"/>
+             <funcDatas><funcData><name v="get_float1"/><constantValue><constantValueString v="amount"/></constantValue></funcData></funcDatas>
+            </paramNode>
+           </paramNodes>
+           <rootnode v="1"/>
+          </dynamicValue>
+         </paramValue>
+        </parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <!-- A library node that isn't installed. -->
+    <compNode>
+     <uid v="51"/>
+     <compOutputs><compOutput><uid v="52"/></compOutput></compOutputs>
+     <compImplementation>
+      <compInstance>
+       <path v="pkg:///pattern_missing?dependency=300"/>
+       <outputBridgings><outputBridging><uid v="52"/><identifier v="output"/></outputBridging></outputBridgings>
+      </compInstance>
+     </compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="53"/>
+     <compOutputs><compOutput><uid v="54"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="bitmap"/>
+       <parameters>
+        <parameter><name v="bitmapresourcepath"/><paramValue><constantValueString v="pkg:///Resources/checker?dependency=100"/></paramValue></parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="61"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="49"/><connRefOutput v="50"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="31"/></compOutputBridge></compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="62"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="45"/><connRefOutput v="46"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="32"/></compOutputBridge></compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="63"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="51"/><connRefOutput v="52"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="33"/></compOutputBridge></compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="64"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="53"/><connRefOutput v="54"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="34"/></compOutputBridge></compImplementation>
+    </compNode>
+   </compNodes>
+  </graph>
+ </content>
+</package>

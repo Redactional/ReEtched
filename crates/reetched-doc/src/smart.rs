@@ -35,7 +35,10 @@ fn refs(node: &Node, files: &mut BTreeSet<ResourceId>, tiles: &mut BTreeSet<Tile
     }
     match &node.kind {
         NodeKind::Fill(fill) => {
-            files.extend(fill.channels.values().filter_map(|c| c.bitmap.clone()))
+            files.extend(fill.channels.values().filter_map(|c| c.bitmap.clone()));
+            if let Some(p) = &fill.procedural {
+                files.extend(p.resource_ids());
+            }
         }
         NodeKind::Paint(paint) => {
             for map in paint.channels.values() {

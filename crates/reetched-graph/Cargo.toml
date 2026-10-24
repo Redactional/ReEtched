@@ -1,0 +1,12 @@
+[package]
+name = "reetched-graph"
+description = "Procedural texture graphs: Substance-style atomic nodes, function graphs and a material library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon = "1.12"
+

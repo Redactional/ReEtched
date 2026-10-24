@@ -14,6 +14,7 @@ mod paint_gpu;
 mod paint_ui;
 mod panels;
 mod preview;
+mod procedural;
 mod smart_presets;
 mod stack_ui;
 mod theme;

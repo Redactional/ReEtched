@@ -118,6 +118,13 @@ pub struct Compositor {
     dummy: ChannelSet,
     /// Paint layers' and masks' painted texels on the GPU.
     paint: HashMap<PaintKey, PaintTexture>,
+    /// Rendered procedural materials by render key: one texture per channel.
+    procedural: HashMap<String, [Option<wgpu::TextureView>; 5]>,
+    /// Resolution and mesh maps of the set being composited (for render keys).
+    proc_ctx: (
+        u32,
+        std::collections::BTreeMap<reetched_doc::MeshMap, ResourceId>,
+    ),
 }
 
 impl Compositor {
@@ -238,6 +245,8 @@ impl Compositor {
             pool: Vec::new(),
             dummy,
             paint: HashMap::new(),
+            procedural: HashMap::new(),
+            proc_ctx: Default::default(),
         }
     }
 
@@ -303,6 +312,7 @@ impl Compositor {
         out: &mut Option<ChannelSet>,
     ) -> Vec<String> {
         let res = set.resolution;
+        self.proc_ctx = (res, set.mesh_maps.clone());
         if out.as_ref().is_none_or(|o| o.resolution != res) {
             *out = Some(self.new_set(device, res));
             // Different-sized scratch sets are dead weight now.
@@ -493,6 +503,18 @@ impl Compositor {
                 }
             }
             p.proj = proj_uniform(&fill.projection);
+            if let Some(proc) = &fill.procedural
+                && let Some(views) = self
+                    .procedural
+                    .get(&proc.render_key(self.proc_ctx.0, &self.proc_ctx.1))
+            {
+                for (i, v) in views.iter().enumerate() {
+                    if let Some(v) = v {
+                        bitmaps[i] = Some(v.clone());
+                        p.blend[i][2] = 1.0;
+                    }
+                }
+            }
         }
         if let NodeKind::Paint(paint) = &node.kind {
             for (i, c) in Channel::ALL.into_iter().enumerate() {
@@ -538,6 +560,31 @@ impl Compositor {
             }
         }
         (p, bitmaps)
+    }
+
+    pub fn has_procedural(&self, key: &str) -> bool {
+        self.procedural.contains_key(key)
+    }
+
+    /// Stores a procedural material's rendered channels (RGBA8; base color is sRGB).
+    pub fn set_procedural(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: String,
+        outputs: &[(Channel, image::RgbaImage)],
+    ) {
+        let mut views: [Option<wgpu::TextureView>; 5] = Default::default();
+        for (c, img) in outputs {
+            let i = Channel::ALL.iter().position(|x| x == c).unwrap_or(0);
+            views[i] = Some(upload_rgba8(device, queue, img, *c == Channel::BaseColor));
+        }
+        self.procedural.insert(key, views);
+    }
+
+    /// Drops rendered materials no layer uses any more.
+    pub fn retain_procedural(&mut self, keep: &std::collections::HashSet<String>) {
+        self.procedural.retain(|k, _| keep.contains(k));
     }
 
     /// A linear (non-sRGB) image resource as a texture, e.g. a brush alpha.

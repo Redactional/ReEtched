@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test dependency package written by hand for ReEtched's .sbs reader tests. -->
+<package>
+ <identifier v="shapes"/>
+ <content>
+  <graph>
+   <identifier v="square"/>
+   <graphOutputs><graphoutput><identifier v="out"/><uid v="2"/></graphoutput></graphOutputs>
+   <compNodes>
+    <compNode>
+     <uid v="3"/>
+     <compOutputs><compOutput><uid v="4"/></compOutput></compOutputs>
+     <compImplementation>
+      <compFilter>
+       <filter v="uniform"/>
+       <parameters>
+        <parameter><name v="outputcolor"/><paramValue><constantValueFloat4 v="1 1 1 1"/></paramValue></parameter>
+       </parameters>
+      </compFilter>
+     </compImplementation>
+    </compNode>
+    <compNode>
+     <uid v="5"/>
+     <connections><connection><identifier v="inputNodeOutput"/><connRef v="3"/><connRefOutput v="4"/></connection></connections>
+     <compImplementation><compOutputBridge><output v="2"/></compOutputBridge></compImplementation>
+    </compNode>
+   </compNodes>
+  </graph>
+ </content>
+</package>

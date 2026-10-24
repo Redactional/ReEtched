@@ -281,6 +281,26 @@ impl State {
             .map(|s| s.mesh_maps.clone())
             .unwrap_or_default();
         let mut effect_req = crate::effects_ui::EffectRequests::default();
+        // The selected fill's procedural material: package, render warnings, rendering?
+        let proc_view = self
+            .stack()
+            .and_then(|s| reetched_doc::find_node(s, sel.node))
+            .and_then(|n| match &n.kind {
+                NodeKind::Fill(f) => f.procedural.clone(),
+                _ => None,
+            })
+            .and_then(|p| {
+                let set = self.doc.texture_sets.get(self.selected_part)?;
+                let key = p.render_key(set.resolution, &set.mesh_maps);
+                let pkg = self.procedural.package(&p.source, &self.resources);
+                let warnings = self
+                    .procedural
+                    .warnings
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                Some((pkg, warnings, self.procedural.is_pending(&key)))
+            });
         let mut pick: Option<BitmapSlot> = None;
         let mut clear: Option<BitmapSlot> = None;
         let mut show_brush = false;
@@ -376,6 +396,17 @@ impl State {
                     return;
                 };
                 ui.add_space(8.0);
+                if let (Some(p), Some((pkg, warnings, pending))) = (&mut fill.procedural, &proc_view) {
+                    let graph = pkg.as_ref().ok().and_then(|pk| pk.graph(&p.graph));
+                    let status = match pkg {
+                        Ok(_) => Ok(warnings.as_slice()),
+                        Err(e) => Err(e.as_str()),
+                    };
+                    if crate::procedural::procedural_ui(ui, p, graph, status, *pending) {
+                        fill.procedural = None;
+                    }
+                    ui.add_space(8.0);
+                }
                 projection_ui(ui, &mut fill.projection, "fill_proj");
                 ui.add_space(8.0);
                 ui.label(theme::header("MATERIAL"));
@@ -390,6 +421,13 @@ impl State {
                     }
                 });
                 ui.add_space(4.0);
+                if fill.procedural.is_some() {
+                    ui.label(
+                        RichText::new("Channel values come from the procedural material.")
+                            .color(theme::WEAK),
+                    );
+                    return;
+                }
                 egui::Grid::new("channels")
                     .num_columns(2)
                     .spacing(vec2(12.0, 6.0))

@@ -25,6 +25,7 @@ impl State {
             for (icon, cat, name) in [
                 (ic::ICON_DEPLOYED_CODE, C::Materials, "Materials"),
                 (ic::ICON_AUTO_FIX_HIGH, C::SmartMaterials, "Smart materials"),
+                (ic::ICON_GRAIN, C::Procedural, "Procedural materials (.sbs)"),
             ] {
                 if icon_button(ui, icon, self.asset_category == cat, name).clicked() {
                     self.asset_category = cat;
@@ -50,6 +51,11 @@ impl State {
             && ui.button("Import smart material…").clicked()
         {
             self.import_smart();
+        }
+        if self.asset_category == crate::app::AssetCategory::Procedural
+            && ui.button("Import Substance graph (.sbs)…").clicked()
+        {
+            self.import_sbs_dialog();
         }
 
         let search = self.asset_search.to_lowercase();

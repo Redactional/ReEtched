@@ -11,6 +11,7 @@ pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x34, 0x3a, 0x42);
 pub const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd4, 0xd4);
 pub const WEAK: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
 pub const ERROR: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x5c);
+pub const WARN: Color32 = Color32::from_rgb(0xd9, 0xa6, 0x4e);
 
 pub fn apply(ctx: &egui::Context) {
     egui_material_icons::initialize(ctx);

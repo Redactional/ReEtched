@@ -316,6 +316,17 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
   - a corpus of simple Designer-authored `.sbs` graphs renders within a set tolerance of `sbsrender` output;
   - our own library makes the app useful with zero Adobe content.
 
+- **Status (done, first pass):**
+  - Built: `reetched-graph` (graph model, evaluator with output-size/seed/tiling semantics, graph instances, parameter expressions, images freed as soon as their last consumer runs) and `reetched-substance` (`.sbs` reader: graphs, function packages, bitmap resources, groups, dependencies by relative path or `sbs://` from a Substance Designer install, `?himself` references).
+  - Atomic nodes: Uniform Color, Blend (12 modes), Levels, Transformation 2D, Blur, Directional Blur, Warp, Directional Warp, Gradient Map, Grayscale Conversion, HSL, Channels Shuffle, Normal, Emboss, Sharpen, Curve, Distance, Bitmap, Pixel Processor, Input/Output, plus passthrough.
+  - Function graphs: math, vectors, swizzles, casts, comparisons, logic, if/else, sequence, get/set variables, samplers, random, function-package instances (inlined).
+  - Our own tileable generators (noise, cells, tiles, weave, wood, gradient) and an eight-material library built from them.
+  - Fill layers can carry a procedural material: parameters in Properties, per-layer resolution and seed, background rendering (newest edit wins), outputs mapped to channels by usage; mesh maps feed image inputs by usage. Project format v4 stores the `.sbs` and its files.
+  - Tests use `.sbs` files we wrote by hand (clean-room); no Designer-authored corpus yet.
+  - **Differences from the plan:** evaluation is CPU (rayon) and function graphs are interpreted, not compiled to WGSL; move to GPU when graphs get slow. No node editor yet: parameters are edited in Properties.
+  - **Not verified:** exact Designer semantics. Blur/warp/normal intensity scales, the Transformation 2D matrix convention, Curve tangents and some function-node data names follow documentation and best guesses; the `sbsrender` comparison (exit criterion 1) needs a Designer install, which the dev machine doesn't have. Designer library lookup paths are untested.
+  - **Deferred:** FX-Map, Value Processor, SVG, Text, Gradient (Dynamic); `.sbsar` metadata and optional `sbsrender` (moved to Phase 5, where cached renders make them useful); node editor (egui-snarl); procedural masks/generators from graphs; GPU execution.
+
 ### Phase 5: Substance Painter project import (≈2–3 months)
 **Goal:** a Painter user can move a real project over.
 - **ReEtched Bridge** (route B), a Python plugin for Painter 10.0 or later. It needs the `layerstack` API, which arrived in 10.0. Projects from older Painter versions can be opened in 10 or later first. The plugin:

@@ -22,6 +22,8 @@ egui_tiles = "0.18"
 egui_material_icons = "0.9"
 reetched-doc.workspace = true
 reetched-bake.workspace = true
+reetched-graph.workspace = true
+reetched-substance.workspace = true
 serde_json = "1"
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }

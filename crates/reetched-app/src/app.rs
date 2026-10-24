@@ -108,11 +108,14 @@ pub struct PresetDrag(pub usize);
 
 /// Asset indices from here on are smart materials (built-ins, then imports).
 pub const SMART_OFFSET: usize = 10_000;
+/// Asset indices from here on are procedural materials (library, then imported graphs).
+pub const PROC_OFFSET: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AssetCategory {
     Materials,
     SmartMaterials,
+    Procedural,
 }
 
 pub struct App {
@@ -173,6 +176,7 @@ pub struct State {
     /// Smart materials imported this session (with their images and tiles).
     pub smart_imports: Vec<(reetched_doc::smart::SmartMaterial, Resources)>,
     pub smart_thumbs: Vec<egui::TextureHandle>,
+    pub procedural: crate::procedural::Procedurals,
     pub selected_preset: Option<usize>,
     pub preview_env: PreviewEnv,
     pub thumbs: Vec<egui::TextureHandle>,
@@ -265,6 +269,7 @@ impl App {
             asset_category: AssetCategory::Materials,
             smart_imports: Vec::new(),
             smart_thumbs: Vec::new(),
+            procedural: Default::default(),
             selected_preset: None,
             thumbs: Vec::new(),
             log: Vec::new(),
@@ -290,6 +295,13 @@ impl App {
         let ctx = ui.ctx().clone();
         if self.state.thumbs.is_empty() {
             self.state.refresh_thumbnails(&ctx);
+        }
+        if self.state.procedural.thumbs.is_empty() {
+            self.state.procedural.refresh_thumbs(&ctx);
+        }
+        self.state.update_procedurals();
+        if self.state.procedural.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
@@ -410,6 +422,9 @@ impl App {
             }
             if ui.button("Load environment…").clicked() {
                 self.state.pick_environment();
+            }
+            if ui.button("Import Substance graph (.sbs)…").clicked() {
+                self.state.import_sbs_dialog();
             }
             ui.separator();
             if ui.button("Quit").clicked() {
@@ -598,6 +613,8 @@ impl State {
             self.load_environment(path);
         } else if ext == project::EXTENSION {
             self.open_project(path);
+        } else if ext == "sbs" {
+            self.import_sbs(path);
         } else {
             self.load_mesh(path);
         }
@@ -915,6 +932,10 @@ impl State {
     /// Adds a fill layer with a material preset to the selected texture set (like dropping
     /// a material onto Painter's layer stack).
     pub fn apply_preset(&mut self, index: usize) {
+        if index >= PROC_OFFSET {
+            self.apply_procedural(index - PROC_OFFSET);
+            return;
+        }
         if index >= SMART_OFFSET {
             self.apply_smart(index - SMART_OFFSET);
             return;
@@ -968,6 +989,19 @@ impl State {
                         name,
                         self.smart_thumbs.get(k).map(|t| t.id()),
                         SMART_OFFSET + k,
+                    )
+                })
+                .collect(),
+            AssetCategory::Procedural => self
+                .procedural
+                .items()
+                .into_iter()
+                .enumerate()
+                .map(|(k, (label, ..))| {
+                    (
+                        label,
+                        self.procedural.thumbs.get(k).map(|t| t.id()),
+                        PROC_OFFSET + k,
                     )
                 })
                 .collect(),
@@ -1514,5 +1548,175 @@ mod tests {
             edge >= 4,
             "steel shows through near the bevelled edges ({edge} texels)"
         );
+    }
+
+    /// Frames until procedural renders finish.
+    fn settle(h: &mut Harness) {
+        for _ in 0..500 {
+            h.frame(vec![]);
+            if !h.app.state.procedural.busy() {
+                h.frame(vec![]); // composite with the finished render
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("procedural render did not finish");
+    }
+
+    #[test]
+    fn procedural_bricks_render_into_the_layer_stack() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.doc.texture_sets[0].resolution = 256;
+        let bricks = h
+            .app
+            .state
+            .procedural
+            .items()
+            .iter()
+            .position(|(_, _, g)| g == "bricks")
+            .unwrap();
+        h.app.state.apply_preset(PROC_OFFSET + bricks);
+        settle(&mut h);
+        let read = |h: &Harness| {
+            h.app
+                .state
+                .viewport
+                .read_back(&h.device, &h.queue, 0)
+                .unwrap()
+        };
+        let d = read(&h);
+        let covered: Vec<[f32; 3]> = d
+            .base_color
+            .iter()
+            .zip(&d.coverage)
+            .filter(|(_, c)| **c)
+            .map(|(b, _)| *b)
+            .collect();
+        assert!(covered.len() > 1000);
+        let reddish = covered.iter().filter(|c| c[0] > c[2] * 2.0).count();
+        let greyish = covered
+            .iter()
+            .filter(|c| c[0] < c[2] * 1.6 && c[0] > 0.2)
+            .count();
+        assert!(
+            reddish > covered.len() / 2,
+            "mostly brick ({reddish}/{})",
+            covered.len()
+        );
+        assert!(
+            greyish > covered.len() / 50,
+            "with mortar lines ({greyish})"
+        );
+
+        // Changing a parameter re-renders: blue bricks.
+        let Some(Selected { node, .. }) = h.app.state.selected else {
+            panic!("the new layer is selected")
+        };
+        let stack = &mut h.app.state.doc.texture_sets[0].stack;
+        let NodeKind::Fill(fill) = &mut reetched_doc::find_node_mut(stack, node).unwrap().kind
+        else {
+            panic!()
+        };
+        fill.procedural
+            .as_mut()
+            .unwrap()
+            .params
+            .insert("brick".into(), [0.1, 0.2, 0.8, 0.0]);
+        settle(&mut h);
+        let d = read(&h);
+        let blue = d
+            .base_color
+            .iter()
+            .zip(&d.coverage)
+            .filter(|(b, c)| **c && b[2] > b[0] * 2.0)
+            .count();
+        assert!(blue > covered.len() / 2, "bricks turned blue ({blue})");
+        assert!(
+            h.app
+                .state
+                .procedural
+                .warnings
+                .values()
+                .all(|w| w.is_empty())
+        );
+    }
+
+    #[test]
+    fn imported_sbs_renders_and_survives_save_and_reload() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.doc.texture_sets[0].resolution = 64;
+        let sbs =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../reetched-substance/tests/data/main.sbs");
+        h.app.state.import_sbs(&sbs);
+        assert_eq!(h.app.state.procedural.imports.len(), 1);
+        let main = h
+            .app
+            .state
+            .procedural
+            .items()
+            .iter()
+            .position(|(_, _, g)| g == "main")
+            .unwrap();
+        h.app.state.apply_preset(PROC_OFFSET + main);
+        settle(&mut h);
+        let warnings = |h: &Harness| -> Vec<String> {
+            h.app
+                .state
+                .procedural
+                .warnings
+                .values()
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        let w = warnings(&h);
+        assert!(w.iter().any(|w| w.contains("pattern_missing")), "{w:?}");
+
+        // The .sbs and its dependency are stored in the project.
+        let names: Vec<&str> = h
+            .app
+            .state
+            .doc
+            .resources
+            .values()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"main.sbs") && names.contains(&"lib/shapes.sbs"),
+            "{names:?}"
+        );
+
+        let dir = std::env::temp_dir().join("reetched-sbs-project-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.retx");
+        h.app.state.project_path = Some(path.clone());
+        h.app.state.save(false);
+        // Forget loaded packages and renders, so they come back from the file.
+        h.app.state.procedural = Default::default();
+        h.app
+            .state
+            .viewport
+            .compositor()
+            .retain_procedural(&HashSet::new());
+        h.app.state.open_project(&path);
+        settle(&mut h);
+        let set = &h.app.state.doc.texture_sets[0];
+        let NodeKind::Fill(fill) = &set.stack[0].kind else {
+            panic!("the fill layer came back")
+        };
+        let key = fill
+            .procedural
+            .as_ref()
+            .unwrap()
+            .render_key(set.resolution, &set.mesh_maps);
+        assert!(h.app.state.viewport.compositor().has_procedural(&key));
+        let w = warnings(&h);
+        assert_eq!(w.len(), 1, "only the missing library package: {w:?}");
     }
 }

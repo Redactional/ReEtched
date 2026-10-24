@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 /// Current `.retx` format version. Bump it and add a migration when the layout changes.
 /// v2: paint layers and painted masks.
 /// v3: mesh maps and mask effects.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Texture channels of the metal/roughness workflow.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -360,6 +360,73 @@ pub struct ChannelSource {
 pub struct Fill {
     pub channels: BTreeMap<Channel, ChannelSource>,
     pub projection: Projection,
+    /// A procedural material; its outputs replace the channels' values and bitmaps.
+    #[serde(default)]
+    pub procedural: Option<Box<Procedural>>,
+}
+
+/// Where a procedural material's graph comes from.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub enum ProceduralSource {
+    /// ReEtched's built-in library.
+    Library,
+    /// An imported `.sbs` package: the file, plus the files it references by
+    /// relative path (other `.sbs` packages, bitmaps), all stored as resources.
+    Sbs {
+        file: ResourceId,
+        name: String,
+        files: BTreeMap<String, ResourceId>,
+    },
+}
+
+/// A fill layer's procedural material (Painter's "substance material").
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Procedural {
+    pub source: ProceduralSource,
+    /// Graph identifier inside the source.
+    pub graph: String,
+    /// Shown name.
+    pub label: String,
+    /// Input values that differ from the graph's defaults, by input id.
+    pub params: BTreeMap<String, [f32; 4]>,
+    pub seed: i32,
+    /// Output size as log2 (8 = 256 … 12 = 4096); 0 follows the texture set.
+    pub resolution_log2: u8,
+}
+
+impl Procedural {
+    /// Output size (log2) in a texture set of `resolution`.
+    pub fn size_log2(&self, resolution: u32) -> u8 {
+        if self.resolution_log2 == 0 {
+            resolution.max(1).ilog2() as u8
+        } else {
+            self.resolution_log2
+        }
+    }
+
+    /// Identifies one render in a texture set with this resolution and mesh
+    /// maps: same key, same images.
+    pub fn render_key(&self, resolution: u32, mesh_maps: &BTreeMap<MeshMap, ResourceId>) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(serde_json::to_string(self).unwrap_or_default().as_bytes());
+        h.update(&[self.size_log2(resolution)]);
+        h.update(
+            serde_json::to_string(mesh_maps)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        h.finalize().to_hex()[..32].to_string()
+    }
+
+    /// Resources this material needs.
+    pub fn resource_ids(&self) -> Vec<ResourceId> {
+        match &self.source {
+            ProceduralSource::Library => Vec::new(),
+            ProceduralSource::Sbs { file, files, .. } => std::iter::once(file.clone())
+                .chain(files.values().cloned())
+                .collect(),
+        }
+    }
 }
 
 impl Fill {
@@ -385,6 +452,7 @@ impl Fill {
         Self {
             channels,
             projection: Projection::default(),
+            procedural: None,
         }
     }
 }
