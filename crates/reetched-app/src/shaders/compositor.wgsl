@@ -6,10 +6,12 @@
 // Channel order everywhere: 0 base color, 1 metallic, 2 roughness, 3 normal, 4 height.
 
 struct Proj {
-    // x: mode (0 uv, 1 tri-planar, 2 planar), y: uv rotation (rad), z: tri-planar exponent, w: 1 / size
+    // x: mode (0 uv, 1 tri-planar, 2 planar, 3 spherical, 4 cylindrical), y: uv rotation (rad),
+    // z: tri-planar exponent, w: 1 / size
     a: vec4<f32>,
     // xy: uv scale, zw: uv offset
     so: vec4<f32>,
+    // xyz: projector position, w: mirror bits (1 x, 2 y, 4 z)
     origin: vec4<f32>,
     // Rows of the inverse projector rotation.
     r0: vec4<f32>,
@@ -261,12 +263,34 @@ fn sample_proj(t: texture_2d<f32>, pr: Proj, uv: vec2<f32>, pos: vec3<f32>, n: v
         let t0 = uv_xform(uv, pr);
         return textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
     }
-    let q = local_dir((pos - pr.origin.xyz) * pr.a.w, pr);
+    // Fill symmetry: mirror the position (and normal) across the chosen planes.
+    let bits = u32(pr.origin.w);
+    var mp = pos;
+    var mn = n;
+    for (var i = 0u; i < 3u; i++) {
+        if (bits & (1u << i)) != 0u && mp[i] < 0.0 {
+            mp[i] = -mp[i];
+            mn[i] = -mn[i];
+        }
+    }
+    let q = local_dir((mp - pr.origin.xyz) * pr.a.w, pr);
     if mode == 2u {
         let t0 = uv_xform(q.xy + 0.5, pr);
         return textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
     }
-    var w = pow(abs(local_dir(n, pr)), vec3(pr.a.z));
+    if mode == 3u || mode == 4u {
+        // Around the projector's Y axis; u wraps once around.
+        let u = atan2(q.x, q.z) / 6.2831853 + 0.5;
+        var v = q.y + 0.5;
+        if mode == 3u {
+            v = 1.0 - acos(clamp(q.y / max(length(q), 1e-6), -1.0, 1.0)) / 3.14159265;
+        }
+        let t0 = uv_xform(vec2(u, v), pr);
+        // Level 0: atan2 jumps at the seam, which would pick the smallest mip there.
+        // ponytail: no mipmapping for these two; use analytic gradients if aliasing shows.
+        return textureSampleLevel(t, smp, vec2(t0.x, 1.0 - t0.y), 0.0);
+    }
+    var w = pow(abs(local_dir(mn, pr)), vec3(pr.a.z));
     w /= max(w.x + w.y + w.z, 1e-5);
     let x = textureSample(t, smp, uv_xform(q.zy, pr) * vec2(1.0, -1.0));
     let y = textureSample(t, smp, uv_xform(q.xz, pr) * vec2(1.0, -1.0));

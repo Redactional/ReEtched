@@ -433,7 +433,7 @@ impl Viewport {
         targets: Vec<StrokeTarget>,
         res: u32,
         resources: &Resources,
-        erase: bool,
+        mode: crate::paint_gpu::StrokeMode,
         opacity: f32,
     ) {
         self.paint.begin(
@@ -443,9 +443,25 @@ impl Viewport {
             targets,
             res,
             resources,
-            erase,
+            mode,
             opacity,
         );
+    }
+
+    /// Polygon Fill: fills triangles (three vertex indices each) of texture set `part`.
+    pub fn paint_fill(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        part: usize,
+        indices: &[u32],
+    ) {
+        let (Some((vertices, _)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
+            return;
+        };
+        self.paint
+            .fill_triangles(device, queue, &self.compositor, vertices, indices);
+        p.composited = None;
     }
 
     /// Stamps dabs on texture set `part`. `occlusion`: test against the 3D view's depth.
@@ -459,6 +475,7 @@ impl Viewport {
         occlusion: bool,
         shape: &BrushShape,
         dabs: &[Dab],
+        motion: [f32; 2],
     ) {
         let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get_mut(part)) else {
             return;
@@ -480,6 +497,7 @@ impl Viewport {
             depth,
             shape,
             dabs,
+            motion,
         );
         // The paint textures changed under the same document: re-composite.
         p.composited = None;

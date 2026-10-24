@@ -14,3 +14,4 @@ bytemuck = { version = "1", features = ["derive"] }
 gltf = "1.4"
 ufbx = "0.11"
 bevy_mikktspace = "1"
+uvunwrap = { version = "0.2", default-features = false, features = ["parallel"] }

@@ -834,8 +834,16 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         ProjectionMode::Uv => 0.0,
         ProjectionMode::Triplanar => 1.0,
         ProjectionMode::Planar => 2.0,
+        ProjectionMode::Spherical => 3.0,
+        ProjectionMode::Cylindrical => 4.0,
     };
     let [px, py, pz] = p.position;
+    let mirror = p
+        .mirror
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| if m { 1 << i } else { 0 })
+        .sum::<u32>() as f32;
     ProjUniform {
         a: [
             mode,
@@ -844,7 +852,7 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
             1.0 / p.size.max(1e-4),
         ],
         so: [p.scale[0], p.scale[1], p.offset[0], p.offset[1]],
-        origin: [px, py, pz, 0.0],
+        origin: [px, py, pz, mirror],
         r0: row(0),
         r1: row(1),
         r2: row(2),
@@ -1102,9 +1110,10 @@ mod tests {
         .ok()
     }
 
-    fn quad(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
+    /// The UV quad, with positions `pos(uv)` along X and Y.
+    fn quad_at(device: &wgpu::Device, pos: fn(f32) -> f32) -> (wgpu::Buffer, wgpu::Buffer) {
         let v = |u: f32, w: f32| Vertex {
-            position: [u, w, 0.0],
+            position: [pos(u), pos(w), 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [u, w],
             tangent: [1.0, 0.0, 0.0, 1.0],
@@ -1126,8 +1135,13 @@ mod tests {
 
     /// Composites `stack` (top first) and returns the read-back channels.
     fn run(stack: Vec<Node>, resources: &Resources) -> Option<ChannelData> {
+        run_at(stack, resources, |u| u)
+    }
+
+    fn run_at(stack: Vec<Node>, resources: &Resources, pos: fn(f32) -> f32) -> Option<ChannelData> {
+        let _gpu = crate::gpu_test_lock();
         let (device, queue) = gpu()?;
-        let (vb, ib) = quad(&device);
+        let (vb, ib) = quad_at(&device, pos);
         let mesh = MeshPart {
             vertices: &vb,
             indices: &ib,
@@ -1274,5 +1288,45 @@ mod tests {
             px(16, 16)
         );
         assert!(px(48, 48).iter().all(|&c| c > 215), "{:?}", px(48, 48));
+    }
+
+    #[test]
+    fn planar_projection_mirrors_across_x() {
+        // 2×2 image: top row red, green; bottom row blue, white.
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut resources = Resources::default();
+        let id = resources.add(png);
+        let layer = |mirror: bool| {
+            let mut doc = Document::new(None, &[]);
+            let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+            fill.channels.get_mut(&Channel::BaseColor).unwrap().bitmap = Some(id.clone());
+            fill.projection.mode = ProjectionMode::Planar;
+            fill.projection.size = 2.0; // the quad spans -1..1
+            fill.projection.mirror = [mirror, false, false];
+            doc.new_fill("img".into(), fill)
+        };
+        let to_pm1 = |u: f32| u * 2.0 - 1.0;
+        let Some(plain) = run_at(vec![layer(false)], &resources, to_pm1) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mirrored = run_at(vec![layer(true)], &resources, to_pm1).unwrap();
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.06);
+        // Left half, top: red normally, green (the right half's color) when mirrored.
+        assert!(near(plain.base_color[at(&plain, 16, 16)], [1.0, 0.0, 0.0]));
+        let m = mirrored.base_color[at(&mirrored, 16, 16)];
+        assert!(near(m, [0.0, 1.0, 0.0]), "{m:?}");
+        // The right half is unchanged.
+        assert!(near(
+            mirrored.base_color[at(&mirrored, 48, 16)],
+            [0.0, 1.0, 0.0]
+        ));
     }
 }

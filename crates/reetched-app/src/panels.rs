@@ -272,6 +272,8 @@ impl State {
             }
         } else {
             self.paint_input(ui, &response, rect, false);
+            self.polygon_input(ui, &response, rect, false);
+            self.path_input(ui, &response, rect);
         }
 
         // Painter's navigation: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, wheel zoom, F to frame.
@@ -328,6 +330,7 @@ impl State {
         self.accept_preset_drop(&response, None);
         drop_highlight(ui, &response);
         self.paint_input(ui, &response, rect, true);
+        self.polygon_input(ui, &response, rect, true);
 
         // UDIM 1001 outline.
         let painter = ui.painter_at(rect);

@@ -1,6 +1,8 @@
 //! Mesh import. A file becomes one indexed triangle mesh, split into parts by
 //! material — each part is what Painter calls a texture set.
 
+pub mod topology;
+
 use anyhow::{Context, Result, anyhow, bail};
 use glam::{Mat4, Vec3};
 use std::{collections::HashMap, f32::consts::PI, ops::Range, path::Path};
@@ -234,6 +236,59 @@ fn load_gltf(path: &Path) -> Result<Soup> {
     Ok(soup)
 }
 
+/// Generates fresh, non-overlapping UVs (one 0..1 atlas per material) and
+/// rebuilds tangents. Existing UVs are replaced.
+pub fn unwrap(mesh: &Mesh) -> Result<Mesh> {
+    let mut soup = Soup {
+        groups: Vec::new(),
+        has_uvs: true,
+    };
+    let options = uvunwrap::Options {
+        density: uvunwrap::Density::Auto { page_size: 2048 },
+        padding: 4,
+        ..Default::default()
+    };
+    for part in &mesh.parts {
+        // Compact the part's vertices so the unwrapper sees only this material.
+        let mut remap = HashMap::new();
+        let mut originals = Vec::new();
+        let indices: Vec<u32> = mesh.indices
+            [part.indices.start as usize..part.indices.end as usize]
+            .iter()
+            .map(|&i| {
+                *remap.entry(i).or_insert_with(|| {
+                    originals.push(i);
+                    originals.len() as u32 - 1
+                })
+            })
+            .collect();
+        let positions: Vec<[f32; 3]> = originals
+            .iter()
+            .map(|&i| mesh.vertices[i as usize].position)
+            .collect();
+        let atlas = uvunwrap::generate(&[uvunwrap::MeshInput::new(&positions, &indices)], &options)
+            .map_err(|e| anyhow::anyhow!("could not unwrap {}: {e}", part.material))?;
+        if atlas.page_count > 1 {
+            log::warn!(
+                "{}: unwrap needed {} pages; they overlap",
+                part.material,
+                atlas.page_count
+            );
+        }
+        // The page may be cropped to fewer rows than its width: keep texels square.
+        let aspect = atlas.height as f32 / atlas.width.max(1) as f32;
+        let out = &atlas.meshes[0];
+        let group = soup.group(&part.material);
+        for &i in &out.indices {
+            let ov = &out.vertices[i as usize];
+            let mut v = mesh.vertices[originals[ov.xref as usize] as usize];
+            v.uv = [ov.uv[0], ov.uv[1] * aspect];
+            group.push(v);
+        }
+    }
+    Ok(build(soup))
+}
+
 /// Generates tangents per material group, then welds identical corners into an indexed mesh.
 fn build(soup: Soup) -> Mesh {
     let mut mesh = Mesh {
@@ -333,5 +388,36 @@ mod tests {
         );
         let (lo, hi) = mesh.bounds();
         assert!(lo.abs_diff_eq(-Vec3::ONE, 1e-3) && hi.abs_diff_eq(Vec3::ONE, 1e-3));
+    }
+
+    #[test]
+    fn unwrap_gives_a_sphere_valid_uvs() {
+        let mut mesh = Mesh::uv_sphere(1.0, 24, 12);
+        for v in &mut mesh.vertices {
+            v.uv = [0.0, 0.0];
+        }
+        mesh.has_uvs = false;
+        let out = unwrap(&mesh).unwrap();
+        assert!(out.has_uvs);
+        assert_eq!(out.indices.len(), mesh.indices.len());
+        let uv = |i: u32| glam::Vec2::from(out.vertices[i as usize].uv);
+        let mut total = 0.0;
+        for t in out.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(uv);
+            for p in [a, b, c] {
+                assert!(
+                    (0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y),
+                    "{p}"
+                );
+            }
+            let area = (b - a).perp_dot(c - a).abs() * 0.5;
+            let p = t.map(|i| Vec3::from(out.vertices[i as usize].position));
+            let area3d = (p[1] - p[0]).cross(p[2] - p[0]).length();
+            // Degenerate triangles (the sphere's poles) may collapse; the rest may not.
+            assert!(area > 0.0 || area3d < 1e-6, "degenerate UV triangle");
+            total += area;
+        }
+        // Non-overlapping charts can't cover more than the whole square.
+        assert!(total > 0.3 && total <= 1.0, "UV area {total}");
     }
 }

@@ -2801,6 +2801,7 @@ dependencies = [
  "gltf",
  "log",
  "ufbx",
+ "uvunwrap",
 ]
 
 [[package]]
@@ -3513,6 +3514,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "uvunwrap"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dcf6453679f6c292df121f82e8f296cbcd4bfeecacdfe8965f2df08549519df"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]

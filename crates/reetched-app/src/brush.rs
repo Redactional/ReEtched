@@ -124,6 +124,8 @@ pub struct Hit {
     pub uv: Vec2,
     /// Texture set (mesh part) that was hit.
     pub part: usize,
+    /// Triangle index.
+    pub tri: usize,
 }
 
 /// Nearest triangle hit along a ray (Möller–Trumbore).
@@ -162,6 +164,7 @@ pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
         pos: origin + dir * t,
         uv: uv(0) * (1.0 - u - v) + uv(1) * u + uv(2) * v,
         part,
+        tri: t_index,
     })
 }
 
@@ -350,6 +353,7 @@ mod tests {
             pos: Vec3::new(0.5, 0.0, 0.8),
             uv: Vec2::ZERO,
             part: 0,
+            tri: 0,
         };
         let dabs = world_dabs(&brush, &view, &hit, 1.0);
         assert_eq!(dabs.len(), 2);

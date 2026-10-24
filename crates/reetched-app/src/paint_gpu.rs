@@ -40,6 +40,21 @@ struct SplatUniform {
 struct ApplyUniform {
     color: [f32; 4],
     params: [f32; 4],
+    /// x: 1 = copy from an offset (clone, smudge), yz: offset in texels.
+    extra: [f32; 4],
+}
+
+/// What a stroke does to the paint it covers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum StrokeMode {
+    Paint,
+    Erase,
+    /// Copies paint from `offset` texels away, as it was when the stroke began.
+    Clone {
+        offset: [f32; 2],
+    },
+    /// Drags paint along with the brush.
+    Smudge,
 }
 
 /// The view the dabs were placed from (for the occlusion test).
@@ -68,15 +83,23 @@ pub struct StrokeTarget {
 
 struct Stroke {
     res: u32,
-    erase: bool,
+    mode: StrokeMode,
     opacity: f32,
     mask: wgpu::Texture,
     mask_view: wgpu::TextureView,
-    targets: Vec<(StrokeTarget, wgpu::TextureView)>,
+    /// Smudge: this frame's dabs only.
+    frame_mask: Option<wgpu::TextureView>,
+    /// Each target with a copy of its paint ("before"): from the stroke's
+    /// start, or for smudge from the start of the current frame.
+    targets: Vec<(StrokeTarget, wgpu::Texture, wgpu::TextureView)>,
+    /// Smudge: motion not yet applied because it was under a texel.
+    carry: [f32; 2],
 }
 
 pub struct PaintGpu {
     splat: wgpu::RenderPipeline,
+    /// Fills whole triangles into the stroke mask (Polygon Fill).
+    fill: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     splat_layout: wgpu::BindGroupLayout,
     apply_layout: wgpu::BindGroupLayout,
@@ -136,14 +159,14 @@ impl PaintGpu {
             ],
         });
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/paint.wgsl"));
-        let pipeline = |layout: &wgpu::BindGroupLayout,
+        let pipeline = |layout: Option<&wgpu::BindGroupLayout>,
                         vs: &str,
                         fs: &str,
                         buffers: &[Option<wgpu::VertexBufferLayout>],
                         target: wgpu::ColorTargetState| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(fs),
-                bind_group_layouts: &[Some(layout)],
+                bind_group_layouts: &[layout],
                 immediate_size: 0,
             });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -173,26 +196,29 @@ impl PaintGpu {
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
+        let vertex_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: size_of::<reetched_io::Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
+        })];
+        let mask_target = wgpu::ColorTargetState {
+            format: MASK_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: accumulate,
+                alpha: accumulate,
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
         let splat = pipeline(
-            &splat_layout,
+            Some(&splat_layout),
             "vs_uv",
             "fs_splat",
-            &[Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<reetched_io::Vertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
-            })],
-            wgpu::ColorTargetState {
-                format: MASK_FORMAT,
-                blend: Some(wgpu::BlendState {
-                    color: accumulate,
-                    alpha: accumulate,
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            },
+            &vertex_layout,
+            mask_target.clone(),
         );
+        let fill = pipeline(None, "vs_uv", "fs_fill", &vertex_layout, mask_target);
         let apply = pipeline(
-            &apply_layout,
+            Some(&apply_layout),
             "vs_full",
             "fs_apply",
             &[],
@@ -243,6 +269,7 @@ impl PaintGpu {
             .create_view(&Default::default());
         Self {
             splat,
+            fill,
             apply,
             splat_layout,
             apply_layout,
@@ -263,7 +290,7 @@ impl PaintGpu {
         targets: Vec<StrokeTarget>,
         res: u32,
         resources: &Resources,
-        erase: bool,
+        mode: StrokeMode,
         opacity: f32,
     ) {
         let mut enc = device.create_command_encoder(&Default::default());
@@ -288,26 +315,32 @@ impl PaintGpu {
                     before.as_image_copy(),
                     src.size(),
                 );
-                (t, before.create_view(&Default::default()))
+                let view = before.create_view(&Default::default());
+                (t, before, view)
             })
             .collect();
-        let mask = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("stroke mask"),
-            size: wgpu::Extent3d {
-                width: res,
-                height: res,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: MASK_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let new_mask = || {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("stroke mask"),
+                size: wgpu::Extent3d {
+                    width: res,
+                    height: res,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MASK_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let mask = new_mask();
         let mask_view = mask.create_view(&Default::default());
+        let frame_mask =
+            (mode == StrokeMode::Smudge).then(|| new_mask().create_view(&Default::default()));
         drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear stroke mask"),
             color_attachments: &[Some(attachment(
@@ -319,15 +352,18 @@ impl PaintGpu {
         queue.submit([enc.finish()]);
         self.stroke = Some(Stroke {
             res,
-            erase,
+            mode,
             opacity,
             mask,
             mask_view,
+            frame_mask,
             targets,
+            carry: [0.0; 2],
         });
     }
 
-    /// Stamps `dabs` and updates the target paint textures.
+    /// Stamps `dabs` and updates the target paint textures. `motion`: smudge
+    /// only, how far the brush moved this frame, in texels.
     #[allow(clippy::too_many_arguments)]
     pub fn dabs(
         &mut self,
@@ -339,16 +375,48 @@ impl PaintGpu {
         depth: Option<&wgpu::TextureView>,
         shape: &BrushShape,
         dabs: &[Dab],
+        motion: [f32; 2],
     ) {
-        let Some(stroke) = &self.stroke else { return };
+        let Some(stroke) = &mut self.stroke else {
+            return;
+        };
         if dabs.is_empty() {
             return;
         }
         let mut enc = device.create_command_encoder(&Default::default());
-        {
+        let mut offset = [0.0; 2];
+        if let Some(frame) = &stroke.frame_mask {
+            // Smudge: drag from the paint as it is now, by whole texels.
+            for (k, c) in stroke.carry.iter_mut().enumerate() {
+                *c += motion[k];
+                offset[k] = -c.round();
+                *c += offset[k];
+            }
+            for (target, before, _) in &stroke.targets {
+                if let Some(dst) = comp.paint_texture(target.key) {
+                    enc.copy_texture_to_texture(
+                        dst.texture.as_image_copy(),
+                        before.as_image_copy(),
+                        before.size(),
+                    );
+                }
+            }
+            drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear frame mask"),
+                color_attachments: &[Some(attachment(
+                    frame,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                ))],
+                ..Default::default()
+            }));
+        }
+        let masks: Vec<&wgpu::TextureView> = std::iter::once(&stroke.mask_view)
+            .chain(stroke.frame_mask.as_ref())
+            .collect();
+        for mask in masks {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("splat"),
-                color_attachments: &[Some(attachment(&stroke.mask_view, wgpu::LoadOp::Load))],
+                color_attachments: &[Some(attachment(mask, wgpu::LoadOp::Load))],
                 ..Default::default()
             });
             pass.set_pipeline(&self.splat);
@@ -408,7 +476,65 @@ impl PaintGpu {
                 pass.draw_indexed(mesh.range.clone(), 0, 0..1);
             }
         }
-        for (target, before) in &stroke.targets {
+        self.apply(device, &mut enc, comp, offset);
+        queue.submit([enc.finish()]);
+    }
+
+    /// Fills whole triangles (`indices`: three vertex indices each) with the
+    /// stroke's value, at the stroke's opacity.
+    pub fn fill_triangles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &Compositor,
+        vertices: &wgpu::Buffer,
+        indices: &[u32],
+    ) {
+        let Some(stroke) = &self.stroke else { return };
+        if indices.is_empty() {
+            return;
+        }
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("polygon fill"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fill triangles"),
+                color_attachments: &[Some(attachment(&stroke.mask_view, wgpu::LoadOp::Load))],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.fill);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        }
+        self.apply(device, &mut enc, comp, [0.0; 2]);
+        queue.submit([enc.finish()]);
+    }
+
+    /// Blends the stroke into every target: before + mask → paint texture.
+    /// `offset`: smudge's copy offset this frame (texels).
+    fn apply(
+        &self,
+        device: &wgpu::Device,
+        enc: &mut wgpu::CommandEncoder,
+        comp: &Compositor,
+        offset: [f32; 2],
+    ) {
+        let Some(stroke) = &self.stroke else { return };
+        let (copy, offset, mask) = match stroke.mode {
+            StrokeMode::Clone { offset } => (1.0, offset, &stroke.mask_view),
+            StrokeMode::Smudge => (
+                1.0,
+                offset,
+                stroke.frame_mask.as_ref().unwrap_or(&stroke.mask_view),
+            ),
+            _ => (0.0, [0.0; 2], &stroke.mask_view),
+        };
+        for (target, _, before) in &stroke.targets {
             let Some(dst) = comp.paint_texture(target.key) else {
                 continue;
             };
@@ -417,10 +543,15 @@ impl PaintGpu {
                 color: [r, g, b, if target.is_normal { 1.0 } else { 0.0 }],
                 params: [
                     stroke.opacity,
-                    if stroke.erase { 1.0 } else { 0.0 },
+                    if stroke.mode == StrokeMode::Erase {
+                        1.0
+                    } else {
+                        0.0
+                    },
                     0.0,
                     0.0,
                 ],
+                extra: [copy, offset[0], offset[1], 0.0],
             };
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("apply"),
@@ -441,7 +572,7 @@ impl PaintGpu {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&stroke.mask_view),
+                        resource: wgpu::BindingResource::TextureView(mask),
                     },
                 ],
             });
@@ -454,7 +585,6 @@ impl PaintGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([enc.finish()]);
     }
 
     /// Ends the stroke: reads the touched tiles back and returns each target's new tiles.
@@ -490,7 +620,7 @@ impl PaintGpu {
         }
 
         let mut out = Vec::new();
-        for (target, _) in &stroke.targets {
+        for (target, ..) in &stroke.targets {
             let mut map = target.old.clone();
             map.resolution = res;
             let Some(pt) = comp.paint_texture(target.key) else {
@@ -616,9 +746,11 @@ mod tests {
         queue: wgpu::Queue,
         vb: wgpu::Buffer,
         ib: wgpu::Buffer,
+        _turn: std::sync::MutexGuard<'static, ()>,
     }
 
     fn gpu() -> Option<Gpu> {
+        let turn = crate::gpu_test_lock();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -646,6 +778,7 @@ mod tests {
             ib: buf(bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX),
             device,
             queue,
+            _turn: turn,
         })
     }
 
@@ -680,6 +813,27 @@ mod tests {
         backface: Option<f32>,
         dabs: &[Dab],
     ) -> TileMap {
+        let mode = if erase {
+            StrokeMode::Erase
+        } else {
+            StrokeMode::Paint
+        };
+        run(g, comp, res, old, mode, backface, &[(dabs, [0.0; 2])], None)
+    }
+
+    /// A stroke of several frames (dabs, smudge motion), optionally ending
+    /// with a polygon fill of `fill` (vertex indices).
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        g: &Gpu,
+        comp: &mut Compositor,
+        res: &mut Resources,
+        old: TileMap,
+        mode: StrokeMode,
+        backface: Option<f32>,
+        frames: &[(&[Dab], [f32; 2])],
+        fill: Option<&[u32]>,
+    ) -> TileMap {
         let mut pg = PaintGpu::new(&g.device, &g.queue);
         let target = StrokeTarget {
             key: (7, 0),
@@ -687,16 +841,7 @@ mod tests {
             is_normal: false,
             old,
         };
-        pg.begin(
-            &g.device,
-            &g.queue,
-            comp,
-            vec![target],
-            RES,
-            res,
-            erase,
-            1.0,
-        );
+        pg.begin(&g.device, &g.queue, comp, vec![target], RES, res, mode, 1.0);
         let mesh = MeshPart {
             vertices: &g.vb,
             indices: &g.ib,
@@ -712,9 +857,14 @@ mod tests {
             backface_cos: backface,
             alpha: None,
         };
-        pg.dabs(
-            &g.device, &g.queue, comp, &mesh, &camera, None, &shape, dabs,
-        );
+        for (dabs, motion) in frames {
+            pg.dabs(
+                &g.device, &g.queue, comp, &mesh, &camera, None, &shape, dabs, *motion,
+            );
+        }
+        if let Some(indices) = fill {
+            pg.fill_triangles(&g.device, &g.queue, comp, &g.vb, indices);
+        }
         let mut out = pg.end(&g.device, &g.queue, comp, res).unwrap();
         assert_eq!(out.len(), 1);
         out.remove(0).1
@@ -827,5 +977,103 @@ mod tests {
             &[world_dab([0.5, 0.5, 0.0], 0.2, [0.0, 0.0, 1.0])],
         );
         assert!(back.tiles.is_empty());
+    }
+
+    /// Texel at UV (u, v) (v up) of a paint buffer.
+    fn texel(map: &TileMap, res: &Resources, u: f32, v: f32) -> [f32; 4] {
+        let x = (u * RES as f32) as u32;
+        let y = ((1.0 - v) * RES as f32) as u32;
+        map.texel(res, x.min(RES - 1), y.min(RES - 1))
+    }
+
+    #[test]
+    fn polygon_fill_covers_whole_triangles() {
+        let Some(g) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut comp = Compositor::new(&g.device, &g.queue);
+        let mut r = Resources::default();
+        // Triangle 0 of the quad: (0,0), (1,0), (1,1), the half below the diagonal.
+        let map = run(
+            &g,
+            &mut comp,
+            &mut r,
+            TileMap::new(RES),
+            StrokeMode::Paint,
+            None,
+            &[],
+            Some(&[0, 1, 2]),
+        );
+        let inside = texel(&map, &r, 0.75, 0.25);
+        assert!(
+            inside[3] > 0.99 && (inside[0] - 1.0).abs() < 1e-3,
+            "{inside:?}"
+        );
+        assert_eq!(texel(&map, &r, 0.25, 0.75)[3], 0.0);
+    }
+
+    #[test]
+    fn clone_copies_from_the_offset_and_smudge_drags_paint() {
+        let Some(g) = gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut comp = Compositor::new(&g.device, &g.queue);
+        let mut r = Resources::default();
+        let spot = stroke(
+            &g,
+            &mut comp,
+            &mut r,
+            TileMap::new(RES),
+            false,
+            None,
+            &[uv_dab(0.25, 0.5, 0.1)],
+        );
+        assert_eq!(texel(&spot, &r, 0.75, 0.5)[3], 0.0);
+
+        // Clone at u = 0.75 from u = 0.25: half the texture to the left.
+        let mut comp2 = Compositor::new(&g.device, &g.queue);
+        let cloned = run(
+            &g,
+            &mut comp2,
+            &mut r,
+            spot.clone(),
+            StrokeMode::Clone {
+                offset: [-0.5 * RES as f32, 0.0],
+            },
+            None,
+            &[(&[uv_dab(0.75, 0.5, 0.1)], [0.0; 2])],
+            None,
+        );
+        let c = texel(&cloned, &r, 0.75, 0.5);
+        assert!(c[3] > 0.99 && (c[0] - 1.0).abs() < 1e-3, "cloned: {c:?}");
+        assert!(texel(&cloned, &r, 0.25, 0.5)[3] > 0.99, "source kept");
+
+        // Smudge from the spot towards the right drags paint into empty texels.
+        let mut comp3 = Compositor::new(&g.device, &g.queue);
+        let step = 0.06;
+        let frames: Vec<(Vec<Dab>, [f32; 2])> = (0..4)
+            .map(|k| {
+                let u = 0.3 + step * k as f32;
+                let motion = if k == 0 { 0.0 } else { step * RES as f32 };
+                (vec![uv_dab(u, 0.5, 0.06)], [motion, 0.0])
+            })
+            .collect();
+        let frames: Vec<(&[Dab], [f32; 2])> =
+            frames.iter().map(|(d, m)| (d.as_slice(), *m)).collect();
+        assert_eq!(texel(&spot, &r, 0.42, 0.5)[3], 0.0, "empty before");
+        let smudged = run(
+            &g,
+            &mut comp3,
+            &mut r,
+            spot,
+            StrokeMode::Smudge,
+            None,
+            &frames,
+            None,
+        );
+        let s = texel(&smudged, &r, 0.42, 0.5);
+        assert!(s[3] > 0.3, "paint dragged right: {s:?}");
     }
 }

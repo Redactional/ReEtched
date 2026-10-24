@@ -122,6 +122,12 @@ fn fs_splat(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(acc, 0.0, 0.0, acc);
 }
 
+// Polygon Fill: whole triangles.
+@fragment
+fn fs_fill(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4(1.0, 0.0, 0.0, 1.0);
+}
+
 // ---------------------------------------------------------------- apply
 
 struct Apply {
@@ -129,6 +135,8 @@ struct Apply {
     color: vec4<f32>,
     // x: stroke opacity, y: erase
     params: vec4<f32>,
+    // x: 1 = copy paint from an offset (clone, smudge), yz: offset in texels
+    extra: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> A: Apply;
@@ -148,6 +156,20 @@ fn fs_apply(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let m = textureLoad(stroke_mask, p, 0).r * A.params.x;
     if A.params.y > 0.5 {
         return vec4(b.rgb, b.a * (1.0 - m));
+    }
+    if A.extra.x > 0.5 {
+        let size = vec2<i32>(textureDimensions(before));
+        let q = clamp(p + vec2<i32>(round(A.extra.yz)), vec2(0), size - 1);
+        let s = textureLoad(before, q, 0);
+        let a = mix(b.a, s.a, m);
+        if a <= 0.0 {
+            return vec4(b.rgb, 0.0);
+        }
+        var rgb = (s.rgb * s.a * m + b.rgb * b.a * (1.0 - m)) / a;
+        if A.color.w > 0.5 {
+            rgb = normalize(rgb);
+        }
+        return vec4(rgb, a);
     }
     let a = m + b.a * (1.0 - m);
     if a <= 0.0 {

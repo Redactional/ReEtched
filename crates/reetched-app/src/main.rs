@@ -16,10 +16,20 @@ mod paint_ui;
 mod panels;
 mod preview;
 mod procedural;
+mod reimport;
 mod smart_presets;
 mod stack_ui;
 mod theme;
+mod tools_ui;
 mod viewport;
+
+/// GPU tests take turns: many devices at once, at low process priority,
+/// stall some drivers.
+#[cfg(test)]
+pub fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use anyhow::{Context, Result};
 use egui_winit::winit::{

@@ -98,7 +98,7 @@ impl Tool {
         (Tool::Smudge, ic::ICON_GESTURE, "Smudge (5)"),
         (Tool::Clone, ic::ICON_CONTENT_COPY, "Clone (6)"),
         (Tool::Picker, ic::ICON_COLORIZE, "Material picker (P)"),
-        (Tool::Path, ic::ICON_POLYLINE, "Path"),
+        (Tool::Path, ic::ICON_POLYLINE, "Path (7)"),
     ];
 }
 
@@ -163,6 +163,16 @@ pub struct State {
     pub tool: Tool,
     pub brush: Brush,
     pub stroke: Option<ActiveStroke>,
+    pub polygon_mode: reetched_io::topology::Selection,
+    /// Mesh adjacency for Polygon Fill (built on first use).
+    pub topology: Option<std::sync::Arc<reetched_io::topology::Topology>>,
+    /// Clone source: UV and texture set.
+    pub clone_source: Option<(glam::Vec2, usize)>,
+    /// Source minus destination (UV), fixed by the first stroke after picking a source.
+    pub clone_offset: Option<glam::Vec2>,
+    /// Path tool points (object space) and whether committing erases.
+    pub path_points: Vec<Vec3>,
+    pub path_erase: bool,
     /// Properties shows the tool (true) or the selected layer (false).
     pub properties_tool: bool,
     /// Latest pen pressure (1 with a mouse).
@@ -261,6 +271,12 @@ impl App {
             tool: Tool::Paint,
             brush: Brush::default(),
             stroke: None,
+            polygon_mode: reetched_io::topology::Selection::Polygon,
+            topology: None,
+            clone_source: None,
+            clone_offset: None,
+            path_points: Vec::new(),
+            path_erase: false,
             properties_tool: false,
             pressure: 1.0,
             last_stroke_end: None,
@@ -412,6 +428,13 @@ impl App {
             }
             if shortcut(ui, "Save as…", "Ctrl+Shift+S") {
                 self.state.save(true);
+            }
+            if ui
+                .button("Reimport mesh…")
+                .on_hover_text("Swap in a changed mesh and keep the paint")
+                .clicked()
+            {
+                self.state.reimport_mesh_dialog();
             }
             ui.separator();
             if shortcut(ui, "Export textures…", "Ctrl+Shift+E") {
@@ -741,15 +764,21 @@ impl State {
 
     pub fn load_mesh(&mut self, path: &Path) {
         match reetched_io::load_mesh(path) {
-            Ok(mesh) => {
+            Ok(mut mesh) => {
                 let name = path.file_name().map_or_else(
                     || path.display().to_string(),
                     |n| n.to_string_lossy().into_owned(),
                 );
                 if !mesh.has_uvs {
-                    self.warn(format!(
-                        "{name} has no UVs; painting will need UVs (auto-unwrap arrives in Phase 6)"
-                    ));
+                    match reetched_io::unwrap(&mesh) {
+                        Ok(m) => {
+                            mesh = m;
+                            self.info(format!("{name} had no UVs; generated them"));
+                        }
+                        Err(e) => self.warn(format!(
+                            "{name} has no UVs and unwrapping failed ({e:#}); painting needs UVs"
+                        )),
+                    }
                 }
                 self.set_mesh(mesh, name, None);
                 self.doc.mesh_source = Some(path.display().to_string());
@@ -780,6 +809,10 @@ impl State {
         self.resources = Resources::default();
         self.history = History::new(&self.doc);
         self.stroke = None;
+        self.topology = None;
+        self.clone_source = None;
+        self.clone_offset = None;
+        self.path_points.clear();
         self.viewport.clear_paint_cache();
         self.select_top_layer();
         self.export.include = vec![true; self.doc.texture_sets.len()];
@@ -1084,8 +1117,10 @@ impl State {
         ui.vertical_centered(|ui| {
             for (tool, icon, name) in Tool::ALL {
                 let tip = match tool {
-                    Tool::Paint | Tool::Eraser => name.to_string(),
-                    _ => format!("{name} — arrives in a later phase"),
+                    Tool::Projection | Tool::Picker => {
+                        format!("{name} — arrives in a later phase")
+                    }
+                    _ => name.to_string(),
                 };
                 if icon_button(ui, icon, self.tool == tool, &tip).clicked() {
                     self.tool = tool;
@@ -1296,10 +1331,12 @@ mod tests {
         ctx: egui::Context,
         renderer: egui_wgpu::Renderer,
         app: App,
+        _turn: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Harness {
         fn new() -> Option<Self> {
+            let turn = crate::gpu_test_lock();
             let instance =
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
@@ -1330,6 +1367,7 @@ mod tests {
                 ctx,
                 renderer,
                 app,
+                _turn: turn,
             })
         }
 
@@ -1383,6 +1421,31 @@ mod tests {
             }
             self.frame(vec![button(to, false)]);
             self.frame(vec![]);
+        }
+
+        fn click(&mut self, at: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            self.frame(vec![]);
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            let ev = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![ev(true)]);
+            self.frame(vec![ev(false)]);
         }
     }
 
@@ -1749,5 +1812,87 @@ mod tests {
             assert!(c.passed(), "{ch:?}: mean {}, off {}", c.mean, c.off);
         }
         h.frame(vec![]);
+    }
+
+    #[test]
+    fn polygon_fill_and_path_tools_paint_through_the_ui() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let rect = h.app.state.view3d_rect;
+        h.app.state.doc.texture_sets[0].resolution = 512;
+        h.frame(vec![]);
+
+        // Polygon Fill, whole mesh: the sphere is one connected mesh, so every tile gets paint.
+        h.app.state.tool = Tool::PolygonFill;
+        h.app.state.polygon_mode = reetched_io::topology::Selection::Mesh;
+        h.click(rect.center());
+        assert_eq!(h.base_color_tiles(), 4, "all of a 512² texture");
+        h.app.state.history.undo(&mut h.app.state.doc);
+        h.frame(vec![]);
+        assert_eq!(h.base_color_tiles(), 0);
+
+        // Path: two clicks, then Enter paints along them.
+        h.app.state.tool = Tool::Path;
+        h.click(rect.center() - vec2(30.0, 0.0));
+        h.click(rect.center() + vec2(30.0, 10.0));
+        assert_eq!(h.app.state.path_points.len(), 2);
+        h.key(egui::Key::Enter);
+        assert!(h.base_color_tiles() > 0, "the path painted");
+        assert!(h.app.state.path_points.is_empty());
+    }
+
+    #[test]
+    fn reimporting_with_new_uvs_keeps_the_paint() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        h.app.state.doc.texture_sets[0].resolution = 256;
+        h.frame(vec![]);
+        let rect = h.app.state.view3d_rect;
+        h.stroke(
+            rect.center() - vec2(20.0, 0.0),
+            rect.center() + vec2(20.0, 0.0),
+        );
+        let painted = |h: &Harness| -> Vec<(u32, u32)> {
+            let s = &h.app.state;
+            let NodeKind::Paint(p) = &s.doc.texture_sets[0].stack[0].kind else {
+                panic!("paint layer")
+            };
+            let map = &p.channels[&Channel::BaseColor];
+            (0..256 * 256)
+                .map(|i| (i % 256, i / 256))
+                .filter(|&(x, y)| map.texel(&s.resources, x, y)[3] > 0.99)
+                .collect()
+        };
+        let before = painted(&h);
+        assert!(before.len() > 50, "the stroke painted texels");
+
+        // Same sphere, UVs mirrored left-right.
+        let mut mirrored = h.app.state.mesh.clone();
+        mirrored
+            .vertices
+            .iter_mut()
+            .for_each(|v| v.uv[0] = 1.0 - v.uv[0]);
+        h.app.state.reimport_with(mirrored, "mirrored".into());
+        h.frame(vec![]);
+        let after = painted(&h);
+        let moved = before
+            .iter()
+            .filter(|&&(x, y)| after.contains(&(255 - x, y)))
+            .count();
+        assert!(
+            moved * 10 >= before.len() * 8,
+            "{moved} of {} painted texels found mirrored",
+            before.len()
+        );
     }
 }

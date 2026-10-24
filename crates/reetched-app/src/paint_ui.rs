@@ -5,7 +5,7 @@ use crate::{
     app::{Selected, State, Tool, icon_button},
     brush::{Axis, StrokePath, Symmetry, ViewInfo, raycast, uv_dab, view_ray, world_dabs},
     compositor::MASK_SLOT,
-    paint_gpu::{BrushShape, Camera, Dab, StrokeTarget},
+    paint_gpu::{BrushShape, Camera, Dab, StrokeMode, StrokeTarget},
     theme,
 };
 use egui::{Color32, ComboBox, Rect, RichText, Slider, Stroke, Ui, vec2};
@@ -19,17 +19,22 @@ pub struct ActiveStroke {
     set: usize,
     /// Painting in the 2D (UV) view rather than the 3D view.
     uv: bool,
-    path: StrokePath,
+    pub path: StrokePath,
     shape: BrushShape,
+    /// Smudge: UV under the brush at the end of the last frame.
+    last_uv: Option<Vec2>,
 }
 
 impl State {
     /// Handles painting input over a view. `uv`: the 2D view.
     pub fn paint_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, uv: bool) {
-        if !matches!(self.tool, Tool::Paint | Tool::Eraser) {
+        if !matches!(
+            self.tool,
+            Tool::Paint | Tool::Eraser | Tool::Smudge | Tool::Clone
+        ) {
             return;
         }
-        let (alt, shift, pressed, down, pos, touch) = ui.input(|i| {
+        let (alt, shift, ctrl, pressed, down, pos, touch) = ui.input(|i| {
             let touch = i.events.iter().rev().find_map(|e| match e {
                 egui::Event::Touch { force, .. } => *force,
                 _ => None,
@@ -37,6 +42,7 @@ impl State {
             (
                 i.modifiers.alt,
                 i.modifiers.shift,
+                i.modifiers.ctrl,
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
                 i.pointer.interact_pos(),
@@ -62,11 +68,37 @@ impl State {
             painter.circle_stroke(p, r, Stroke::new(1.0, Color32::from_white_alpha(200)));
         }
 
+        // Clone: Ctrl+click picks the source; the first stroke after sets the offset.
+        if self.tool == Tool::Clone
+            && let Some((src, _)) = self.clone_source
+        {
+            let painter = ui.painter_at(rect);
+            if let Some(p) = self.uv_to_screen(src, rect, uv) {
+                painter.circle_stroke(p, 6.0, Stroke::new(2.0, Color32::from_rgb(255, 170, 60)));
+            }
+        }
+        if pressed && response.hovered() && !alt && ctrl && self.tool == Tool::Clone {
+            if let Some((src, part)) = pos.and_then(|p| self.uv_under(p, rect, uv)) {
+                self.clone_source = Some((src, part));
+                self.clone_offset = None;
+                self.info("Clone source set — paint to copy from it".into());
+            }
+            return;
+        }
+
         if pressed && response.hovered() && !alt && self.stroke.is_none() {
             if touch.is_none() {
                 self.pressure = 1.0;
             }
-            if self.begin_stroke(uv) {
+            let mode = match self.tool {
+                Tool::Eraser => Some(StrokeMode::Erase),
+                Tool::Smudge => Some(StrokeMode::Smudge),
+                Tool::Clone => self.clone_mode(pos, rect, uv),
+                _ => Some(StrokeMode::Paint),
+            };
+            if let Some(mode) = mode
+                && self.begin_stroke(uv, mode)
+            {
                 // Shift+click: straight line from where the last stroke ended.
                 if shift
                     && let (Some((was_uv, from)), Some(stroke)) =
@@ -96,8 +128,46 @@ impl State {
         }
     }
 
-    fn begin_stroke(&mut self, uv: bool) -> bool {
-        let erase = self.tool == Tool::Eraser;
+    /// Clone's stroke mode for a stroke starting at `pos`, or None (with a hint).
+    fn clone_mode(&mut self, pos: Option<egui::Pos2>, rect: Rect, uv: bool) -> Option<StrokeMode> {
+        let Some((src, _)) = self.clone_source else {
+            self.warn("Ctrl+click to choose where to clone from".into());
+            return None;
+        };
+        let (start, _) = self.uv_under(pos?, rect, uv)?;
+        let offset = *self.clone_offset.get_or_insert(src - start);
+        let res = self.doc.texture_sets.get(self.selected_part)?.resolution as f32;
+        // Texel rows run downwards, UV v upwards.
+        Some(StrokeMode::Clone {
+            offset: [offset.x * res, -offset.y * res],
+        })
+    }
+
+    /// The UV under a point of a view, and the texture set it's on.
+    pub fn uv_under(&self, p: egui::Pos2, rect: Rect, uv: bool) -> Option<(Vec2, usize)> {
+        if uv {
+            let cam = &self.uv_camera;
+            let at =
+                cam.center + Vec2::new(p.x - rect.center().x, rect.center().y - p.y) / cam.zoom;
+            return Some((at, self.selected_part));
+        }
+        let view = self.view_info(rect);
+        let ndc = Vec2::new(
+            (p.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+            1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
+        );
+        let (origin, dir) = view_ray(view.view_proj, ndc);
+        raycast(&self.mesh, origin, dir).map(|h| (h.uv, h.part))
+    }
+
+    /// Where a UV shows in a view (2D view only; the 3D view would need a search).
+    fn uv_to_screen(&self, at: Vec2, rect: Rect, uv: bool) -> Option<egui::Pos2> {
+        uv.then(|| self.uv_camera.to_screen(rect, at))
+    }
+
+    pub fn begin_stroke(&mut self, uv: bool, mode: StrokeMode) -> bool {
+        // Erase, smudge and clone work on the channels the layer has; paint on the brush's.
+        let erase = mode != StrokeMode::Paint;
         let Some(sel) = self.selected else {
             self.warn("Select a paint layer or a mask to paint on".into());
             return false;
@@ -173,7 +243,7 @@ impl State {
             targets,
             res,
             &self.resources,
-            erase,
+            mode,
             self.brush.opacity,
         );
         self.stroke = Some(ActiveStroke {
@@ -182,17 +252,19 @@ impl State {
             uv,
             path: StrokePath::default(),
             shape,
+            last_uv: None,
         });
         true
     }
 
     /// Turns stamp positions (screen points) into dabs and paints them.
-    fn stamp(&mut self, points: &[Vec2], rect: Rect) {
+    pub fn stamp(&mut self, points: &[Vec2], rect: Rect) {
         let Some(stroke) = &self.stroke else { return };
         if points.is_empty() {
             return;
         }
         let mut dabs: Vec<Dab> = Vec::new();
+        let mut end_uv = None;
         if stroke.uv {
             let cam = &self.uv_camera;
             for p in points {
@@ -204,6 +276,7 @@ impl State {
                     self.brush.size / cam.zoom,
                     self.pressure,
                 ));
+                end_uv = Some(uv);
             }
         } else {
             let view = self.view_info(rect);
@@ -216,6 +289,7 @@ impl State {
                 if let Some(hit) = raycast(&self.mesh, origin, dir).filter(|h| h.part == stroke.set)
                 {
                     dabs.extend(world_dabs(&self.brush, &view, &hit, self.pressure));
+                    end_uv = Some(hit.uv);
                 }
             }
         }
@@ -236,8 +310,30 @@ impl State {
             backface_cos: stroke.shape.backface_cos,
             alpha: stroke.shape.alpha.clone(),
         };
-        self.viewport
-            .paint_dabs(&self.device, &self.queue, set, &camera, !uv, &shape, &dabs);
+        // Smudge drags paint by how far the brush moved in texels this frame.
+        let res = self
+            .doc
+            .texture_sets
+            .get(set)
+            .map_or(0.0, |s| s.resolution as f32);
+        let stroke = self.stroke.as_mut().expect("checked above");
+        let motion = match (stroke.last_uv, end_uv) {
+            (Some(a), Some(b)) => [(b.x - a.x) * res, -(b.y - a.y) * res],
+            _ => [0.0; 2],
+        };
+        if end_uv.is_some() {
+            stroke.last_uv = end_uv;
+        }
+        self.viewport.paint_dabs(
+            &self.device,
+            &self.queue,
+            set,
+            &camera,
+            !uv,
+            &shape,
+            &dabs,
+            motion,
+        );
     }
 
     pub fn end_stroke(&mut self) {
@@ -350,17 +446,21 @@ impl State {
         let target = self.paint_target_label();
         let names = self.doc.resources.clone();
         let mut pick_alpha = false;
+        ui.label(theme::header(match self.tool {
+            Tool::Eraser => "ERASER",
+            Tool::PolygonFill => "POLYGON FILL",
+            Tool::Smudge => "SMUDGE",
+            Tool::Clone => "CLONE",
+            Tool::Path => "PATH",
+            _ => "PAINT",
+        }));
+        ui.label(RichText::new(target).color(theme::WEAK));
+        self.tool_options_ui(ui);
+        ui.add_space(4.0);
         let b = &mut self.brush;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                ui.label(theme::header(if self.tool == Tool::Eraser {
-                    "ERASER"
-                } else {
-                    "PAINT"
-                }));
-                ui.label(RichText::new(target).color(theme::WEAK));
-                ui.add_space(4.0);
                 egui::Grid::new("brush")
                     .num_columns(2)
                     .spacing(vec2(12.0, 6.0))
@@ -437,7 +537,7 @@ impl State {
                         ui.end_row();
                     });
 
-                if self.tool == Tool::Paint {
+                if matches!(self.tool, Tool::Paint | Tool::PolygonFill | Tool::Path) {
                     ui.add_space(8.0);
                     ui.label(theme::header("MATERIAL"));
                     if self.selected.is_some_and(|s| s.mask) {
@@ -512,21 +612,24 @@ impl State {
             return;
         }
         use egui::Key;
-        let (paint, erase, smaller, bigger) = ctx.input(|i| {
+        let (smaller, bigger) = ctx.input(|i| {
             (
-                i.key_pressed(Key::Num1),
-                i.key_pressed(Key::Num2),
                 i.key_pressed(Key::OpenBracket),
                 i.key_pressed(Key::CloseBracket),
             )
         });
-        if paint {
-            self.tool = Tool::Paint;
-            self.properties_tool = true;
-        }
-        if erase {
-            self.tool = Tool::Eraser;
-            self.properties_tool = true;
+        for (key, tool) in [
+            (Key::Num1, Tool::Paint),
+            (Key::Num2, Tool::Eraser),
+            (Key::Num4, Tool::PolygonFill),
+            (Key::Num5, Tool::Smudge),
+            (Key::Num6, Tool::Clone),
+            (Key::Num7, Tool::Path),
+        ] {
+            if ctx.input(|i| i.key_pressed(key)) {
+                self.tool = tool;
+                self.properties_tool = true;
+            }
         }
         if smaller {
             self.brush.size = (self.brush.size / 1.2).max(1.0);

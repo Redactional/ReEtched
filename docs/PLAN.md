@@ -370,6 +370,11 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
 - Color management: OCIO v2 through our own binding (ACES 1.x and 2.0 configs), per-bitmap color space, display transform.
 - USD import/export with materials. Mesh export with displacement. Layered PSD export.
 
+- **Status (first pass: tools, projections, reimport):**
+  - Built: Polygon Fill (triangle, flat polygon, UV island, mesh; click or Ctrl+click to erase; 3D and 2D views), Smudge, Clone (Ctrl+click source, relative offset), Path (click points in 3D, Catmull-Rom curve, paint or erase); spherical and cylindrical fill projections and fill symmetry (mirror X/Y/Z); auto-unwrap of meshes without UVs (the pure-Rust `uvunwrap` crate instead of xatlas, so no C++ build); Reimport mesh, which re-projects every paint layer and painted mask from the old surface onto the new UVs by ray casting (the baker's machinery), matching texture sets by name.
+  - **Differences from the plan:** reimport re-projects pixels rather than replaying a 3D dab history, so it works on any existing project (including Painter imports) but resamples paint once. Smudge and Clone copy in UV space, so they stop at UV seams.
+  - **Deferred:** marquee and loop selection for Polygon Fill, the Projection tool, ribbon and filled paths, smudge along paths, text and SVG resources, dynamic strokes, warp-grid and UV-set-to-UV-set projections, UDIM, and everything in rendering, color management and USD/PSD (left for a later pass).
+
 ### Phase 7: Ecosystem (≈3 months, can overlap Phase 6)
 - **Python scripting API** (pyo3), modelled on `substance_painter` concepts (project, layerstack, textureset, export, resource, baking, event). Porting existing Painter scripts should feel familiar. Use our own names where needed; don't clone Adobe's docs.
 - Plugin system for Python plugins, with WASM for sandboxed custom nodes later.

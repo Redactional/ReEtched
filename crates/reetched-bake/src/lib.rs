@@ -296,6 +296,43 @@ fn sample2d(i: u32, n: u32, texel: u32) -> (f32, f32) {
     (u, v)
 }
 
+/// For mesh reimport: where each texel of `new`'s part `part` (at `res`²)
+/// lies on `old`, as an old UV, or None if the old surface isn't there.
+/// Only hits on `old`'s part `old_part` count. Texels are row-major, row 0 at
+/// the top (v = 1). Rays follow averaged normals both ways, up to `reach` × the
+/// mesh's size, so moved or reshaped geometry still finds its old surface.
+pub fn transfer(
+    new: &Mesh,
+    part: usize,
+    old: &Mesh,
+    old_part: usize,
+    res: u32,
+    reach: f32,
+) -> Vec<Option<[f32; 2]>> {
+    let scene = Scene::new(old);
+    let texels = rasterize(new, part, res, 1);
+    let (lo, hi) = new.bounds();
+    let d = (hi - lo).length().max(1e-6) * reach;
+    texels
+        .par_iter()
+        .map(|samples| {
+            let s = samples.first()?;
+            let (tri, t) = scene.hit(s.pos + s.ray_dir * d, -s.ray_dir, 2.0 * d)?;
+            if scene.part(tri) != old_part {
+                return None;
+            }
+            let p = s.pos + s.ray_dir * (d - t);
+            let idx = &old.indices[tri * 3..tri * 3 + 3];
+            let v = |k: usize| &old.vertices[idx[k] as usize];
+            let [a, b, c] = [0, 1, 2].map(|k| Vec3::from(v(k).position));
+            let w = barycentric(p, a, b, c);
+            let uv =
+                Vec2::from(v(0).uv) * w.x + Vec2::from(v(1).uv) * w.y + Vec2::from(v(2).uv) * w.z;
+            Some(uv.into())
+        })
+        .collect()
+}
+
 /// A stable, distinct color per mesh part (for ID maps).
 pub fn id_color(part: usize) -> [f32; 3] {
     let h = (part as f32 * 0.618_034).fract();
@@ -693,6 +730,39 @@ mod tests {
                 &progress
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn transfer_follows_the_surface_to_its_old_uvs() {
+        let old = quad(0.0, [0.0, 0.0, 1.0]);
+        // Same surface, UVs mirrored left-right.
+        let mut new = old.clone();
+        new.vertices
+            .iter_mut()
+            .for_each(|v| v.uv[0] = 1.0 - v.uv[0]);
+        let res = 16;
+        let map = transfer(&new, 0, &old, 0, res, 0.05);
+        // New texel (x, y) is at old u = 1 - (x + 0.5) / res, same v.
+        for (x, y) in [(2, 3), (13, 8), (7, 14)] {
+            let uv = map[(y * res + x) as usize].expect("on the surface");
+            let want_u = 1.0 - (x as f32 + 0.5) / res as f32;
+            let want_v = 1.0 - (y as f32 + 0.5) / res as f32;
+            assert!(
+                (uv[0] - want_u).abs() < 1e-3 && (uv[1] - want_v).abs() < 1e-3,
+                "{uv:?}"
+            );
+        }
+        // A surface far from the old one finds nothing.
+        let far: Mesh = {
+            let mut m = old.clone();
+            m.vertices.iter_mut().for_each(|v| v.position[2] = 5.0);
+            m
+        };
+        assert!(
+            transfer(&far, 0, &old, 0, res, 0.05)
+                .iter()
+                .all(Option::is_none)
         );
     }
 }

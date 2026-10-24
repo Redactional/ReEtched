@@ -261,9 +261,9 @@ impl State {
 
     pub fn properties_ui(&mut self, ui: &mut Ui) {
         if self.properties_tool
-            && matches!(
+            && !matches!(
                 self.tool,
-                crate::app::Tool::Paint | crate::app::Tool::Eraser
+                crate::app::Tool::Projection | crate::app::Tool::Picker
             )
         {
             self.brush_ui(ui);
@@ -1187,6 +1187,16 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
                 ui.horizontal(|ui| {
                     for v in &mut p.rotation3d_deg {
                         ui.add(DragValue::new(v).speed(0.5).suffix("°"));
+                    }
+                });
+                ui.end_row();
+            }
+            if p.mode != ProjectionMode::Uv {
+                ui.label("Symmetry");
+                ui.horizontal(|ui| {
+                    for (m, axis) in p.mirror.iter_mut().zip(["X", "Y", "Z"]) {
+                        ui.toggle_value(m, axis)
+                            .on_hover_text(format!("Mirror the projection across {axis} = 0"));
                     }
                 });
                 ui.end_row();

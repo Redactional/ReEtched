@@ -344,13 +344,17 @@ pub enum ProjectionMode {
     Uv,
     Triplanar,
     Planar,
+    Spherical,
+    Cylindrical,
 }
 
 impl ProjectionMode {
-    pub const ALL: [ProjectionMode; 3] = [
+    pub const ALL: [ProjectionMode; 5] = [
         ProjectionMode::Uv,
         ProjectionMode::Triplanar,
         ProjectionMode::Planar,
+        ProjectionMode::Spherical,
+        ProjectionMode::Cylindrical,
     ];
 
     pub fn label(self) -> &'static str {
@@ -358,6 +362,8 @@ impl ProjectionMode {
             ProjectionMode::Uv => "UV projection",
             ProjectionMode::Triplanar => "Tri-planar projection",
             ProjectionMode::Planar => "Planar projection",
+            ProjectionMode::Spherical => "Spherical projection",
+            ProjectionMode::Cylindrical => "Cylindrical projection",
         }
     }
 }
@@ -377,6 +383,9 @@ pub struct Projection {
     pub rotation3d_deg: [f32; 3],
     /// World units covered by one texture repeat.
     pub size: f32,
+    /// Fill symmetry: mirror the projection across the object's X, Y, Z = 0 planes.
+    #[serde(default)]
+    pub mirror: [bool; 3],
 }
 
 impl Default for Projection {
@@ -390,6 +399,7 @@ impl Default for Projection {
             position: [0.0; 3],
             rotation3d_deg: [0.0; 3],
             size: 1.0,
+            mirror: [false; 3],
         }
     }
 }

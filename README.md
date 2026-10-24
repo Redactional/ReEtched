@@ -2,17 +2,19 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 5 of 9 done).** You can bake mesh maps, paint and texture a model with layers, procedural and smart materials, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), save projects and export game-ready textures. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 6 of 9 under way).** You can bake mesh maps, paint and texture a model with layers, procedural and smart materials, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), save projects and export game-ready textures. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
-- Load **FBX, OBJ, glTF/GLB** meshes; each material becomes a texture set, like in Painter
+- Load **FBX, OBJ, glTF/GLB** meshes; each material becomes a texture set, like in Painter. Meshes without UVs are unwrapped automatically
+- **Reimport mesh** (File menu): swap in a changed mesh and keep the paint, re-projected onto the new UVs
 - Painter-style interface: tool strip, Assets, 3D and 2D (UV) views, Texture Set List, Layers, Properties — every panel can be dragged, re-docked, closed and restored from the **Window** menu
 - PBR (metal/rough) 3D view with HDR image-based lighting, tone mapping, wireframe, perspective/orthographic cameras and solo-channel view modes
 - 2D UV view of the selected texture set
 - **Painting** on the model or in the 2D view: paint layers and paint inside masks, eraser, size/flow/stroke opacity/spacing/hardness/angle, image alphas, backface culling, mirror and radial symmetry, lazy mouse, Shift+click lines, pen pressure (**1** paint, **2** eraser, **[ ]** size)
+- **Polygon Fill** (**4**): fill a triangle, flat polygon, UV island or whole mesh with a click (Ctrl+click erases); **Smudge** (**5**); **Clone** (**6**, Ctrl+click sets the source); **Path** (**7**): click points, Enter paints along a smooth curve through them
 - **Layer stack** like Painter's: paint layers, fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image/painted masks, drag to reorder
-- Fill layers with a color or image per channel (base color, metallic, roughness, normal, height) and UV, tri-planar or planar projection
+- Fill layers with a color or image per channel (base color, metallic, roughness, normal, height) and UV, tri-planar, planar, spherical or cylindrical projection, with optional symmetry
 - **Baking** (Texture Set Settings → Mesh maps → Bake…): normal (high to low, with cage distances), world-space normal, ID, ambient occlusion, curvature, position, thickness, height and opacity, with antialiasing and dilation; or import maps you baked in Painter (`TextureSetName_MeshMapName` naming)
 - **Mask effects**: generators driven by the mesh maps (edge wear, cavity, AO, position gradient, thickness, noise), Levels and Color Selection (pick ID colors on the model)
 - **Smart materials**: built-ins (Painted Steel Worn, Rusty Iron, Dusty Plastic, Gold Grime), save any layer or folder as a `.rsm` file and import it into other projects
