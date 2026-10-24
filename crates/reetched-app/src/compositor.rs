@@ -1097,7 +1097,8 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         .iter()
         .enumerate()
         .map(|(i, &m)| if m { 1 << i } else { 0 })
-        .sum::<u32>() as f32;
+        .sum::<u32>() as f32
+        + if p.repeat { 0.0 } else { 8.0 };
     let w = &p.warp;
     ProjUniform {
         a: [

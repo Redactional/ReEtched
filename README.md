@@ -22,7 +22,8 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - **Smart materials**: built-ins (Painted Steel Worn, Rusty Iron, Dusty Plastic, Gold Grime), save any layer or folder as a `.rsm` file and import it into other projects
 - View modes for every baked mesh map
 - **Procedural materials**: a built-in library (brushed steel, plastic, wood planks, fabric, concrete, rust, leather, bricks) with editable parameters, rendered in the background at any resolution
-- **Painter projects**: the [ReEtched Bridge](tools/painter-bridge) plugin exports a project from Painter 10+; File > Import Painter bridge rebuilds its layer stack (blend modes, opacities, masks, fills) with paint as editable pixels, then checks the result against Painter's own export. The plugin has not been tried in Painter yet
+- **Painter `.spp` projects without Painter** (File > Import Painter project, or drag and drop; read-only, the `.spp` is never changed): texture sets, channels, the layer stack with folders, fills (colors and images, UV/tri-planar/planar), blending, opacity and masks, baked mesh maps and the mesh, with paint replayed from the stored brush strokes; the result is checked against Painter's own cached output. Procedural (`.sbsar`) fills, filters, decals and smudge strokes aren't converted yet, and stroke replay is approximate (see [the format notes](docs/spp-format.md))
+- **Painter projects through Painter**: the [ReEtched Bridge](tools/painter-bridge) plugin exports a project from Painter 10+; File > Import Painter bridge rebuilds its layer stack (blend modes, opacities, masks, fills) with paint as editable pixels, then checks the result against Painter's own export. The plugin has not been tried in Painter yet
 - **Substance Designer `.sbs` graphs**: import them (File menu, Assets panel or drag and drop) and use them as fill layers with their own parameters — no Adobe software needed. Graphs that use Designer's `sbs://` library need Substance Designer installed; anything missing is reported
 - Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack to add a fill layer
 - **Projects** (`.retx`): save and reopen everything, including the mesh and images; undo/redo
@@ -78,6 +79,7 @@ crates/
   reetched-color/  pure-Rust OpenColorIO v2 subset: configs, transforms, LUTs, ACES 1.x / 2.x
   reetched-shader/ Painter custom shader (.glsl) translation, with our own implementation of its shader API
   reetched-trace/  GPU path tracer (wgpu compute, BVH)
+  reetched-spp/    read-only Painter project (.spp) conversion
   reetched-library/ asset library: folder scanning, kinds, tags, favorites, thumbnails, file watching
   reetched-script/ Python scripting host: finds your Python and drives the bridge
   reetched-python/ the Python side: the `reetched` module and plugin loader (pyo3, loaded at runtime)

@@ -1,9 +1,10 @@
-//! Importing a ReEtched Bridge bundle (a Painter project exported by the
-//! plugin in `tools/painter-bridge`) and checking it against Painter's export.
+//! Importing Painter projects, from a ReEtched Bridge bundle (exported by
+//! the plugin in `tools/painter-bridge`) or straight from a `.spp` file, and
+//! checking the result against Painter's own output.
 
 use crate::app::State;
 use reetched_doc::{Channel, export::linear_to_srgb};
-use reetched_substance::bridge::{self, Reference};
+use reetched_substance::bridge::{self, Imported, Reference};
 use std::path::Path;
 
 /// How one channel of one texture set compares with Painter's export.
@@ -46,15 +47,52 @@ impl State {
                 return Vec::new();
             }
         };
-        let name = crate::app::file_name(dir);
+        let references = imported.references.clone();
+        self.apply_imported(imported, crate::app::file_name(dir), "Bridge");
+        self.report_checks(&references, "Bridge")
+    }
+
+    pub fn import_spp_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Painter project", &["spp"])
+            .pick_file()
+        {
+            self.import_spp(&path);
+        }
+    }
+
+    /// Converts a Painter `.spp` project (read-only; the file is never changed).
+    pub fn import_spp(&mut self, path: &Path) -> Vec<Check> {
+        let converted = match reetched_spp::convert::convert(path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.error(format!("Could not convert {}: {e:#}", path.display()));
+                return Vec::new();
+            }
+        };
+        let name = crate::app::file_name(path);
+        let references = converted.imported.references.clone();
+        self.apply_imported(converted.imported, name, "Painter project");
+        self.replay_strokes(&converted.jobs);
+        self.history = reetched_doc::history::History::new(&self.doc);
+        self.report_checks(&references, "Painter project")
+    }
+
+    /// Shows an imported project, logs what didn't carry over and checks it
+    /// against Painter's output.
+    fn apply_imported(&mut self, imported: Imported, name: String, source: &str) {
         self.set_mesh(imported.mesh, name.clone(), Some(imported.doc));
         self.resources = imported.resources;
         self.project_path = None;
         self.info(format!("Imported Painter project {name}"));
         for line in imported.log {
-            self.warn(format!("Bridge: {line}"));
+            self.warn(format!("{source}: {line}"));
         }
-        let checks = self.verify(&imported.references);
+    }
+
+    /// Compares the document with Painter's output and logs the result.
+    fn report_checks(&mut self, references: &[Reference], source: &str) -> Vec<Check> {
+        let checks = self.verify(references);
         let failed = checks.iter().filter(|c| !c.passed()).count();
         for c in &checks {
             let text = format!(
@@ -77,7 +115,7 @@ impl State {
         }
         if !checks.is_empty() {
             self.info(format!(
-                "Bridge check: {} of {} channels match Painter's export",
+                "{source} check: {} of {} channels match Painter's output",
                 checks.len() - failed,
                 checks.len()
             ));

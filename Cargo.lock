@@ -1449,6 +1449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-pure"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18a2ed6aa54b01776adf71049f7f776284c22d6febe772155ac040105ffbd126"
+dependencies = [
+ "byteorder",
+ "flate2",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1961,6 +1971,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
 dependencies = [
  "logos-codegen",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -2554,7 +2573,7 @@ dependencies = [
  "derive_more",
  "half",
  "logos",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "num-traits",
  "regex-lite",
  "strum",
@@ -3138,6 +3157,7 @@ dependencies = [
  "reetched-library",
  "reetched-script",
  "reetched-shader",
+ "reetched-spp",
  "reetched-substance",
  "reetched-trace",
  "resvg",
@@ -3199,6 +3219,7 @@ dependencies = [
  "anyhow",
  "bevy_mikktspace",
  "bytemuck",
+ "flate2",
  "glam",
  "gltf",
  "log",
@@ -3243,6 +3264,22 @@ name = "reetched-shader"
 version = "0.1.0"
 dependencies = [
  "naga",
+ "serde_json",
+]
+
+[[package]]
+name = "reetched-spp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "hdf5-pure",
+ "image",
+ "log",
+ "lz4_flex 0.11.6",
+ "reetched-doc",
+ "reetched-io",
+ "reetched-substance",
  "serde_json",
 ]
 

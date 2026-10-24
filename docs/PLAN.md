@@ -36,7 +36,7 @@ Ranked by how reliable each one is. The plan builds all four, in this order.
 | **A** | **Native readers for the open formats**: `.sbs`, `.sbsar` metadata, `.spexp`, `.sbsprs`, Painter GLSL shaders, all meshes and images. | Exact | No | 1–5 |
 | **B** | **"ReEtched Bridge"**: a small Python plugin that runs *inside* Painter, uses Adobe's official API, and saves the whole project to our open format. | Layer stack, blend modes, opacities, masks, effects, fill settings and Substance parameter values are **exact**. Paint layers come across as **full-resolution pixels** (Painter's API does not expose brush strokes). | Yes, once, to export | 5 |
 | **C** | **Optional `sbsrender` hookup**: if the user has Substance Designer installed, we call Adobe's own renderer to render `.sbsar` materials live. | Exact | Designer | 5 |
-| **D** | **Direct `.spp` / `.spsm` reading** without Painter. | Goal: same as B. Builds on Universal-Painter-Files' findings, version by version. | No | 8 (long-term R&D) |
+| **D** | **`.spp` conversion** without Painter: read-only, into ReEtched projects. | Layers, fills and masks as in B; paint rebuilt from the stored brush strokes. | No | 8 |
 
 ### Limits
 
@@ -404,16 +404,18 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
   - **Performance:** wgpu pipeline cache saved between runs (Vulkan), a GPU cache budget for paint and image textures with least-recently-used eviction, a cached BVH for brush ray casts with parallel dab ray casts, and small CPU thumbnails for layers and masks keyed by content.
   - **Differences from the plan:** no WASM nodes yet. The path tracer shades metal/rough only (ASM/OpenPBR extras such as coat, sheen and transmission and custom GLSL shaders fall back to it), samples materials from a 1024² copy per tile, and has no multiple-scattering compensation. The app selects one layer at a time, so scripts selecting several get the first. Resource ids are integers derived from content hashes.
 
-### Phase 8: Direct Painter file reading (long-term R&D, clean-room)
-**Goal:** open `.spp`, `.spsm` and `.spmsk` **without Painter installed**.
-- Prerequisites:
-  - Adobe has been asked in writing for documentation;
-  - counsel has signed off;
-  - the clean-room process (§0) is in place.
-- **Step 1, the container:** read HDF5 (`hdf5` crate), list datasets, read `projectsettings.ini` and the version keys, extract embedded resources.
-- **Step 2, structure:** decode HBO streams (12-byte header, magic `0x1B7C2FDD`), one Painter version family at a time: 11/12 registry format first, then 8.1–10 inline format. Universal-Painter-Files' public schemas are the starting point; the clean-room spec is ours. Map them onto the same document model the Bridge fills. **The Bridge is the oracle**: for every test project, the direct reader must produce the same document the Bridge does.
-- **Step 3, paint data:** the black box. Investigate whether paint is stored as stroke records (best case: we replay strokes with our brush engine) or as cached rasters (we load the pixels). Either way it is gated on research results. **Not promised.**
-- **`.sbsasm` decoding**: lowest priority, highest risk. Only attempt it if Phase 4's atomic-node implementation is mature, since the compiled graph would run on those same nodes.
+### Phase 8: Painter project conversion (read-only)
+**Goal:** convert `.spp` projects (and later `.spsm` / `.spmsk`) into ReEtched projects **without Painter installed**. Conversion is one way: ReEtched reads Painter files and writes its own `.retx`; it never writes, edits or round-trips Adobe formats. This replaces the earlier "direct reading" plan and its prerequisites (decided by the project owner, 2026-10-24).
+- **Working rules:** formats are worked out only from projects the user saved themselves, read-only, plus the public MIT-licensed Universal-Painter-Files project; never from Painter's binaries, and no Adobe code or library assets. Format notes record where each fact came from. Painter files are never committed; tests that need them read a local folder named by an environment variable and skip without it.
+- **What the files hold** (from the user's projects, Painter document versions 67–82):
+  - HDF5 container; `projectsettings.ini`, `editor/*` settings; `paint/scene.assbin` (the mesh, an Assimp binary dump: an open format); `resources/<sha1>` (images: a Qt `QDataStream` header and LZ4-compressed pixels; `.sbsar` packages; shaders) with `resources/.alg_meta` (Qt maps: origin, usage); `texture-cache/` (Painter's final channel textures per texture set, LZ4).
+  - `paint/document.bin`: a self-describing object stream (magic `0x1B7C2FDD`): an inline tagged encoding up to version 78 and a "registry" encoding at version 82. It holds texture sets (`DataMaterial`), channels, the layer stack (`DataLayerColor`, `DataLayerGroup`), fills (`DataActionFill` + uniform, bitmap and procedural sources), filters, masks, blending, and **paint as brush strokes** (`DataActionPaint` with `DataStroke` points, pressure, timing and camera matrices); pixels of painted layers are not stored.
+- **Step 1, container and resources:** `reetched-spp` reads HDF5 in pure Rust, Qt maps, LZ4 images and the assbin mesh.
+- **Step 2, document:** decode both encodings into one tree; map texture sets, channels, layers, folders, blending, opacity, masks and fills (uniform and bitmap) onto the ReEtched document. Procedural (`.sbsar`) fills keep their parameters and use Painter's cached texture for the look.
+- **Step 3, paint:** replay strokes with ReEtched's brush engine (best effort, not pixel-identical); Painter's own `texture-cache` output is the reference to measure against, and the fallback when a layer can't be rebuilt.
+- **`.sbsasm` decoding**: not planned.
+- **Status (first pass):** steps 1 and 2 are done and step 3 is started. `reetched-spp` reads all 19 of the owner's projects (versions 67–82, both encodings, every image except JPEG 2000 tiles, the texture cache, the mesh) and converts them: texture sets, channels, folders, fill and paint layers, uniform and image fills with UV / tri-planar / planar projections (fills can now be non-repeating), blending, opacity, masks and baked maps. Paint and eraser strokes are replayed with ReEtched's brush (3D-view strokes through Painter's stored cameras, with symmetry). Each import is compared with Painter's cached channels: plain fill-and-image projects match closely (mean difference about 0.01–0.02 in base color).
+  - **Not yet:** procedural (`.sbsar`) fills, filters and generators, decals, smudge, text; masks built from fills; 2D-view strokes (no camera is stored; placement is approximate); brush size calibration; blend modes 9–11 confirmed in Painter; JPEG 2000 images; channels beyond the five metal/rough ones.
 
 ### Phase 9: 1.0 polish
 - UI/UX pass with Painter-familiar shortcuts as the default keymap, and an optional Blender-style keymap.

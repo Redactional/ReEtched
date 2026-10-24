@@ -29,6 +29,7 @@ mod settings;
 mod settings_ui;
 mod shader_ui;
 mod smart_presets;
+mod spp_replay;
 mod stack_ui;
 mod templates;
 mod text_ui;

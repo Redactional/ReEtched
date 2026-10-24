@@ -646,6 +646,14 @@ pub struct Projection {
     /// Warp projection lattice points in UV space (see `warp_identity`).
     #[serde(default = "warp_identity")]
     pub warp: [[f32; 2]; 16],
+    /// The image repeats; off, it appears once and the fill covers nothing
+    /// outside it (UV, warp and planar projections).
+    #[serde(default = "default_true")]
+    pub repeat: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Projection {
@@ -661,6 +669,7 @@ impl Default for Projection {
             size: 1.0,
             mirror: [false; 3],
             warp: warp_identity(),
+            repeat: true,
         }
     }
 }

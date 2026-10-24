@@ -555,6 +555,13 @@ impl App {
             if ui.button("Import Substance graph (.sbs)…").clicked() {
                 self.state.import_sbs_dialog();
             }
+            if ui
+                .button("Import Painter project (.spp)…")
+                .on_hover_text("Converts a Substance 3D Painter project; the .spp is only read")
+                .clicked()
+            {
+                self.state.import_spp_dialog();
+            }
             if ui.button("Import Painter bridge…").clicked() {
                 self.state.import_bridge_dialog();
             }
@@ -781,6 +788,8 @@ impl State {
             }
         } else if ext == "sbs" {
             self.import_sbs(path);
+        } else if ext == "spp" {
+            self.import_spp(path);
         } else if path.is_dir() || file_name(path) == reetched_substance::bridge::MANIFEST {
             self.import_bridge(path);
         } else {
@@ -2854,5 +2863,86 @@ assert r.all_files(), r
         // Same material, so roughly the same brightness as the rasterizer.
         let diff = (traced[0] as i32 - raster[0] as i32).abs();
         assert!(diff < 70, "traced {traced:?} vs raster {raster:?}");
+    }
+
+    /// Converts the user's own Painter projects (folder in `REETCHED_SPP_DIR`;
+    /// never part of the repository) and compares them with Painter's output.
+    #[test]
+    fn painter_projects_convert_and_compare() {
+        let Some(dir) = std::env::var_os("REETCHED_SPP_DIR") else {
+            eprintln!("REETCHED_SPP_DIR not set; skipping");
+            return;
+        };
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "spp"))
+            .filter(|p| p.metadata().is_ok_and(|m| m.len() < 400_000_000))
+            .collect();
+        files.sort();
+        for path in files {
+            let checks = h.app.state.import_spp(&path);
+            let s = &h.app.state;
+            for l in s.log.iter().filter(|l| l.text.contains("troke")) {
+                eprintln!("    log: {}", l.text);
+            }
+            assert!(!s.doc.texture_sets.is_empty(), "{}", path.display());
+            eprintln!("{}", path.file_name().unwrap().to_string_lossy());
+            // Side-by-side images (ours | Painter's) for looking at differences.
+            if let Some(out) = std::env::var_os("REETCHED_SPP_OUT") {
+                let refs = reetched_spp::convert::convert(&path)
+                    .unwrap()
+                    .imported
+                    .references;
+                let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+                for r in refs.iter().filter(|r| {
+                    matches!(
+                        r.channel,
+                        Channel::BaseColor | Channel::Normal | Channel::Roughness
+                    )
+                }) {
+                    let s = &h.app.state;
+                    let data = s
+                        .viewport
+                        .read_back(&h.device, &h.queue, r.set, reetched_doc::FIRST_UDIM)
+                        .unwrap();
+                    if (data.width, data.height) != (r.width, r.height) {
+                        continue;
+                    }
+                    let (w, ht) = (r.width, r.height);
+                    let ours = |i: usize| -> [f32; 3] {
+                        match r.channel {
+                            Channel::BaseColor => {
+                                data.base_color[i].map(reetched_doc::export::linear_to_srgb)
+                            }
+                            Channel::Normal => data.normal[i].map(|v| v * 0.5 + 0.5),
+                            _ => [data.roughness[i]; 3],
+                        }
+                    };
+                    let img = image::RgbImage::from_fn(w * 2, ht, |x, y| {
+                        let i = (y * w + (x % w)) as usize;
+                        let v = if x < w { ours(i) } else { r.pixels[i] };
+                        image::Rgb(v.map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8))
+                    });
+                    let file = format!("{stem}_{}_{:?}.png", r.set, r.channel);
+                    img.save(std::path::Path::new(&out).join(file)).unwrap();
+                }
+            }
+            for c in &checks {
+                eprintln!(
+                    "    {} / {}: mean {:.3}, {:.1}% off{}",
+                    c.set,
+                    c.channel.label(),
+                    c.mean,
+                    c.off * 100.0,
+                    if c.passed() { "  MATCH" } else { "" }
+                );
+            }
+        }
     }
 }

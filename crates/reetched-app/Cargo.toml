@@ -40,6 +40,7 @@ reetched-color.workspace = true
 reetched-shader.workspace = true
 reetched-trace.workspace = true
 reetched-library = { path = "../reetched-library" }
+reetched-spp.workspace = true
 reetched-script = { path = "../reetched-script" }
 naga = "30.0.1"
 serde_json = "1"

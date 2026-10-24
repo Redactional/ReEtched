@@ -18,6 +18,7 @@ reetched-substance = { path = "crates/reetched-substance" }
 reetched-color = { path = "crates/reetched-color" }
 reetched-shader = { path = "crates/reetched-shader" }
 reetched-trace = { path = "crates/reetched-trace" }
+reetched-spp = { path = "crates/reetched-spp" }
 anyhow = "1"
 glam = { version = "0.34", features = ["bytemuck"] }
 log = "0.4"

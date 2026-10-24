@@ -100,6 +100,7 @@ struct BMask {
 }
 
 /// Painter's final export of one channel, to compare the import against.
+#[derive(Clone)]
 pub struct Reference {
     pub set: usize,
     pub channel: Channel,

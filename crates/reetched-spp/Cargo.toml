@@ -1,0 +1,20 @@
+[package]
+name = "reetched-spp"
+description = "Read-only conversion of Substance 3D Painter projects into ReEtched projects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reetched-io.workspace = true
+reetched-doc.workspace = true
+reetched-substance.workspace = true
+anyhow.workspace = true
+glam.workspace = true
+log.workspace = true
+hdf5-pure = "0.47"
+lz4_flex = "0.11"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "exr"] }

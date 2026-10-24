@@ -1605,6 +1605,10 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
                 ui.add(DragValue::new(&mut p.offset[1]).speed(0.005));
             });
             ui.end_row();
+            ui.label("Repeat");
+            ui.checkbox(&mut p.repeat, "")
+                .on_hover_text("Off: the image appears once; the fill covers nothing outside it");
+            ui.end_row();
             if !p.mode.is_uv() {
                 ui.label("Size");
                 ui.add(

@@ -20,7 +20,7 @@ struct Proj {
     a: vec4<f32>,
     // xy: uv scale, zw: uv offset
     so: vec4<f32>,
-    // xyz: projector position, w: mirror bits (1 x, 2 y, 4 z)
+    // xyz: projector position, w: mirror bits (1 x, 2 y, 4 z), 8 = no repeat
     origin: vec4<f32>,
     // Rows of the inverse projector rotation.
     r0: vec4<f32>,
@@ -314,6 +314,12 @@ fn warp_uv(t: vec2<f32>, pr: Proj) -> vec2<f32> {
     return base + found;
 }
 
+// A non-repeating image covers nothing outside 0..1.
+fn clipped(t0: vec2<f32>, pr: Proj) -> bool {
+    let outside = any(t0 < vec2(0.0)) || any(t0 > vec2(1.0));
+    return (u32(pr.origin.w) & 8u) != 0u && outside;
+}
+
 fn sample_proj(t: texture_2d<f32>, pr: Proj, in: VsOut, n: vec3<f32>) -> vec4<f32> {
     let mode = u32(pr.a.x);
     if mode == 0u || mode == 5u || mode == 6u {
@@ -322,7 +328,8 @@ fn sample_proj(t: texture_2d<f32>, pr: Proj, in: VsOut, n: vec3<f32>) -> vec4<f3
         if mode == 5u {
             t0 = warp_uv(t0, pr);
         }
-        return textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
+        let s = textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
+        return select(s, vec4(0.0), clipped(t0, pr));
     }
     let pos = in.world;
     // Fill symmetry: mirror the position (and normal) across the chosen planes.
@@ -338,7 +345,8 @@ fn sample_proj(t: texture_2d<f32>, pr: Proj, in: VsOut, n: vec3<f32>) -> vec4<f3
     let q = local_dir((mp - pr.origin.xyz) * pr.a.w, pr);
     if mode == 2u {
         let t0 = uv_xform(q.xy + 0.5, pr);
-        return textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
+        let s = textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
+        return select(s, vec4(0.0), clipped(t0, pr));
     }
     if mode == 3u || mode == 4u {
         // Around the projector's Y axis; u wraps once around.
@@ -495,12 +503,13 @@ fn on(i: u32) -> bool {
     return P.values[i].w > 0.5;
 }
 
-// A fill layer's value for slot `i`: its bitmap through the projection, or its uniform value.
-fn fill_value(i: u32, t: texture_2d<f32>, in: VsOut, n: vec3<f32>) -> vec3<f32> {
+// A fill layer's value for slot `i` and how much of it there is: its bitmap
+// through the projection (alpha = coverage, like Painter), or its uniform value.
+fn fill_value(i: u32, t: texture_2d<f32>, in: VsOut, n: vec3<f32>) -> vec4<f32> {
     if P.blend[i].z > 0.5 {
-        return sample_proj(t, P.proj, in, n).rgb;
+        return sample_proj(t, P.proj, in, n);
     }
-    return P.values[i].xyz;
+    return vec4(P.values[i].xyz, 1.0);
 }
 
 // A fill layer onto `d` in slot `i`.
@@ -508,7 +517,8 @@ fn fill_slot(i: u32, t: texture_2d<f32>, d: vec3<f32>, in: VsOut, n: vec3<f32>, 
     if !on(i) {
         return d;
     }
-    return composite(mode_of(i), d, fill_value(i, t, in, n), P.blend[i].y * m, false);
+    let v = fill_value(i, t, in, n);
+    return composite(mode_of(i), d, v.rgb, P.blend[i].y * m * v.a, false);
 }
 
 // A paint layer's texels onto `d` in slot `i`.
@@ -597,15 +607,27 @@ fn fs_fill(in: VsOut) -> Out {
     c.rough = fill_slot(2u, t_c2, vec3(c.rough), in, n, m).x;
     if on(3u) {
         var v = P.values[3].xyz;
+        var a = 1.0;
         // Normal bitmaps are OpenGL-convention tangent-space maps.
-        if P.blend[3].z > 0.5 { v = sample_proj(t_c3, P.proj, in, n).rgb * 2.0 - 1.0; }
-        c.normal = composite(mode_of(3u), c.normal, normalize(v), P.blend[3].y * m, true);
+        if P.blend[3].z > 0.5 {
+            let s = sample_proj(t_c3, P.proj, in, n);
+            v = s.rgb * 2.0 - 1.0;
+            a = s.a;
+        }
+        if a > 0.0 {
+            c.normal = composite(mode_of(3u), c.normal, normalize(v), P.blend[3].y * m * a, true);
+        }
     }
     if on(4u) {
         var v = P.values[4].x;
+        var a = 1.0;
         // ponytail: bitmap mid-grey = height 0, matching export's +0.5; revisit with Painter goldens.
-        if P.blend[4].z > 0.5 { v = sample_proj(t_c4, P.proj, in, n).r - 0.5; }
-        c.height = composite(mode_of(4u), vec3(c.height), vec3(v), P.blend[4].y * m, false).x;
+        if P.blend[4].z > 0.5 {
+            let s = sample_proj(t_c4, P.proj, in, n);
+            v = s.r - 0.5;
+            a = s.a;
+        }
+        c.height = composite(mode_of(4u), vec3(c.height), vec3(v), P.blend[4].y * m * a, false).x;
     }
     c.emissive = fill_slot(5u, t_c5, c.emissive, in, n, m);
     c.opacity = fill_slot(6u, t_c6, vec3(c.opacity), in, n, m).x;
