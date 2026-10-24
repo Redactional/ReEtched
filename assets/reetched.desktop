@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ReEtched
+Comment=Open-source 3D texture painter
+Exec=reetched %f
+Icon=reetched
+Terminal=false
+Categories=Graphics;3DGraphics;

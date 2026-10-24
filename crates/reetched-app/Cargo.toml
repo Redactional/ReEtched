@@ -10,6 +10,18 @@ rust-version.workspace = true
 name = "reetched"
 path = "src/main.rs"
 
+# App bundles (`cargo bundle --release -p reetched-app`): a .app with the .icns
+# on macOS, a .deb with the PNG icons on Linux.
+[package.metadata.bundle]
+name = "ReEtched"
+identifier = "io.github.redactional.reetched"
+icon = [
+    "../../assets/icons/ReEtched.icns",
+    "../../assets/icons/linux/ReEtched_*.png",
+]
+category = "public.app-category.graphics-design"
+short_description = "Open-source 3D texture painter"
+
 [dependencies]
 reetched-io.workspace = true
 anyhow.workspace = true
@@ -46,3 +58,6 @@ rayon = "1.12"
 
 [dev-dependencies]
 psd = "0.3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

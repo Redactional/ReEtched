@@ -56,6 +56,17 @@ The mesh argument is optional — without it you get a preview sphere. You can a
 cargo test --workspace
 ```
 
+### Packaging
+
+App icons live in `assets/icons/`. The Windows executable gets `ReEtched.ico` embedded at build time (needs the Windows SDK's resource compiler, which comes with the Visual Studio Build Tools). For macOS and Linux, [cargo-bundle](https://github.com/burtonageo/cargo-bundle) builds a `.app` with `ReEtched.icns` or a `.deb` with the PNG icons:
+
+```bash
+cargo install cargo-bundle
+cargo bundle --release -p reetched-app
+```
+
+Other Linux packages can use `assets/reetched.desktop` with the PNGs in `assets/icons/linux/`, installed as `hicolor/<size>/apps/reetched.png`. Ship `reetched_python` (`.dll` / `.dylib` / `.so`) next to the executable for scripting.
+
 ## Project layout
 
 ```

@@ -94,6 +94,14 @@ struct Gfx {
     app: app::App,
 }
 
+/// The title bar / taskbar icon (macOS takes it from the app bundle instead).
+fn window_icon() -> Option<winit::window::Icon> {
+    let png = include_bytes!("../../../assets/icons/linux/ReEtched_256x256.png");
+    let img = image::load_from_memory(png).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_some() {
@@ -102,7 +110,8 @@ impl ApplicationHandler for Runner {
         let attrs = Window::default_attributes()
             .with_title("ReEtched")
             .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0))
-            .with_maximized(true);
+            .with_maximized(true)
+            .with_window_icon(window_icon());
         let result = event_loop
             .create_window(attrs)
             .context("failed to create window")
@@ -331,4 +340,10 @@ impl Gfx {
         }
         repaint_after
     }
+}
+
+#[cfg(test)]
+#[test]
+fn window_icon_decodes() {
+    assert!(window_icon().is_some());
 }
