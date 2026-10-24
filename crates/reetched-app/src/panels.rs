@@ -203,6 +203,62 @@ impl State {
                     ui.end_row();
                 });
             ui.add_space(8.0);
+            ui.label(theme::header("RENDERING"));
+            let r = &mut self.render;
+            egui::Grid::new("rendering")
+                .num_columns(2)
+                .spacing(vec2(12.0, 6.0))
+                .show(ui, |ui| {
+                    use crate::viewport::{AlphaMode, ToneMap};
+                    ui.label("Tone mapping");
+                    egui::ComboBox::from_id_salt("tone_map")
+                        .selected_text(r.tone_map.label())
+                        .show_ui(ui, |ui| {
+                            for t in ToneMap::ALL {
+                                ui.selectable_value(&mut r.tone_map, t, t.label());
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Bloom");
+                    ui.add(egui::Slider::new(&mut r.bloom, 0.0..=1.0));
+                    ui.end_row();
+                    if r.bloom > 0.0 {
+                        ui.label("Bloom threshold");
+                        ui.add(egui::Slider::new(&mut r.bloom_threshold, 0.0..=4.0));
+                        ui.end_row();
+                    }
+                    ui.label("Vignette");
+                    ui.add(egui::Slider::new(&mut r.vignette, 0.0..=1.0));
+                    ui.end_row();
+                    ui.label("Emissive intensity");
+                    ui.add(
+                        egui::Slider::new(&mut r.emissive_intensity, 0.0..=20.0).logarithmic(true),
+                    );
+                    ui.end_row();
+                    ui.label("Opacity");
+                    egui::ComboBox::from_id_salt("alpha_mode")
+                        .selected_text(r.alpha.label())
+                        .show_ui(ui, |ui| {
+                            for a in AlphaMode::ALL {
+                                ui.selectable_value(&mut r.alpha, a, a.label());
+                            }
+                        });
+                    ui.end_row();
+                    if r.alpha == AlphaMode::Cutout {
+                        ui.label("Cutoff");
+                        ui.add(egui::Slider::new(&mut r.alpha_cutoff, 0.0..=1.0));
+                        ui.end_row();
+                    }
+                    ui.label("Displacement");
+                    ui.add(egui::Slider::new(&mut r.parallax, 0.0..=0.2))
+                        .on_hover_text("Parallax occlusion from the height channel (0 = off)");
+                    ui.end_row();
+                    ui.label("Anti-aliasing");
+                    ui.checkbox(&mut r.accumulate, "Progressive")
+                        .on_hover_text("Refines the image over a few frames while nothing moves");
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
             ui.label(theme::header("CAMERA"));
             egui::Grid::new("camera")
                 .num_columns(2)

@@ -32,6 +32,108 @@ struct Globals {
     view: [f32; 4],
     uv_xform: [f32; 4],
     sh: [[f32; 4]; 9],
+    /// x: tone map, y: bloom strength, z: vignette, w: emissive intensity
+    post: [f32; 4],
+    /// x: alpha mode, y: alpha cutoff, z: parallax depth, w: frame number
+    extra: [f32; 4],
+    /// x: bloom threshold, y: accumulation weight of this frame
+    accum: [f32; 4],
+}
+
+/// How the 3D view maps HDR light to the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToneMap {
+    Aces,
+    Agx,
+    Neutral,
+    Linear,
+}
+
+impl ToneMap {
+    pub const ALL: [ToneMap; 4] = [
+        ToneMap::Aces,
+        ToneMap::Agx,
+        ToneMap::Neutral,
+        ToneMap::Linear,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToneMap::Aces => "ACES (filmic)",
+            ToneMap::Agx => "AgX",
+            ToneMap::Neutral => "Khronos PBR Neutral",
+            ToneMap::Linear => "Linear (clamped)",
+        }
+    }
+}
+
+/// How the opacity channel shows in the 3D view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlphaMode {
+    Opaque,
+    /// Alpha test against a cutoff.
+    Cutout,
+    /// Stochastic transparency, smoothed by progressive accumulation.
+    Blend,
+}
+
+impl AlphaMode {
+    pub const ALL: [AlphaMode; 3] = [AlphaMode::Opaque, AlphaMode::Cutout, AlphaMode::Blend];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AlphaMode::Opaque => "Opaque",
+            AlphaMode::Cutout => "Cutout (alpha test)",
+            AlphaMode::Blend => "Blend",
+        }
+    }
+}
+
+/// 3D view rendering options (Display settings).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RenderSettings {
+    pub tone_map: ToneMap,
+    pub bloom: f32,
+    /// Brightness (after exposure) where bloom starts.
+    pub bloom_threshold: f32,
+    pub vignette: f32,
+    pub emissive_intensity: f32,
+    pub alpha: AlphaMode,
+    pub alpha_cutoff: f32,
+    /// Parallax displacement depth from the height channel (0 = off).
+    pub parallax: f32,
+    /// Progressive anti-aliasing: jitter and average frames while nothing changes.
+    pub accumulate: bool,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            tone_map: ToneMap::Aces,
+            bloom: 0.0,
+            bloom_threshold: 1.0,
+            vignette: 0.0,
+            emissive_intensity: 1.0,
+            alpha: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+            parallax: 0.0,
+            accumulate: true,
+        }
+    }
+}
+
+/// Frames accumulated before the view stops redrawing.
+const ACCUMULATE_FRAMES: u32 = 32;
+
+/// Everything that, when it changes, restarts accumulation.
+#[derive(Clone, PartialEq)]
+struct FrameKey {
+    view_proj: Mat4,
+    globals: [f32; 12],
+    render: RenderSettings,
+    wire: bool,
+    scene: u64,
+    size: [u32; 2],
 }
 
 #[repr(C)]
@@ -52,17 +154,21 @@ pub enum ViewMode {
     Metallic,
     Normal,
     Uv,
+    Emissive,
+    Opacity,
     /// A baked mesh map, shown as-is.
     Mesh(MeshMap),
 }
 
 impl ViewMode {
-    pub const CHANNELS: [ViewMode; 6] = [
+    pub const CHANNELS: [ViewMode; 8] = [
         ViewMode::Material,
         ViewMode::BaseColor,
         ViewMode::Roughness,
         ViewMode::Metallic,
         ViewMode::Normal,
+        ViewMode::Emissive,
+        ViewMode::Opacity,
         ViewMode::Uv,
     ];
 
@@ -74,6 +180,8 @@ impl ViewMode {
             ViewMode::Metallic => "Metallic",
             ViewMode::Normal => "Normal (mesh)",
             ViewMode::Uv => "UV coordinates",
+            ViewMode::Emissive => "Emissive",
+            ViewMode::Opacity => "Opacity",
             ViewMode::Mesh(m) => m.label(),
         }
     }
@@ -87,6 +195,8 @@ impl ViewMode {
             ViewMode::Normal => 4.0,
             ViewMode::Uv => 5.0,
             ViewMode::Mesh(_) => 6.0,
+            ViewMode::Emissive => 7.0,
+            ViewMode::Opacity => 8.0,
         }
     }
 }
@@ -124,6 +234,7 @@ pub struct FrameParams {
     pub uv_xform: [f32; 4],
     /// Texture set shown in the 2D view.
     pub uv_part: Option<usize>,
+    pub render: RenderSettings,
 }
 
 /// An offscreen texture egui displays, resized to whatever the UI asks for.
@@ -145,16 +256,32 @@ impl ViewTarget {
 }
 
 struct Targets {
+    size: [u32; 2],
     hdr: wgpu::TextureView,
     depth: wgpu::TextureView,
     display: wgpu::TextureView,
-    hdr_bind_group: wgpu::BindGroup,
+    /// Accumulated frames, ping-ponged.
+    history: [wgpu::TextureView; 2],
+    /// Quarter-resolution bloom buffers.
+    bloom: [wgpu::TextureView; 2],
+    /// Writes history[i] from the new frame and history[1 - i].
+    accum_bg: [wgpu::BindGroup; 2],
+    /// Bright pass from history[i] into bloom[0].
+    bloom_down_bg: [wgpu::BindGroup; 2],
+    blur_h_bg: wgpu::BindGroup,
+    blur_v_bg: wgpu::BindGroup,
+    /// history[i] + bloom → display.
+    tonemap_bg: [wgpu::BindGroup; 2],
 }
 
 struct Pipelines {
     sky: wgpu::RenderPipeline,
     pbr: wgpu::RenderPipeline,
     wire: Option<wgpu::RenderPipeline>,
+    accumulate: wgpu::RenderPipeline,
+    bloom_down: wgpu::RenderPipeline,
+    blur_h: wgpu::RenderPipeline,
+    blur_v: wgpu::RenderPipeline,
     tonemap: wgpu::RenderPipeline,
     uv_fill: wgpu::RenderPipeline,
     uv_wire: Option<wgpu::RenderPipeline>,
@@ -172,7 +299,14 @@ pub struct Viewport {
     globals_layout: wgpu::BindGroupLayout,
     globals_bind_group: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
-    hdr_layout: wgpu::BindGroupLayout,
+    post_layout: wgpu::BindGroupLayout,
+    post_sampler: wgpu::Sampler,
+    /// Frames accumulated so far, and which history buffer the next frame writes.
+    accum: u32,
+    history_cur: usize,
+    last_key: Option<FrameKey>,
+    /// Bumped whenever a texture set is re-composited.
+    scene_version: u64,
     env_sampler: wgpu::Sampler,
     env_sh: [[f32; 4]; 9],
     prefilter: wgpu::ComputePipeline,
@@ -205,7 +339,7 @@ impl Viewport {
                 ),
             ],
         );
-        // Composited set (t0..t2), sampler, baked AO, previewed mesh map.
+        // Composited set (t0..t2), sampler, baked AO, previewed mesh map, set t3.
         let material_layout = bind_group_layout(
             device,
             &[
@@ -218,14 +352,32 @@ impl Viewport {
                 ),
                 (S::FRAGMENT, texture_binding(true)),
                 (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, texture_binding(true)),
             ],
         );
-        let hdr_layout = bind_group_layout(device, &[(S::FRAGMENT, texture_binding(false))]);
+        // Post passes: two inputs and a sampler.
+        let post_layout = bind_group_layout(
+            device,
+            &[
+                (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, texture_binding(true)),
+                (
+                    S::FRAGMENT,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        );
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/viewport.wgsl"));
         let scene_layout = pipeline_layout(device, &[&globals_layout, &material_layout]);
         let globals_only = pipeline_layout(device, &[&globals_layout]);
-        let tonemap_layout = pipeline_layout(device, &[&globals_layout, &hdr_layout]);
+        let post_pipeline_layout = pipeline_layout(device, &[&globals_layout, &post_layout]);
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -277,11 +429,33 @@ impl Viewport {
                     )
                     .build(device)
             }),
+            accumulate: base
+                .with(
+                    "vs_fullscreen",
+                    "fs_accumulate",
+                    &post_pipeline_layout,
+                    None,
+                )
+                .build(device),
+            bloom_down: base
+                .with(
+                    "vs_fullscreen",
+                    "fs_bloom_down",
+                    &post_pipeline_layout,
+                    None,
+                )
+                .build(device),
+            blur_h: base
+                .with("vs_fullscreen", "fs_blur_h", &post_pipeline_layout, None)
+                .build(device),
+            blur_v: base
+                .with("vs_fullscreen", "fs_blur_v", &post_pipeline_layout, None)
+                .build(device),
             tonemap: PipelineDesc {
                 format: DISPLAY_FORMAT,
                 ..base
             }
-            .with("vs_fullscreen", "fs_tonemap", &tonemap_layout, None)
+            .with("vs_fullscreen", "fs_tonemap", &post_pipeline_layout, None)
             .build(device),
             uv_fill: PipelineDesc {
                 format: DISPLAY_FORMAT,
@@ -323,7 +497,7 @@ impl Viewport {
             mapped_at_creation: false,
         });
 
-        let targets = Targets::new(device, &hdr_layout, [64, 64]);
+        let targets = Targets::new(device, &post_layout, &post_sampler, [64, 64]);
         let uv_display = display_texture(device, [64, 64]);
         let mut target = |view: &wgpu::TextureView| ViewTarget {
             texture_id: egui.register_native_texture(device, view, wgpu::FilterMode::Linear),
@@ -349,7 +523,12 @@ impl Viewport {
             globals_layout,
             globals_bind_group,
             material_layout,
-            hdr_layout,
+            post_layout,
+            post_sampler,
+            accum: 0,
+            history_cur: 0,
+            last_key: None,
+            scene_version: 0,
             env_sampler,
             env_sh,
             prefilter,
@@ -446,6 +625,41 @@ impl Viewport {
             mode,
             opacity,
         );
+    }
+
+    /// Projection tool: projects `image` (placed by `u`) onto texture set `part`
+    /// as the current stroke's color source, hidden where the 3D view is occluded.
+    pub fn paint_project(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        part: usize,
+        image: &wgpu::TextureView,
+        u: crate::paint_gpu::ProjectUniform,
+    ) {
+        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get(part)) else {
+            return;
+        };
+        let mesh = MeshPart {
+            vertices,
+            indices,
+            range: p.indices.clone(),
+            scale: self.mesh_scale,
+        };
+        let depth = (self.view3d.size == self.view3d.requested_size).then_some(&self.targets.depth);
+        self.paint.project(device, queue, &mesh, depth, image, u);
+    }
+
+    /// An image resource as an sRGB-decoded texture.
+    pub fn color_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &Resources,
+        id: &ResourceId,
+    ) -> Option<wgpu::TextureView> {
+        self.compositor
+            .bitmap_view_srgb(device, queue, resources, id)
     }
 
     /// Polygon Fill: fills triangles (three vertex indices each) of texture set `part`.
@@ -617,15 +831,53 @@ impl Viewport {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(&shown),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&views[3]),
+                    },
                 ],
             }));
             part.composited = Some(set.clone());
             part.bound_maps = maps;
+            self.scene_version += 1;
         }
         warnings
     }
 
     /// Reads texture set `index` back from the GPU (for export).
+    /// Composites `set` on texture set `part`'s triangles into a scratch target
+    /// and reads it back (e.g. one layer alone, for PSD export).
+    pub fn composite_temp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        part: usize,
+        set: &TextureSet,
+        resources: &Resources,
+    ) -> anyhow::Result<ChannelData> {
+        let (Some((vertices, indices)), Some(p)) = (&self.mesh, self.parts.get(part)) else {
+            anyhow::bail!("no mesh");
+        };
+        let mesh = MeshPart {
+            vertices,
+            indices,
+            range: p.indices.clone(),
+            scale: self.mesh_scale,
+        };
+        let mut out = None;
+        let warnings = self
+            .compositor
+            .composite(device, queue, &mesh, set, resources, &mut out);
+        if let Some(w) = warnings.first() {
+            anyhow::bail!("{w}");
+        }
+        self.compositor.read_back(
+            device,
+            queue,
+            out.as_ref().expect("composite creates the set"),
+        )
+    }
+
     pub fn read_back(
         &self,
         device: &wgpu::Device,
@@ -661,7 +913,12 @@ impl Viewport {
         p: &FrameParams,
     ) {
         if self.view3d.needs_resize() {
-            self.targets = Targets::new(device, &self.hdr_layout, self.view3d.requested_size);
+            self.targets = Targets::new(
+                device,
+                &self.post_layout,
+                &self.post_sampler,
+                self.view3d.requested_size,
+            );
             egui.update_egui_texture_from_wgpu_texture(
                 device,
                 &self.targets.display,
@@ -682,29 +939,75 @@ impl Viewport {
         }
 
         let max_lod = (ENV_LEVELS - 1) as f32;
+        let params = [
+            p.exposure_ev.exp2(),
+            p.env_rotation,
+            max_lod,
+            p.background_blur * max_lod,
+        ];
+        let view = [
+            p.view_mode.shader_index(),
+            p.env_opacity,
+            p.uv_mode.shader_index(),
+            0.0,
+        ];
+        // Restart accumulation when anything that shows in the 3D view changes.
+        let key = FrameKey {
+            view_proj: p.view_proj,
+            globals: [
+                params[0], params[1], params[3], view[0], view[1], p.eye.x, p.eye.y, p.eye.z, 0.0,
+                0.0, 0.0, 0.0,
+            ],
+            render: p.render,
+            wire: p.show_wireframe,
+            scene: self.scene_version,
+            size: self.targets.size,
+        };
+        if self.last_key.as_ref() != Some(&key) {
+            self.accum = 0;
+            self.last_key = Some(key);
+        }
+        let accumulate = p.render.accumulate && p.view_mode == ViewMode::Material;
+        let n = if accumulate { self.accum } else { 0 };
+        // Sub-pixel jitter (Halton 2, 3), none on the first frame so a still image is sharp.
+        let jitter = if n == 0 {
+            glam::Vec2::ZERO
+        } else {
+            glam::Vec2::new(halton(n, 2), halton(n, 3)) - 0.5
+        };
+        let [w, h] = self.targets.size.map(|s| s.max(1) as f32);
+        let view_proj =
+            Mat4::from_translation(Vec3::new(jitter.x * 2.0 / w, jitter.y * 2.0 / h, 0.0))
+                * p.view_proj;
+        let r = &p.render;
         let globals = Globals {
-            view_proj: p.view_proj.to_cols_array_2d(),
-            inv_view_proj: p.view_proj.inverse().to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             eye: p.eye.extend(1.0).into(),
-            params: [
-                p.exposure_ev.exp2(),
-                p.env_rotation,
-                max_lod,
-                p.background_blur * max_lod,
-            ],
-            view: [
-                p.view_mode.shader_index(),
-                p.env_opacity,
-                p.uv_mode.shader_index(),
-                0.0,
-            ],
+            params,
+            view,
             uv_xform: p.uv_xform,
             sh: self.env_sh,
+            post: [
+                r.tone_map as u32 as f32,
+                r.bloom,
+                r.vignette,
+                r.emissive_intensity,
+            ],
+            extra: [
+                r.alpha as u32 as f32,
+                r.alpha_cutoff,
+                r.parallax,
+                (n % 64) as f32,
+            ],
+            accum: [r.bloom_threshold, 1.0 / (n + 1) as f32, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
         if self.view3d.visible() {
             self.render_3d(encoder, p);
+            self.history_cur = 1 - self.history_cur;
+            self.accum = (n + 1).min(ACCUMULATE_FRAMES);
         }
         if self.view2d.visible() {
             self.render_2d(encoder, p);
@@ -755,18 +1058,81 @@ impl Viewport {
                 }
             }
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("tonemap"),
-            color_attachments: &[Some(color_attachment(
-                &self.targets.display,
-                wgpu::Color::BLACK,
-            ))],
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.pipelines.tonemap);
-        pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.targets.hdr_bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        let t = &self.targets;
+        let cur = self.history_cur;
+        let fullscreen = |encoder: &mut wgpu::CommandEncoder,
+                          label: &str,
+                          target: &wgpu::TextureView,
+                          pipeline: &wgpu::RenderPipeline,
+                          group: &wgpu::BindGroup| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(color_attachment(target, wgpu::Color::TRANSPARENT))],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_bind_group(1, group, &[]);
+            pass.draw(0..3, 0..1);
+        };
+        fullscreen(
+            encoder,
+            "accumulate",
+            &t.history[cur],
+            &self.pipelines.accumulate,
+            &t.accum_bg[cur],
+        );
+        fullscreen(
+            encoder,
+            "bloom down",
+            &t.bloom[0],
+            &self.pipelines.bloom_down,
+            &t.bloom_down_bg[cur],
+        );
+        fullscreen(
+            encoder,
+            "bloom blur h",
+            &t.bloom[1],
+            &self.pipelines.blur_h,
+            &t.blur_h_bg,
+        );
+        fullscreen(
+            encoder,
+            "bloom blur v",
+            &t.bloom[0],
+            &self.pipelines.blur_v,
+            &t.blur_v_bg,
+        );
+        fullscreen(
+            encoder,
+            "tonemap",
+            &t.display,
+            &self.pipelines.tonemap,
+            &t.tonemap_bg[cur],
+        );
+    }
+
+    /// The 3D view as displayed (RGBA8, sRGB-encoded), for tests.
+    #[cfg(test)]
+    pub fn read_display(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> ([u32; 2], Vec<u8>) {
+        let [w, h] = self.targets.size;
+        let bytes = crate::paint_gpu::read_region(
+            device,
+            queue,
+            self.targets.display.texture(),
+            0,
+            0,
+            w,
+            h,
+            4,
+        )
+        .unwrap();
+        ([w, h], bytes)
+    }
+
+    /// The 3D view is still refining (progressive anti-aliasing); keep redrawing.
+    pub fn accumulating(&self, settings: &RenderSettings) -> bool {
+        settings.accumulate && self.view3d.visible() && self.accum < ACCUMULATE_FRAMES
     }
 
     fn render_2d(&self, encoder: &mut wgpu::CommandEncoder, p: &FrameParams) {
@@ -817,19 +1183,33 @@ fn display_texture(device: &wgpu::Device, [width, height]: [u32; 2]) -> wgpu::Te
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DISPLAY_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         })
         .create_view(&Default::default())
 }
 
+/// Element `i` of the Halton sequence in `base`, in [0, 1).
+fn halton(mut i: u32, base: u32) -> f32 {
+    let (mut f, mut r) = (1.0, 0.0);
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
+
 impl Targets {
     fn new(
         device: &wgpu::Device,
-        hdr_layout: &wgpu::BindGroupLayout,
+        post_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
         [width, height]: [u32; 2],
     ) -> Self {
-        let view = |format, usage| {
+        let sized = |format, usage, [width, height]: [u32; 2]| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: None,
@@ -848,21 +1228,48 @@ impl Targets {
                 .create_view(&Default::default())
         };
         use wgpu::TextureUsages as U;
-        let hdr = view(HDR_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING);
-        let hdr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: hdr_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&hdr),
-            }],
-        });
+        let full = [width, height];
+        let quarter = [(width / 4).max(1), (height / 4).max(1)];
+        let rt = U::RENDER_ATTACHMENT | U::TEXTURE_BINDING;
+        let hdr = sized(HDR_FORMAT, rt, full);
+        let history = [sized(HDR_FORMAT, rt, full), sized(HDR_FORMAT, rt, full)];
+        let bloom = [
+            sized(HDR_FORMAT, rt, quarter),
+            sized(HDR_FORMAT, rt, quarter),
+        ];
+        let group = |a: &wgpu::TextureView, b: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: post_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(a),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(b),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
         Self {
+            size: full,
+            accum_bg: [group(&hdr, &history[1]), group(&hdr, &history[0])],
+            bloom_down_bg: [group(&history[0], &hdr), group(&history[1], &hdr)],
+            blur_h_bg: group(&bloom[0], &bloom[0]),
+            blur_v_bg: group(&bloom[1], &bloom[1]),
+            tonemap_bg: [group(&history[0], &bloom[0]), group(&history[1], &bloom[0])],
             hdr,
             // Kept and readable: brush strokes test occlusion against it.
-            depth: view(DEPTH_FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
-            display: display_texture(device, [width, height]),
-            hdr_bind_group,
+            depth: sized(DEPTH_FORMAT, rt, full),
+            display: display_texture(device, full),
+            history,
+            bloom,
         }
     }
 }

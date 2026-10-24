@@ -126,6 +126,8 @@ pub fn channel(name: &str) -> Option<Channel> {
         "roughness" => Channel::Roughness,
         "normal" => Channel::Normal,
         "height" => Channel::Height,
+        "emissive" => Channel::Emissive,
+        "opacity" => Channel::Opacity,
         _ => return None,
     })
 }
@@ -265,7 +267,9 @@ fn solve(c: Channel, e0: [f32; 3], e1: [f32; 3], b0: [f32; 3], b1: [f32; 3]) -> 
     }
     let v: [f32; 3] = std::array::from_fn(|i| ((e0[i] - b0[i] * (1.0 - a)) / a).clamp(0.0, 1.0));
     match c {
-        Channel::BaseColor => [to_linear(v[0]), to_linear(v[1]), to_linear(v[2]), a],
+        Channel::BaseColor | Channel::Emissive => {
+            [to_linear(v[0]), to_linear(v[1]), to_linear(v[2]), a]
+        }
         Channel::Normal => {
             let n = [v[0] * 2.0 - 1.0, v[1] * 2.0 - 1.0, v[2] * 2.0 - 1.0];
             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -301,11 +305,13 @@ fn node(doc: &mut Document, cx: &mut Ctx, b: &BNode) -> Node {
                     Channel::Roughness => "roughness",
                     Channel::Normal => "normal",
                     Channel::Height => "height",
+                    Channel::Emissive => "emissive",
+                    Channel::Opacity => "opacity",
                 };
                 if let Some(v) = values.get(name) {
                     src.enabled = true;
                     src.value = match c {
-                        Channel::BaseColor => *v,
+                        Channel::BaseColor | Channel::Emissive => *v,
                         Channel::Normal => {
                             let n = v.map(|x| x * 2.0 - 1.0);
                             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
@@ -511,11 +517,11 @@ mod tests {
         let imp = import(&dir).unwrap();
         let near = |a: f32, b: f32| (a - b).abs() < 2e-3;
         assert!(
-            imp.log.iter().any(|l| l.contains("Emissive")),
+            imp.log.iter().any(|l| l.contains("Specular")),
             "{:?}",
             imp.log
         );
-        assert_eq!(imp.references.len(), 5);
+        assert_eq!(imp.references.len(), 7);
         let set = &imp.doc.texture_sets[0];
         assert_eq!((set.name.as_str(), set.resolution), ("Body", 4));
         assert!(set.mesh_maps.contains_key(&MeshMap::AmbientOcclusion));

@@ -52,6 +52,30 @@
     1.0
    ]
   ],
+  "emissive": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
+  "opacity": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    1.0
+   ]
+  ],
   "normal": [
    [
     0.5,
@@ -80,7 +104,9 @@
     "metallic": "captures/Body_reference/Body_metallic.png",
     "roughness": "captures/Body_reference/Body_roughness.png",
     "normal": "captures/Body_reference/Body_normal.png",
-    "height": "captures/Body_reference/Body_height.png"
+    "height": "captures/Body_reference/Body_height.png",
+    "emissive": "captures/Body_reference/Body_emissive.png",
+    "opacity": "captures/Body_reference/Body_opacity.png"
    },
    "layers": [
     {
@@ -106,6 +132,14 @@
       "height": {
        "mode": "Normal",
        "opacity": 1.0
+      },
+      "emissive": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "opacity": {
+       "mode": "Normal",
+       "opacity": 1.0
       }
      },
      "type": "paint",
@@ -115,14 +149,18 @@
        "metallic": "captures/Body_101_black/Body_metallic.png",
        "roughness": "captures/Body_101_black/Body_roughness.png",
        "normal": "captures/Body_101_black/Body_normal.png",
-       "height": "captures/Body_101_black/Body_height.png"
+       "height": "captures/Body_101_black/Body_height.png",
+       "emissive": "captures/Body_101_black/Body_emissive.png",
+       "opacity": "captures/Body_101_black/Body_opacity.png"
       },
       "white": {
        "basecolor": "captures/Body_101_white/Body_basecolor.png",
        "metallic": "captures/Body_101_white/Body_metallic.png",
        "roughness": "captures/Body_101_white/Body_roughness.png",
        "normal": "captures/Body_101_white/Body_normal.png",
-       "height": "captures/Body_101_white/Body_height.png"
+       "height": "captures/Body_101_white/Body_height.png",
+       "emissive": "captures/Body_101_white/Body_emissive.png",
+       "opacity": "captures/Body_101_white/Body_opacity.png"
       }
      },
      "mask": {
@@ -161,6 +199,14 @@
       "height": {
        "mode": "Normal",
        "opacity": 1.0
+      },
+      "emissive": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "opacity": {
+       "mode": "Normal",
+       "opacity": 1.0
       }
      },
      "type": "group",
@@ -186,6 +232,14 @@
          "opacity": 1.0
         },
         "height": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "emissive": {
+         "mode": "Normal",
+         "opacity": 1.0
+        },
+        "opacity": {
          "mode": "Normal",
          "opacity": 1.0
         }
@@ -234,6 +288,14 @@
       "height": {
        "mode": "Normal",
        "opacity": 1.0
+      },
+      "emissive": {
+       "mode": "Normal",
+       "opacity": 1.0
+      },
+      "opacity": {
+       "mode": "Normal",
+       "opacity": 1.0
       }
      },
      "type": "fill",
@@ -248,14 +310,18 @@
        "metallic": "captures/Body_104_black/Body_metallic.png",
        "roughness": "captures/Body_104_black/Body_roughness.png",
        "normal": "captures/Body_104_black/Body_normal.png",
-       "height": "captures/Body_104_black/Body_height.png"
+       "height": "captures/Body_104_black/Body_height.png",
+       "emissive": "captures/Body_104_black/Body_emissive.png",
+       "opacity": "captures/Body_104_black/Body_opacity.png"
       },
       "white": {
        "basecolor": "captures/Body_104_white/Body_basecolor.png",
        "metallic": "captures/Body_104_white/Body_metallic.png",
        "roughness": "captures/Body_104_white/Body_roughness.png",
        "normal": "captures/Body_104_white/Body_normal.png",
-       "height": "captures/Body_104_white/Body_height.png"
+       "height": "captures/Body_104_white/Body_height.png",
+       "emissive": "captures/Body_104_white/Body_emissive.png",
+       "opacity": "captures/Body_104_white/Body_opacity.png"
       }
      }
     }
@@ -263,7 +329,7 @@
   }
  ],
  "log": [
-  "Body: channels not carried over: Emissive",
+  "Body: channels not carried over: Specular",
   "Body: export of Body_meshmaps produced no curvature map",
   "Body: export of Body_meshmaps produced no normal map",
   "Body: export of Body_meshmaps produced no world_normal map",

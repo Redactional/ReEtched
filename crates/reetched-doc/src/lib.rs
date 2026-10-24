@@ -5,6 +5,7 @@
 pub mod export;
 pub mod history;
 pub mod project;
+pub mod psd;
 pub mod smart;
 
 use serde::{Deserialize, Serialize};
@@ -23,15 +24,19 @@ pub enum Channel {
     Roughness,
     Normal,
     Height,
+    Emissive,
+    Opacity,
 }
 
 impl Channel {
-    pub const ALL: [Channel; 5] = [
+    pub const ALL: [Channel; 7] = [
         Channel::BaseColor,
         Channel::Metallic,
         Channel::Roughness,
         Channel::Normal,
         Channel::Height,
+        Channel::Emissive,
+        Channel::Opacity,
     ];
 
     pub fn label(self) -> &'static str {
@@ -41,12 +46,17 @@ impl Channel {
             Channel::Roughness => "Roughness",
             Channel::Normal => "Normal",
             Channel::Height => "Height",
+            Channel::Emissive => "Emissive",
+            Channel::Opacity => "Opacity",
         }
     }
 
     /// Three-component channels; the rest use only `x`.
     pub fn is_vector(self) -> bool {
-        matches!(self, Channel::BaseColor | Channel::Normal)
+        matches!(
+            self,
+            Channel::BaseColor | Channel::Normal | Channel::Emissive
+        )
     }
 
     /// Value of an empty layer stack (base color is linear RGB, normal is tangent space).
@@ -57,7 +67,14 @@ impl Channel {
             Channel::Roughness => [0.5; 3],
             Channel::Normal => [0.0, 0.0, 1.0],
             Channel::Height => [0.0; 3],
+            Channel::Emissive => [0.0; 3],
+            Channel::Opacity => [1.0; 3],
         }
+    }
+
+    /// Color channels hold linear RGB (and are sRGB-encoded in 8/16-bit images).
+    pub fn is_color(self) -> bool {
+        matches!(self, Channel::BaseColor | Channel::Emissive)
     }
 
     /// Painter's default blend mode for a new layer in this channel.
@@ -404,6 +421,38 @@ impl Default for Projection {
     }
 }
 
+/// How a bitmap's pixel values are read (Painter's per-resource color space).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ColorSpace {
+    /// sRGB for color channels (base color, emissive), raw for data channels.
+    #[default]
+    Auto,
+    Srgb,
+    /// Raw values (linear / data).
+    Linear,
+}
+
+impl ColorSpace {
+    pub const ALL: [ColorSpace; 3] = [ColorSpace::Auto, ColorSpace::Srgb, ColorSpace::Linear];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorSpace::Auto => "Auto",
+            ColorSpace::Srgb => "sRGB",
+            ColorSpace::Linear => "Linear / raw",
+        }
+    }
+
+    /// Decode as sRGB when used for channel `c`?
+    pub fn is_srgb(self, c: Channel) -> bool {
+        match self {
+            ColorSpace::Auto => c.is_color(),
+            ColorSpace::Srgb => true,
+            ColorSpace::Linear => false,
+        }
+    }
+}
+
 /// What a fill layer puts into one channel.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ChannelSource {
@@ -412,6 +461,8 @@ pub struct ChannelSource {
     pub value: [f32; 3],
     /// A bitmap overrides the uniform value.
     pub bitmap: Option<ResourceId>,
+    #[serde(default)]
+    pub color_space: ColorSpace,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -494,6 +545,7 @@ impl Fill {
             enabled,
             value,
             bitmap: None,
+            color_space: ColorSpace::Auto,
         };
         let channels = Channel::ALL
             .into_iter()

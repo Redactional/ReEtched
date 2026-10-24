@@ -260,12 +260,7 @@ impl State {
     }
 
     pub fn properties_ui(&mut self, ui: &mut Ui) {
-        if self.properties_tool
-            && !matches!(
-                self.tool,
-                crate::app::Tool::Projection | crate::app::Tool::Picker
-            )
-        {
+        if self.properties_tool && self.tool != crate::app::Tool::Picker {
             self.brush_ui(ui);
             return;
         }
@@ -416,6 +411,7 @@ impl State {
                             enabled: false,
                             value: c.empty_value(),
                             bitmap: None,
+                            color_space: Default::default(),
                         });
                         ui.toggle_value(&mut src.enabled, c.label());
                     }
@@ -448,6 +444,18 @@ impl State {
                                     &mut pick,
                                     &mut clear,
                                 );
+                                if src.bitmap.is_some() {
+                                    ComboBox::from_id_salt(("color_space", c))
+                                        .width(70.0)
+                                        .selected_text(src.color_space.label())
+                                        .show_ui(ui, |ui| {
+                                            for cs in reetched_doc::ColorSpace::ALL {
+                                                ui.selectable_value(&mut src.color_space, cs, cs.label());
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("How the image's values are read");
+                                }
                             });
                             ui.end_row();
                         }
@@ -508,6 +516,8 @@ impl State {
         }
         let mut open = true;
         let mut run = false;
+        let mut run_mesh = false;
+        let mut run_psd = false;
         egui::Window::new(theme::header("EXPORT TEXTURES"))
             .open(&mut open)
             .default_width(480.0)
@@ -674,8 +684,42 @@ impl State {
                         run = true;
                     }
                 });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(theme::header("MESH WITH TEXTURES"));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut e.mesh_usd, true, "USD (.usda)");
+                    ui.selectable_value(&mut e.mesh_usd, false, "OBJ");
+                    ui.label("Displacement");
+                    ui.add(egui::DragValue::new(&mut e.displacement).speed(0.001).range(0.0..=10.0))
+                        .on_hover_text("Moves vertices along their normals by the height channel × this (world units); 0 = off");
+                });
+                ui.label(
+                    RichText::new("Writes the mesh plus PBR Metallic Roughness textures it references, into the folder above.")
+                        .color(theme::WEAK),
+                );
+                let ready = !e.dir.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Export mesh")).clicked() {
+                    run_mesh = true;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(theme::header("LAYERED PSD"));
+                ui.label(
+                    RichText::new("One Photoshop file per texture set and channel, with layers, folders, masks, blend modes and opacities.")
+                        .color(theme::WEAK),
+                );
+                if ui.add_enabled(ready, egui::Button::new("Export PSD")).clicked() {
+                    run_psd = true;
+                }
             });
         self.export.open = open;
+        if run_mesh {
+            self.export_mesh();
+        }
+        if run_psd {
+            self.export_psd();
+        }
         if std::mem::take(&mut self.pending_preset_import) {
             self.import_spexp();
         }
@@ -794,6 +838,91 @@ impl State {
     }
 }
 
+impl State {
+    /// Writes the mesh (OBJ or USD) and the textures it references.
+    pub fn export_mesh(&mut self) {
+        use reetched_io::export::{MaterialFiles, write_obj, write_usda};
+        let dir = PathBuf::from(self.export.dir.trim());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.error(format!("Could not create {}: {e}", dir.display()));
+            return;
+        }
+        for w in self.viewport.sync(
+            &self.device,
+            &self.queue,
+            &self.doc.texture_sets,
+            &self.resources,
+            self.preview_map(),
+        ) {
+            self.warn(w);
+        }
+        let preset = reetched_doc::export::builtin_presets().remove(0);
+        let project = self.project_name();
+        let mesh_name = mesh_name(&self.doc.mesh_source);
+        let mut materials = Vec::new();
+        let mut heights = Vec::new();
+        for (i, set) in self.doc.texture_sets.clone().iter().enumerate() {
+            let result = self
+                .viewport
+                .read_back(&self.device, &self.queue, i)
+                .and_then(|data| {
+                    let files = export_texture_set(
+                        &preset,
+                        &self.export.settings,
+                        &data,
+                        &dir,
+                        (&project, &mesh_name, &set.name),
+                    )?;
+                    Ok((data, files))
+                });
+            let (data, files) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    self.error(format!("Export of {} failed: {e:#}", set.name));
+                    return;
+                }
+            };
+            // The preset's maps, in order: base color, metallic, roughness, normal, height, emissive, opacity.
+            let file = |k: usize| {
+                files
+                    .get(k)
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+            };
+            materials.push(MaterialFiles {
+                name: set.name.clone(),
+                base_color: file(0),
+                metallic: file(1),
+                roughness: file(2),
+                normal: file(3),
+                emissive: file(5),
+                opacity: file(6),
+            });
+            heights.push((data.width, data.height_map));
+        }
+        let scale = self.export.displacement;
+        let displace = |part: usize, uv: [f32; 2]| -> f32 {
+            let Some((res, h)) = heights.get(part) else {
+                return 0.0;
+            };
+            let x = ((uv[0].rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
+            let y = (((1.0 - uv[1]).rem_euclid(1.0) * *res as f32) as u32).min(res - 1);
+            h[(y * res + x) as usize] * scale
+        };
+        let displace: Option<reetched_io::export::Displace> = (scale > 0.0).then_some(&displace);
+        let (ext, write): (&str, fn(_, _, _, _) -> _) = if self.export.mesh_usd {
+            ("usda", write_usda)
+        } else {
+            ("obj", write_obj)
+        };
+        let path = dir.join(format!("{mesh_name}.{ext}"));
+        match write(&path, &self.mesh, displace, &materials) {
+            Ok(()) => self.info(format!("Exported {}", path.display())),
+            Err(e) => self.error(format!("Mesh export failed: {e:#}")),
+        }
+    }
+}
+
 /// The texture set's baked AO, resized to `res` (empty if there is none).
 fn baked_ao(
     set: &reetched_doc::TextureSet,
@@ -819,7 +948,7 @@ fn baked_ao(
     }
 }
 
-fn mesh_name(source: &Option<String>) -> String {
+pub(crate) fn mesh_name(source: &Option<String>) -> String {
     source
         .as_deref()
         .map(std::path::Path::new)
@@ -1062,7 +1191,7 @@ fn swatch(fill: &Fill, channel: Channel) -> Color32 {
     let [x, y, z] = src.value;
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
     match channel {
-        Channel::BaseColor => egui::Rgba::from_rgb(x, y, z).into(),
+        Channel::BaseColor | Channel::Emissive => egui::Rgba::from_rgb(x, y, z).into(),
         Channel::Normal => Color32::from_rgb(
             byte(x * 0.5 + 0.5),
             byte(y * 0.5 + 0.5),
@@ -1075,7 +1204,7 @@ fn swatch(fill: &Fill, channel: Channel) -> Color32 {
 
 pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
     match c {
-        Channel::BaseColor => {
+        Channel::BaseColor | Channel::Emissive => {
             let mut rgba = egui::Rgba::from_rgb(value[0], value[1], value[2]);
             if egui::color_picker::color_edit_button_rgba(
                 ui,
@@ -1087,7 +1216,7 @@ pub fn channel_value_ui(ui: &mut Ui, c: Channel, value: &mut [f32; 3]) {
                 *value = [rgba.r(), rgba.g(), rgba.b()];
             }
         }
-        Channel::Metallic | Channel::Roughness => {
+        Channel::Metallic | Channel::Roughness | Channel::Opacity => {
             if ui.add(Slider::new(&mut value[0], 0.0..=1.0)).changed() {
                 *value = [value[0]; 3];
             }

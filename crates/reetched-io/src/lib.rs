@@ -1,6 +1,7 @@
 //! Mesh import. A file becomes one indexed triangle mesh, split into parts by
 //! material — each part is what Painter calls a texture set.
 
+pub mod export;
 pub mod topology;
 
 use anyhow::{Context, Result, anyhow, bail};

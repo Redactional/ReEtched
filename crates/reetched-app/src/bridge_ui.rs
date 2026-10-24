@@ -112,6 +112,8 @@ impl State {
                     Channel::Metallic => [data.metallic[i]; 3],
                     Channel::Roughness => [data.roughness[i]; 3],
                     Channel::Height => [data.height_map[i]; 3],
+                    Channel::Emissive => data.emissive[i].map(linear_to_srgb),
+                    Channel::Opacity => [data.opacity[i]; 3],
                 }
             };
             let comps = if r.channel.is_vector() { 3 } else { 1 };

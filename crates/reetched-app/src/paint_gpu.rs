@@ -55,6 +55,19 @@ pub enum StrokeMode {
     },
     /// Drags paint along with the brush.
     Smudge,
+    /// Paints the Projection tool's image into targets marked `projected`.
+    Project,
+}
+
+/// Where the Projection tool's image sits over the 3D view.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ProjectUniform {
+    pub view_proj: [[f32; 4]; 4],
+    /// xy: image center (NDC), zw: half size (NDC)
+    pub place: [f32; 4],
+    /// x: cos, y: sin of the rotation, z: 1 = depth test
+    pub rot: [f32; 4],
 }
 
 /// The view the dabs were placed from (for the occlusion test).
@@ -77,6 +90,8 @@ pub struct StrokeTarget {
     /// Brush value for this buffer (linear color, normal, or scalar in x).
     pub value: [f32; 3],
     pub is_normal: bool,
+    /// Projection tool: this buffer takes the projected image's colors.
+    pub projected: bool,
     /// The buffer's tiles when the stroke started.
     pub old: TileMap,
 }
@@ -94,12 +109,16 @@ struct Stroke {
     targets: Vec<(StrokeTarget, wgpu::Texture, wgpu::TextureView)>,
     /// Smudge: motion not yet applied because it was under a texel.
     carry: [f32; 2],
+    /// Projection tool: the image as seen on each texel.
+    projected: Option<wgpu::TextureView>,
 }
 
 pub struct PaintGpu {
     splat: wgpu::RenderPipeline,
     /// Fills whole triangles into the stroke mask (Polygon Fill).
     fill: wgpu::RenderPipeline,
+    /// Projects the Projection tool's image into texture space.
+    project: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     splat_layout: wgpu::BindGroupLayout,
     apply_layout: wgpu::BindGroupLayout,
@@ -156,6 +175,7 @@ impl PaintGpu {
                 entry(0, S::FRAGMENT, uniform),
                 entry(1, S::FRAGMENT, tex(false)),
                 entry(2, S::FRAGMENT, tex(false)),
+                entry(3, S::FRAGMENT, tex(false)),
             ],
         });
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/paint.wgsl"));
@@ -217,6 +237,13 @@ impl PaintGpu {
             mask_target.clone(),
         );
         let fill = pipeline(None, "vs_uv", "fs_fill", &vertex_layout, mask_target);
+        let project = pipeline(
+            Some(&splat_layout),
+            "vs_uv",
+            "fs_project",
+            &vertex_layout,
+            PAINT_FORMAT.into(),
+        );
         let apply = pipeline(
             Some(&apply_layout),
             "vs_full",
@@ -270,6 +297,7 @@ impl PaintGpu {
         Self {
             splat,
             fill,
+            project,
             apply,
             splat_layout,
             apply_layout,
@@ -359,6 +387,7 @@ impl PaintGpu {
             frame_mask,
             targets,
             carry: [0.0; 2],
+            projected: None,
         });
     }
 
@@ -515,6 +544,85 @@ impl PaintGpu {
         queue.submit([enc.finish()]);
     }
 
+    /// Projection tool: renders `image` as placed by `u` onto the mesh, in texture
+    /// space, as the color source of this stroke.
+    pub fn project(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshPart,
+        depth: Option<&wgpu::TextureView>,
+        image: &wgpu::TextureView,
+        mut u: ProjectUniform,
+    ) {
+        let Some(stroke) = &mut self.stroke else {
+            return;
+        };
+        let view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("projected image"),
+                size: wgpu::Extent3d {
+                    width: stroke.res,
+                    height: stroke.res,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: PAINT_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        u.rot[2] = if depth.is_some() { 1.0 } else { 0.0 };
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("project"),
+            contents: bytemuck::bytes_of(&u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.splat_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth.unwrap_or(&self.no_depth)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(image),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("project image"),
+                color_attachments: &[Some(attachment(
+                    &view,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                ))],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.project);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(mesh.range.clone(), 0, 0..1);
+        }
+        queue.submit([enc.finish()]);
+        stroke.projected = Some(view);
+    }
+
     /// Blends the stroke into every target: before + mask → paint texture.
     /// `offset`: smudge's copy offset this frame (texels).
     fn apply(
@@ -539,6 +647,9 @@ impl PaintGpu {
                 continue;
             };
             let [r, g, b] = target.value;
+            let project = stroke.mode == StrokeMode::Project
+                && target.projected
+                && stroke.projected.is_some();
             let u = ApplyUniform {
                 color: [r, g, b, if target.is_normal { 1.0 } else { 0.0 }],
                 params: [
@@ -551,7 +662,7 @@ impl PaintGpu {
                     0.0,
                     0.0,
                 ],
-                extra: [copy, offset[0], offset[1], 0.0],
+                extra: [if project { 2.0 } else { copy }, offset[0], offset[1], 0.0],
             };
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("apply"),
@@ -573,6 +684,12 @@ impl PaintGpu {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(mask),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            stroke.projected.as_ref().unwrap_or(&self.white),
+                        ),
                     },
                 ],
             });
@@ -675,7 +792,7 @@ fn attachment(
 
 /// Copies a texture region to the CPU, rows tightly packed.
 #[allow(clippy::too_many_arguments)]
-fn read_region(
+pub(crate) fn read_region(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -839,6 +956,7 @@ mod tests {
             key: (7, 0),
             value: [1.0, 0.0, 0.0],
             is_normal: false,
+            projected: false,
             old,
         };
         pg.begin(&g.device, &g.queue, comp, vec![target], RES, res, mode, 1.0);

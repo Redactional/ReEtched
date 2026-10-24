@@ -18,6 +18,8 @@ class ChannelType(enum.Enum):
     Normal = 3
     Height = 4
     Emissive = 5
+    Opacity = 6
+    Specular = 7
 
 
 class BlendingMode(enum.Enum):
@@ -376,7 +378,15 @@ def _write_png16(path, size, pixels):
         f.write(data)
 
 
-_DOC_MAPS = {"basecolor": ChannelType.BaseColor, "metallic": ChannelType.Metallic, "roughness": ChannelType.Roughness, "normal": ChannelType.Normal, "height": ChannelType.Height}
+_DOC_MAPS = {
+    "basecolor": ChannelType.BaseColor,
+    "metallic": ChannelType.Metallic,
+    "roughness": ChannelType.Roughness,
+    "normal": ChannelType.Normal,
+    "height": ChannelType.Height,
+    "emissive": ChannelType.Emissive,
+    "opacity": ChannelType.Opacity,
+}
 
 
 # What an empty stack exports (captures must not depend on it).
@@ -386,6 +396,8 @@ _EMPTY = {
     ChannelType.Roughness: (0.5, 0.5, 0.5),
     ChannelType.Normal: (0.5, 0.5, 1.0),
     ChannelType.Height: (0.0, 0.0, 0.0),
+    ChannelType.Emissive: (0.0, 0.0, 0.0),
+    ChannelType.Opacity: (1.0, 1.0, 1.0),
 }
 
 

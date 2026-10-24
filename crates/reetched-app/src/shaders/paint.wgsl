@@ -122,6 +122,49 @@ fn fs_splat(in: VsOut) -> @location(0) vec4<f32> {
     return vec4(acc, 0.0, 0.0, acc);
 }
 
+// ---------------------------------------------------------------- projection
+
+// The Projection tool: an image placed over the 3D view, projected onto the
+// surface. Rendered once per stroke into a per-texel "source" texture.
+struct Project {
+    view_proj: mat4x4<f32>,
+    // xy: image center (NDC), zw: half size (NDC)
+    place: vec4<f32>,
+    // x: cos, y: sin of the image rotation, z: 1 = test against the view's depth
+    rot: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> PJ: Project;
+@group(0) @binding(1) var pj_depth: texture_depth_2d;
+@group(0) @binding(2) var pj_image: texture_2d<f32>;
+@group(0) @binding(3) var pj_smp: sampler;
+
+@fragment
+fn fs_project(in: VsOut) -> @location(0) vec4<f32> {
+    let clip = PJ.view_proj * vec4(in.world, 1.0);
+    if clip.w <= 0.0 {
+        return vec4(0.0);
+    }
+    let ndc = clip.xyz / clip.w;
+    if abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 {
+        return vec4(0.0);
+    }
+    if PJ.rot.z > 0.5 {
+        let size = vec2<f32>(textureDimensions(pj_depth));
+        let px = clamp(vec2<i32>((vec2(ndc.x, -ndc.y) * 0.5 + 0.5) * size), vec2(0), vec2<i32>(size) - 1);
+        if ndc.z > textureLoad(pj_depth, px, 0) + 0.0005 {
+            return vec4(0.0); // hidden behind other geometry
+        }
+    }
+    let d = ndc.xy - PJ.place.xy;
+    let r = vec2(PJ.rot.x * d.x + PJ.rot.y * d.y, -PJ.rot.y * d.x + PJ.rot.x * d.y) / PJ.place.zw;
+    let uv = r * vec2(0.5, -0.5) + 0.5;
+    if any(uv < vec2(0.0)) || any(uv > vec2(1.0)) {
+        return vec4(0.0);
+    }
+    return textureSampleLevel(pj_image, pj_smp, uv, 0.0);
+}
+
 // Polygon Fill: whole triangles.
 @fragment
 fn fs_fill(in: VsOut) -> @location(0) vec4<f32> {
@@ -135,13 +178,16 @@ struct Apply {
     color: vec4<f32>,
     // x: stroke opacity, y: erase
     params: vec4<f32>,
-    // x: 1 = copy paint from an offset (clone, smudge), yz: offset in texels
+    // x: 1 = copy paint from an offset (clone, smudge), 2 = paint the projected image;
+    // yz: offset in texels
     extra: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> A: Apply;
 @group(0) @binding(1) var before: texture_2d<f32>;
 @group(0) @binding(2) var stroke_mask: texture_2d<f32>;
+// Projection tool: per-texel color and coverage to paint.
+@group(0) @binding(3) var projected: texture_2d<f32>;
 
 @vertex
 fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -156,6 +202,15 @@ fn fs_apply(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let m = textureLoad(stroke_mask, p, 0).r * A.params.x;
     if A.params.y > 0.5 {
         return vec4(b.rgb, b.a * (1.0 - m));
+    }
+    if A.extra.x > 1.5 {
+        let s = textureLoad(projected, p, 0);
+        let k = m * s.a;
+        let a = k + b.a * (1.0 - k);
+        if a <= 0.0 {
+            return b;
+        }
+        return vec4((s.rgb * k + b.rgb * b.a * (1.0 - k)) / a, a);
     }
     if A.extra.x > 0.5 {
         let size = vec2<i32>(textureDimensions(before));

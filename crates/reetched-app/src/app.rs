@@ -151,6 +151,7 @@ pub struct State {
     pub pending_preset_import: bool,
     pub pending_preset_save: bool,
     pub exposure_ev: f32,
+    pub render: crate::viewport::RenderSettings,
     pub env_rotation_deg: f32,
     pub background_blur: f32,
     pub env_opacity: f32,
@@ -173,6 +174,10 @@ pub struct State {
     /// Path tool points (object space) and whether committing erases.
     pub path_points: Vec<Vec3>,
     pub path_erase: bool,
+    /// The Projection tool's image.
+    pub stencil: crate::tools_ui::Stencil,
+    /// Polygon Fill rectangle selection: where the drag started.
+    pub marquee: Option<egui::Pos2>,
     /// Properties shows the tool (true) or the selected layer (false).
     pub properties_tool: bool,
     /// Latest pen pressure (1 with a mouse).
@@ -212,6 +217,9 @@ pub struct ExportUi {
     pub settings: ExportSettings,
     /// Which texture sets to export.
     pub include: Vec<bool>,
+    /// Mesh export: USD (true) or OBJ, and displacement from the height channel (world units).
+    pub mesh_usd: bool,
+    pub displacement: f32,
 }
 
 pub struct LogLine {
@@ -258,8 +266,11 @@ impl App {
                 preset: 0,
                 settings: ExportSettings::default(),
                 include: Vec::new(),
+                mesh_usd: true,
+                displacement: 0.0,
             },
             exposure_ev: 0.0,
+            render: Default::default(),
             env_rotation_deg: 0.0,
             background_blur: 0.6,
             env_opacity: 0.0,
@@ -277,6 +288,8 @@ impl App {
             clone_offset: None,
             path_points: Vec::new(),
             path_erase: false,
+            stencil: Default::default(),
+            marquee: None,
             properties_tool: false,
             pressure: 1.0,
             last_stroke_end: None,
@@ -318,6 +331,9 @@ impl App {
         self.state.update_procedurals();
         if self.state.procedural.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.state.viewport.accumulating(&self.state.render) {
+            ctx.request_repaint();
         }
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
@@ -559,6 +575,7 @@ impl App {
             uv_mode: s.uv_mode,
             uv_xform: s.uv_camera.xform,
             uv_part: Some(s.selected_part),
+            render: s.render,
         };
         s.viewport
             .render(&s.device, &s.queue, egui, encoder, &params);
@@ -1117,7 +1134,7 @@ impl State {
         ui.vertical_centered(|ui| {
             for (tool, icon, name) in Tool::ALL {
                 let tip = match tool {
-                    Tool::Projection | Tool::Picker => {
+                    Tool::Picker => {
                         format!("{name} — arrives in a later phase")
                     }
                     _ => name.to_string(),
@@ -1799,7 +1816,7 @@ mod tests {
         let checks = h.app.state.import_bridge(&dir);
         let s = &h.app.state;
         assert_eq!(s.doc.texture_sets[0].stack.len(), 3);
-        assert_eq!(checks.len(), 5);
+        assert_eq!(checks.len(), 7);
         for c in &checks {
             eprintln!(
                 "{} {:?}: mean {:.4}, off {:.3}",
@@ -1807,7 +1824,12 @@ mod tests {
             );
         }
         // The fake Painter in the plugin test blends like ours for these channels.
-        for ch in [Channel::Metallic, Channel::Roughness] {
+        for ch in [
+            Channel::Metallic,
+            Channel::Roughness,
+            Channel::Emissive,
+            Channel::Opacity,
+        ] {
             let c = checks.iter().find(|c| c.channel == ch).unwrap();
             assert!(c.passed(), "{ch:?}: mean {}, off {}", c.mean, c.off);
         }
@@ -1893,6 +1915,211 @@ mod tests {
             moved * 10 >= before.len() * 8,
             "{moved} of {} painted texels found mirrored",
             before.len()
+        );
+    }
+
+    #[test]
+    fn emissive_glows_and_cutout_hides_in_the_3d_view() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let center = |h: &Harness| {
+            let ([w, ht], px) = h.app.state.viewport.read_display(&h.device, &h.queue);
+            let i = ((ht / 2 * w + w / 2) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        let set_fill = |h: &mut Harness, emissive: [f32; 3], opacity: f32| {
+            let mut fill = reetched_doc::Fill::new([0.0; 3], 0.0, 0.9);
+            for (c, v) in [
+                (Channel::Emissive, emissive),
+                (Channel::Opacity, [opacity; 3]),
+            ] {
+                let src = fill.channels.get_mut(&c).unwrap();
+                src.enabled = true;
+                src.value = v;
+            }
+            let node = h.app.state.doc.new_fill("test".into(), fill);
+            h.app.state.doc.texture_sets[0].stack = vec![node];
+            for _ in 0..4 {
+                h.frame(vec![]);
+            }
+        };
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        // A black, glowing red sphere.
+        set_fill(&mut h, [1.0, 0.0, 0.0], 1.0);
+        let c = center(&h);
+        assert!(c[0] > 150 && c[1] < 60, "emissive red: {c:?}");
+
+        // Fully transparent with alpha cutout: the background shows (#262626).
+        h.app.state.render.alpha = crate::viewport::AlphaMode::Cutout;
+        set_fill(&mut h, [1.0, 0.0, 0.0], 0.0);
+        let c = center(&h);
+        assert!(
+            c.iter().all(|&v| (0x20..=0x2c).contains(&v)),
+            "background: {c:?}"
+        );
+    }
+
+    #[test]
+    fn exports_usd_and_obj_with_their_textures() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        h.app.state.doc.texture_sets[0].resolution = 64;
+        h.frame(vec![]);
+        let dir = std::env::temp_dir().join("reetched-mesh-export-app");
+        let _ = std::fs::remove_dir_all(&dir);
+        h.app.state.export.dir = dir.display().to_string();
+        h.app.state.export.displacement = 0.1;
+        for usd in [true, false] {
+            h.app.state.export.mesh_usd = usd;
+            h.app.state.export_mesh();
+        }
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let has = |suffix: &str| names.iter().any(|n| n.ends_with(suffix));
+        for suffix in [
+            ".usda",
+            ".obj",
+            ".mtl",
+            "_BaseColor.png",
+            "_Normal.png",
+            "_Emissive.png",
+        ] {
+            assert!(has(suffix), "missing *{suffix} in {names:?}");
+        }
+        let usda = names.iter().find(|n| n.ends_with(".usda")).unwrap();
+        let text = std::fs::read_to_string(dir.join(usda)).unwrap();
+        let base = names
+            .iter()
+            .find(|n| n.ends_with("_BaseColor.png"))
+            .unwrap();
+        assert!(text.contains(&format!("@{base}@")), "USD references {base}");
+    }
+
+    #[test]
+    fn layered_psd_keeps_layers_folders_and_masks() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let s = &mut h.app.state;
+        s.doc.texture_sets[0].resolution = 64;
+        // Folder [ Red fill (multiply 50%, black mask) ], over a grey fill.
+        let mut red = s.doc.new_fill(
+            "Red".into(),
+            reetched_doc::Fill::new([1.0, 0.0, 0.0], 0.0, 0.5),
+        );
+        red.blend.insert(
+            Channel::BaseColor,
+            reetched_doc::ChannelBlend {
+                mode: reetched_doc::BlendMode::Multiply,
+                opacity: 0.5,
+            },
+        );
+        red.mask = Some(reetched_doc::Mask::new(reetched_doc::MaskBackground::Black));
+        let mut folder = s.doc.new_folder("Group".into());
+        if let NodeKind::Folder { children } = &mut folder.kind {
+            children.push(red);
+        }
+        let grey = s
+            .doc
+            .new_fill("Grey".into(), reetched_doc::Fill::new([0.5; 3], 0.0, 0.5));
+        s.doc.texture_sets[0].stack = vec![folder, grey];
+        let dir = std::env::temp_dir().join("reetched-psd-app");
+        let _ = std::fs::remove_dir_all(&dir);
+        s.export.dir = dir.display().to_string();
+        s.export.include = vec![true];
+        h.frame(vec![]);
+        h.app.state.export_psd();
+
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().ends_with("_BaseColor.psd"))
+            .expect("a base color PSD");
+        let psd = psd::Psd::from_bytes(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!((psd.width(), psd.height()), (64, 64));
+        assert_eq!(psd.groups().len(), 1);
+        let red = psd.layer_by_name("Red").unwrap();
+        assert_eq!(format!("{:?}", red.blend_mode()), "Multiply");
+        assert_eq!(red.opacity(), 128);
+        let mid = ((32 * 64 + 32) * 4) as usize;
+        assert_eq!(&red.rgba()[mid..mid + 4], &[255, 0, 0, 255]);
+        let grey = psd.layer_by_name("Grey").unwrap();
+        assert!(
+            (grey.rgba()[mid] as i32 - 188).abs() <= 2,
+            "linear 0.5 → sRGB 188"
+        );
+        // Several channels were written: base color, metallic, roughness.
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert!(n >= 3, "{n} files");
+    }
+
+    #[test]
+    fn projection_tool_and_marquee_fill_paint_the_layer() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        h.app.state.doc.texture_sets[0].resolution = 256;
+        h.frame(vec![]);
+        let rect = h.app.state.view3d_rect;
+        let base = |h: &Harness| -> Vec<[f32; 4]> {
+            let s = &h.app.state;
+            let NodeKind::Paint(p) = &s.doc.texture_sets[0].stack[0].kind else {
+                panic!("paint layer")
+            };
+            p.channels.get(&Channel::BaseColor).map_or(Vec::new(), |m| {
+                (0..256 * 256)
+                    .map(|k| m.texel(&s.resources, k % 256, k / 256))
+                    .filter(|t| t[3] > 0.99)
+                    .collect()
+            })
+        };
+
+        // Projection: a big solid green image; the stroke paints green, whatever the brush color.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let s = &mut h.app.state;
+        s.stencil.image = Some(s.resources.add(png));
+        s.stencil.size = 3.0;
+        s.tool = Tool::Projection;
+        h.stroke(
+            rect.center() - vec2(20.0, 0.0),
+            rect.center() + vec2(20.0, 0.0),
+        );
+        let painted = base(&h);
+        assert!(painted.len() > 50, "projected texels: {}", painted.len());
+        assert!(
+            painted.iter().all(|t| t[1] > 0.9 && t[0] < 0.05),
+            "green, not the brush color: {:?}",
+            painted[0]
+        );
+        h.app.state.history.undo(&mut h.app.state.doc);
+        h.frame(vec![]);
+
+        // Polygon Fill marquee over the middle of the view.
+        h.app.state.tool = Tool::PolygonFill;
+        h.stroke(
+            rect.center() - vec2(60.0, 60.0),
+            rect.center() + vec2(60.0, 60.0),
+        );
+        let filled = base(&h).len();
+        assert!(
+            (200..20_000).contains(&filled),
+            "the rectangle fills some front faces, not the whole texture: {filled}"
         );
     }
 }

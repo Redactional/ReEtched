@@ -1,9 +1,11 @@
-// Layer-stack compositor. Every pass renders the mesh in UV space into three
+// Layer-stack compositor. Every pass renders the mesh in UV space into four
 // rgba16float targets (a "channel set"):
 //   t0 = base color (linear rgb), metallic
 //   t1 = normal (tangent space xyz), roughness
-//   t2 = height, coverage (1 inside UV islands), filled (1 = has a value, incl. dilation), 0
-// Channel order everywhere: 0 base color, 1 metallic, 2 roughness, 3 normal, 4 height.
+//   t2 = height, coverage (1 inside UV islands), filled (1 = has a value, incl. dilation), opacity
+//   t3 = emissive (linear rgb), unused
+// Channel order everywhere: 0 base color, 1 metallic, 2 roughness, 3 normal, 4 height,
+// 5 emissive, 6 opacity.
 
 struct Proj {
     // x: mode (0 uv, 1 tri-planar, 2 planar, 3 spherical, 4 cylindrical), y: uv rotation (rad),
@@ -33,9 +35,9 @@ struct MaskFx {
 
 struct Params {
     // xyz: uniform value, w: channel enabled
-    values: array<vec4<f32>, 5>,
+    values: array<vec4<f32>, 7>,
     // x: blend mode, y: opacity, z: has bitmap
-    blend: array<vec4<f32>, 5>,
+    blend: array<vec4<f32>, 7>,
     // x: mask enabled, y: background (1 white), z: has bitmap, w: invert
     mask: vec4<f32>,
     proj: Proj,
@@ -56,16 +58,18 @@ struct Params {
 @group(0) @binding(4) var t_rough: texture_2d<f32>;
 @group(0) @binding(5) var t_normal: texture_2d<f32>;
 @group(0) @binding(6) var t_height: texture_2d<f32>;
-@group(0) @binding(7) var t_mask: texture_2d<f32>;
+@group(0) @binding(7) var t_emissive: texture_2d<f32>;
+@group(0) @binding(8) var t_opacity: texture_2d<f32>;
+@group(0) @binding(9) var t_mask: texture_2d<f32>;
 // Painted mask texels (value in r, coverage in a), same size as the texture set.
-@group(0) @binding(8) var t_mask_paint: texture_2d<f32>;
+@group(0) @binding(10) var t_mask_paint: texture_2d<f32>;
 // Baked mesh maps (image orientation: row 0 = v 1).
-@group(0) @binding(9) var m_normal: texture_2d<f32>;
-@group(0) @binding(10) var m_curvature: texture_2d<f32>;
-@group(0) @binding(11) var m_ao: texture_2d<f32>;
-@group(0) @binding(12) var m_position: texture_2d<f32>;
-@group(0) @binding(13) var m_thickness: texture_2d<f32>;
-@group(0) @binding(14) var m_id: texture_2d<f32>;
+@group(0) @binding(11) var m_normal: texture_2d<f32>;
+@group(0) @binding(12) var m_curvature: texture_2d<f32>;
+@group(0) @binding(13) var m_ao: texture_2d<f32>;
+@group(0) @binding(14) var m_position: texture_2d<f32>;
+@group(0) @binding(15) var m_thickness: texture_2d<f32>;
+@group(0) @binding(16) var m_id: texture_2d<f32>;
 
 fn mesh_map(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(t, smp, vec2(uv.x, 1.0 - uv.y), 0.0);
@@ -171,10 +175,12 @@ fn mask_blend(mode: u32, a: f32, b: f32, opacity: f32) -> f32 {
 @group(1) @binding(0) var s0: texture_2d<f32>;
 @group(1) @binding(1) var s1: texture_2d<f32>;
 @group(1) @binding(2) var s2: texture_2d<f32>;
+@group(1) @binding(3) var s3: texture_2d<f32>;
 // Folder passes: the folder's content.
 @group(2) @binding(0) var o0: texture_2d<f32>;
 @group(2) @binding(1) var o1: texture_2d<f32>;
 @group(2) @binding(2) var o2: texture_2d<f32>;
+@group(2) @binding(3) var o3: texture_2d<f32>;
 
 struct Ch {
     base: vec3<f32>,
@@ -184,37 +190,41 @@ struct Ch {
     height: f32,
     coverage: f32,
     filled: f32,
+    emissive: vec3<f32>,
+    opacity: f32,
 };
 
 struct Out {
     @location(0) t0: vec4<f32>,
     @location(1) t1: vec4<f32>,
     @location(2) t2: vec4<f32>,
+    @location(3) t3: vec4<f32>,
 };
 
-fn unpack(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>) -> Ch {
-    return Ch(a.rgb, a.a, b.a, b.xyz, c.x, c.y, c.z);
+fn unpack(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> Ch {
+    return Ch(a.rgb, a.a, b.a, b.xyz, c.x, c.y, c.z, d.rgb, c.w);
 }
 
 fn load_s(p: vec2<i32>) -> Ch {
-    return unpack(textureLoad(s0, p, 0), textureLoad(s1, p, 0), textureLoad(s2, p, 0));
+    return unpack(textureLoad(s0, p, 0), textureLoad(s1, p, 0), textureLoad(s2, p, 0), textureLoad(s3, p, 0));
 }
 
 fn load_o(p: vec2<i32>) -> Ch {
-    return unpack(textureLoad(o0, p, 0), textureLoad(o1, p, 0), textureLoad(o2, p, 0));
+    return unpack(textureLoad(o0, p, 0), textureLoad(o1, p, 0), textureLoad(o2, p, 0), textureLoad(o3, p, 0));
 }
 
 fn pack(c: Ch) -> Out {
     var o: Out;
     o.t0 = vec4(clamp(c.base, vec3(0.0), vec3(1.0)), clamp(c.metal, 0.0, 1.0));
     o.t1 = vec4(normalize(c.normal), clamp(c.rough, 0.0, 1.0));
-    o.t2 = vec4(c.height, c.coverage, c.filled, 0.0);
+    o.t2 = vec4(c.height, c.coverage, c.filled, clamp(c.opacity, 0.0, 1.0));
+    o.t3 = vec4(clamp(c.emissive, vec3(0.0), vec3(1.0)), 1.0);
     return o;
 }
 
 // Must match Channel::empty_value in reetched-doc.
 fn empty() -> Ch {
-    return Ch(vec3(0.214), 0.0, 0.5, vec3(0.0, 0.0, 1.0), 0.0, 1.0, 1.0);
+    return Ch(vec3(0.214), 0.0, 0.5, vec3(0.0, 0.0, 1.0), 0.0, 1.0, 1.0, vec3(0.0), 1.0);
 }
 
 // ---------------------------------------------------------------- mesh in UV space
@@ -475,6 +485,16 @@ fn fs_fill(in: VsOut) -> Out {
         if P.blend[4].z > 0.5 { v = sample_proj(t_height, P.proj, in.uv, in.world, n).r - 0.5; }
         c.height = composite(mode_of(4u), vec3(c.height), vec3(v), P.blend[4].y * m, false).x;
     }
+    if P.values[5].w > 0.5 {
+        var v = P.values[5].xyz;
+        if P.blend[5].z > 0.5 { v = sample_proj(t_emissive, P.proj, in.uv, in.world, n).rgb; }
+        c.emissive = composite(mode_of(5u), c.emissive, v, P.blend[5].y * m, false);
+    }
+    if P.values[6].w > 0.5 {
+        var v = P.values[6].x;
+        if P.blend[6].z > 0.5 { v = sample_proj(t_opacity, P.proj, in.uv, in.world, n).r; }
+        c.opacity = composite(mode_of(6u), vec3(c.opacity), vec3(v), P.blend[6].y * m, false).x;
+    }
     c.coverage = 1.0;
     c.filled = 1.0;
     return pack(c);
@@ -508,6 +528,14 @@ fn fs_paint(in: VsOut) -> Out {
         let t = textureLoad(t_height, p, 0);
         c.height = composite(mode_of(4u), vec3(c.height), vec3(t.r), t.a * P.blend[4].y * m, false).x;
     }
+    if P.blend[5].z > 0.5 {
+        let t = textureLoad(t_emissive, p, 0);
+        c.emissive = composite(mode_of(5u), c.emissive, t.rgb, t.a * P.blend[5].y * m, false);
+    }
+    if P.blend[6].z > 0.5 {
+        let t = textureLoad(t_opacity, p, 0);
+        c.opacity = composite(mode_of(6u), vec3(c.opacity), vec3(t.r), t.a * P.blend[6].y * m, false).x;
+    }
     c.coverage = 1.0;
     c.filled = 1.0;
     return pack(c);
@@ -535,6 +563,8 @@ fn fs_folder(in: VsOut) -> Out {
     c.rough = folder_channel(2u, vec3(c.rough), vec3(o.rough), P.blend[2].y * m, false).x;
     c.normal = folder_channel(3u, c.normal, o.normal, P.blend[3].y * m, true);
     c.height = folder_channel(4u, vec3(c.height), vec3(o.height), P.blend[4].y * m, false).x;
+    c.emissive = folder_channel(5u, c.emissive, o.emissive, P.blend[5].y * m, false);
+    c.opacity = folder_channel(6u, vec3(c.opacity), vec3(o.opacity), P.blend[6].y * m, false).x;
     c.coverage = 1.0;
     c.filled = 1.0;
     return pack(c);
@@ -585,7 +615,9 @@ fn fs_dilate(@builtin(position) frag: vec4<f32>) -> Out {
     let size = vec2<i32>(textureDimensions(s0));
     var sum0 = vec4(0.0);
     var sum1 = vec4(0.0);
+    var sum3 = vec4(0.0);
     var h = 0.0;
+    var op = 0.0;
     var count = 0.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
@@ -594,7 +626,9 @@ fn fs_dilate(@builtin(position) frag: vec4<f32>) -> Out {
             if t2.z > 0.5 {
                 sum0 += textureLoad(s0, q, 0);
                 sum1 += textureLoad(s1, q, 0);
+                sum3 += textureLoad(s3, q, 0);
                 h += t2.x;
+                op += t2.w;
                 count += 1.0;
             }
         }
@@ -605,6 +639,7 @@ fn fs_dilate(@builtin(position) frag: vec4<f32>) -> Out {
     var o: Out;
     o.t0 = sum0 / count;
     o.t1 = vec4(normalize(sum1.xyz), sum1.w / count);
-    o.t2 = vec4(h / count, 0.0, 1.0, 0.0);
+    o.t2 = vec4(h / count, 0.0, 1.0, op / count);
+    o.t3 = sum3 / count;
     return o;
 }

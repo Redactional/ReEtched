@@ -108,7 +108,7 @@ def main():
     [entry] = bundle["texture_sets"]
     assert entry["resolution"] == [N, N]
     assert set(entry["mesh_maps"]) == {"ambient_occlusion"}, entry["mesh_maps"]
-    assert set(entry["reference"]) == {"basecolor", "metallic", "roughness", "normal", "height"}
+    assert set(entry["reference"]) == {"basecolor", "metallic", "roughness", "normal", "height", "emissive", "opacity"}
     scratches, base, rust = entry["layers"]
     assert scratches["type"] == "paint" and set(scratches["content"]) == {"black", "white"}
     assert scratches["blend"]["basecolor"] == {"mode": "Multiply", "opacity": 0.8}
@@ -123,7 +123,7 @@ def main():
     assert "content" not in steel
     assert rust["visible"] is False and "content" in rust
     assert rust["substance"] == {"resource://starter_assets/rust": {"age": 0.7}}
-    assert any("Emissive" in line for line in bundle["log"]), bundle["log"]
+    assert any("Specular" in line for line in bundle["log"]), bundle["log"]
 
     shutil.rmtree(work)
     print("ok: %d exports" % fake.scene.exports)

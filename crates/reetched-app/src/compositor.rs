@@ -1,5 +1,5 @@
 //! Evaluates a texture set's layer stack on the GPU into a "channel set":
-//! three rgba16float textures (see `shaders/compositor.wgsl` for the layout).
+//! four rgba16float textures (see `shaders/compositor.wgsl` for the layout).
 
 use glam::{EulerRot, Mat3};
 use reetched_doc::export::ChannelData;
@@ -15,9 +15,12 @@ pub const SET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Padding (in texels) grown around UV islands for display.
 const DISPLAY_DILATION: u32 = 8;
 
-/// Identifies a paint buffer: a paint layer's channel (slot = channel index) or a mask (slot 5).
+/// Identifies a paint buffer: a paint layer's channel (slot = channel index) or a mask.
 pub type PaintKey = (NodeId, u8);
-pub const MASK_SLOT: u8 = 5;
+pub const MASK_SLOT: u8 = 99;
+/// Channel textures in a set: base+metal, normal+rough, height/coverage/filled/opacity, emissive.
+const SET_TEXTURES: usize = 4;
+const CHANNELS: usize = Channel::ALL.len();
 pub const PAINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// GPU copy of one paint buffer, kept in sync with its tiles.
@@ -32,8 +35,8 @@ pub struct PaintTexture {
 /// Composited channels of one texture set.
 pub struct ChannelSet {
     pub resolution: u32,
-    textures: [wgpu::Texture; 3],
-    pub views: [wgpu::TextureView; 3],
+    textures: [wgpu::Texture; SET_TEXTURES],
+    pub views: [wgpu::TextureView; SET_TEXTURES],
     /// For reading this set in a compositor pass.
     read: wgpu::BindGroup,
 }
@@ -58,7 +61,7 @@ struct MaskFx {
     colors: [[f32; 4]; 4],
 }
 
-/// Mesh maps the compositor binds, in binding order (9..=14).
+/// Mesh maps the compositor binds, in binding order (11..=16).
 const BOUND_MAPS: [MeshMap; 6] = [
     MeshMap::Normal,
     MeshMap::Curvature,
@@ -68,15 +71,18 @@ const BOUND_MAPS: [MeshMap; 6] = [
     MeshMap::Id,
 ];
 
-/// Texture views for one pass: 0–4 channel bitmaps/paint, 5 mask bitmap,
-/// 6 painted mask, 7–12 mesh maps.
-type PassTextures = [Option<wgpu::TextureView>; 13];
+/// Texture views for one pass: 0–6 channel bitmaps/paint, 7 mask bitmap,
+/// 8 painted mask, 9–14 mesh maps.
+type PassTextures = [Option<wgpu::TextureView>; 15];
+const MASK_BITMAP: usize = CHANNELS;
+const MASK_PAINT: usize = CHANNELS + 1;
+const FIRST_MAP: usize = CHANNELS + 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
-    values: [[f32; 4]; 5],
-    blend: [[f32; 4]; 5],
+    values: [[f32; 4]; CHANNELS],
+    blend: [[f32; 4]; CHANNELS],
     mask: [f32; 4],
     proj: ProjUniform,
     mask_proj: ProjUniform,
@@ -119,7 +125,7 @@ pub struct Compositor {
     /// Paint layers' and masks' painted texels on the GPU.
     paint: HashMap<PaintKey, PaintTexture>,
     /// Rendered procedural materials by render key: one texture per channel.
-    procedural: HashMap<String, [Option<wgpu::TextureView>; 5]>,
+    procedural: HashMap<String, [Option<wgpu::TextureView>; CHANNELS]>,
     /// Resolution and mesh maps of the set being composited (for render keys).
     proc_ctx: (
         u32,
@@ -157,14 +163,14 @@ impl Compositor {
                 count: None,
             },
         ];
-        entries.extend((2..15).map(|b| tex(b, true)));
+        entries.extend((2..2 + 15).map(|b| tex(b, true)));
         let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor params"),
             entries: &entries,
         });
         let set_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("channel set"),
-            entries: &[tex(0, false), tex(1, false), tex(2, false)],
+            entries: &[tex(0, false), tex(1, false), tex(2, false), tex(3, false)],
         });
 
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/compositor.wgsl"));
@@ -178,11 +184,8 @@ impl Compositor {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
         };
-        let targets = [
-            Some(SET_FORMAT.into()),
-            Some(SET_FORMAT.into()),
-            Some(SET_FORMAT.into()),
-        ];
+        let targets: [Option<wgpu::ColorTargetState>; SET_TEXTURES] =
+            std::array::from_fn(|_| Some(SET_FORMAT.into()));
         let mesh_buffers = [Some(vertex_layout)];
         let pipeline = |vs: &str, fs: &str, mesh: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -337,7 +340,7 @@ impl Compositor {
             (p.maps, p.maps2) = map_flags;
             p.misc[2] = mesh.scale;
             for (slot, view) in maps.iter().enumerate() {
-                t[7 + slot] = view.clone();
+                t[FIRST_MAP + slot] = view.clone();
             }
             (p, t)
         };
@@ -496,7 +499,7 @@ impl Compositor {
                         queue,
                         resources,
                         id,
-                        c == Channel::BaseColor,
+                        src.color_space.is_srgb(c),
                         warnings,
                     );
                     p.blend[i][2] = if bitmaps[i].is_some() { 1.0 } else { 0.0 };
@@ -543,8 +546,12 @@ impl Compositor {
                 if mask.invert { 1.0 } else { 0.0 },
             ];
             if let Some(id) = &mask.bitmap {
-                bitmaps[5] = self.bitmap(device, queue, resources, id, false, warnings);
-                p.mask[2] = if bitmaps[5].is_some() { 1.0 } else { 0.0 };
+                bitmaps[MASK_BITMAP] = self.bitmap(device, queue, resources, id, false, warnings);
+                p.mask[2] = if bitmaps[MASK_BITMAP].is_some() {
+                    1.0
+                } else {
+                    0.0
+                };
             }
             p.mask_proj = proj_uniform(&mask.projection);
             for (fx, e) in
@@ -554,7 +561,7 @@ impl Compositor {
                 *fx = mask_fx(e);
             }
             if let Some(map) = mask.paint.as_ref().filter(|m| !m.tiles.is_empty()) {
-                bitmaps[6] =
+                bitmaps[MASK_PAINT] =
                     Some(self.paint_view(device, queue, (node.id, MASK_SLOT), map, res, resources));
                 p.misc[1] = 1.0;
             }
@@ -574,10 +581,10 @@ impl Compositor {
         key: String,
         outputs: &[(Channel, image::RgbaImage)],
     ) {
-        let mut views: [Option<wgpu::TextureView>; 5] = Default::default();
+        let mut views: [Option<wgpu::TextureView>; CHANNELS] = Default::default();
         for (c, img) in outputs {
             let i = Channel::ALL.iter().position(|x| x == c).unwrap_or(0);
-            views[i] = Some(upload_rgba8(device, queue, img, *c == Channel::BaseColor));
+            views[i] = Some(upload_rgba8(device, queue, img, c.is_color()));
         }
         self.procedural.insert(key, views);
     }
@@ -585,6 +592,17 @@ impl Compositor {
     /// Drops rendered materials no layer uses any more.
     pub fn retain_procedural(&mut self, keep: &std::collections::HashSet<String>) {
         self.procedural.retain(|k, _| keep.contains(k));
+    }
+
+    /// A color image resource, decoded from sRGB.
+    pub fn bitmap_view_srgb(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &Resources,
+        id: &ResourceId,
+    ) -> Option<wgpu::TextureView> {
+        self.bitmap(device, queue, resources, id, true, &mut Vec::new())
     }
 
     /// A linear (non-sRGB) image resource as a texture, e.g. a brush alpha.
@@ -707,7 +725,7 @@ impl Compositor {
         let row = res * 8; // rgba16float
         let padded_row =
             row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let buffers: Vec<wgpu::Buffer> = (0..3)
+        let buffers: Vec<wgpu::Buffer> = (0..SET_TEXTURES)
             .map(|_| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("readback"),
@@ -743,7 +761,7 @@ impl Compositor {
         device.poll(wgpu::PollType::wait_indefinitely())?;
 
         let texels = (res * res) as usize;
-        let mut planes: Vec<Vec<[f32; 4]>> = Vec::with_capacity(3);
+        let mut planes: Vec<Vec<[f32; 4]>> = Vec::with_capacity(SET_TEXTURES);
         for b in &buffers {
             let mapped = b
                 .slice(..)
@@ -762,7 +780,7 @@ impl Compositor {
             b.unmap();
             planes.push(px);
         }
-        let (t0, t1, t2) = (&planes[0], &planes[1], &planes[2]);
+        let (t0, t1, t2, t3) = (&planes[0], &planes[1], &planes[2], &planes[3]);
         Ok(ChannelData {
             width: res,
             height: res,
@@ -771,6 +789,8 @@ impl Compositor {
             roughness: t1.iter().map(|p| p[3]).collect(),
             normal: t1.iter().map(|p| [p[0], p[1], p[2]]).collect(),
             height_map: t2.iter().map(|p| p[0]).collect(),
+            emissive: t3.iter().map(|p| [p[0], p[1], p[2]]).collect(),
+            opacity: t2.iter().map(|p| p[3]).collect(),
             coverage: t2.iter().map(|p| p[1] > 0.5).collect(),
             ambient_occlusion: Vec::new(),
         })
@@ -791,6 +811,13 @@ fn begin<'a>(enc: &'a mut wgpu::CommandEncoder, dst: &'a ChannelSet) -> wgpu::Re
             g: 0.0,
             b: 1.0,
             a: 0.5,
+        },
+        // Height 0, coverage 0, not filled, opacity 1.
+        wgpu::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
         },
         wgpu::Color::TRANSPARENT,
     ];
@@ -912,7 +939,7 @@ fn make_set(
 ) -> ChannelSet {
     let textures = std::array::from_fn(|i| {
         device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(["set t0", "set t1", "set t2"][i]),
+            label: Some(["set t0", "set t1", "set t2", "set t3"][i]),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
@@ -929,12 +956,12 @@ fn make_set(
             view_formats: &[],
         })
     });
-    let views: [wgpu::TextureView; 3] =
+    let views: [wgpu::TextureView; SET_TEXTURES] =
         std::array::from_fn(|i: usize| textures[i].create_view(&Default::default()));
     let read = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: set_layout,
-        entries: &[0, 1, 2].map(|i| wgpu::BindGroupEntry {
+        entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
             binding: i,
             resource: wgpu::BindingResource::TextureView(&views[i as usize]),
         }),
@@ -1328,5 +1355,60 @@ mod tests {
             mirrored.base_color[at(&mirrored, 48, 16)],
             [0.0, 1.0, 0.0]
         ));
+    }
+
+    #[test]
+    fn emissive_and_opacity_composite() {
+        let mut doc = Document::new(None, &[]);
+        let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+        for (c, v) in [
+            (Channel::Emissive, [1.0, 0.5, 0.0]),
+            (Channel::Opacity, [0.3; 3]),
+        ] {
+            let src = fill.channels.get_mut(&c).unwrap();
+            src.enabled = true;
+            src.value = v;
+        }
+        let layer = doc.new_fill("glow".into(), fill);
+        let Some(d) = run(vec![layer], &Resources::default()) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let i = at(&d, 32, 32);
+        assert!(close(d.emissive[i], [1.0, 0.5, 0.0]), "{:?}", d.emissive[i]);
+        assert!((d.opacity[i] - 0.3).abs() < 1e-3, "{}", d.opacity[i]);
+        // An empty stack is opaque and not emissive.
+        let d = run(vec![], &Resources::default()).unwrap();
+        let i = at(&d, 32, 32);
+        assert_eq!((d.emissive[i], d.opacity[i]), ([0.0; 3], 1.0));
+    }
+
+    #[test]
+    fn bitmap_color_space_controls_decoding() {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut resources = Resources::default();
+        let id = resources.add(png);
+        let base = |cs: reetched_doc::ColorSpace| {
+            let mut doc = Document::new(None, &[]);
+            let mut fill = Fill::new([1.0; 3], 0.0, 0.5);
+            let src = fill.channels.get_mut(&Channel::BaseColor).unwrap();
+            src.bitmap = Some(id.clone());
+            src.color_space = cs;
+            let d = run(vec![doc.new_fill("img".into(), fill)], &resources)?;
+            Some(d.base_color[at(&d, 32, 32)][0])
+        };
+        let Some(srgb) = base(reetched_doc::ColorSpace::Auto) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let raw = base(reetched_doc::ColorSpace::Linear).unwrap();
+        assert!(
+            (srgb - 0.216).abs() < 0.01,
+            "sRGB 128 → linear 0.216: {srgb}"
+        );
+        assert!((raw - 0.502).abs() < 0.01, "raw 128 → 0.502: {raw}");
     }
 }

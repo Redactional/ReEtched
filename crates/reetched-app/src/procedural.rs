@@ -127,6 +127,8 @@ pub fn channel_for(o: &OutputDef) -> Option<Channel> {
         "roughness" => Channel::Roughness,
         "normal" => Channel::Normal,
         "height" | "displacement" => Channel::Height,
+        "emissive" | "emission" => Channel::Emissive,
+        "opacity" | "alpha" => Channel::Opacity,
         _ => return None,
     })
 }

@@ -16,3 +16,6 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 blake3 = "1"
 half = "2"
 image = { version = "0.25", default-features = false, features = ["png", "tga", "tiff", "exr", "jpeg"] }
+
+[dev-dependencies]
+psd = "0.3"

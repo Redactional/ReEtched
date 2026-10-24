@@ -30,7 +30,7 @@ impl State {
     pub fn paint_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, uv: bool) {
         if !matches!(
             self.tool,
-            Tool::Paint | Tool::Eraser | Tool::Smudge | Tool::Clone
+            Tool::Paint | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Projection
         ) {
             return;
         }
@@ -77,6 +77,12 @@ impl State {
                 painter.circle_stroke(p, 6.0, Stroke::new(2.0, Color32::from_rgb(255, 170, 60)));
             }
         }
+        if self.tool == Tool::Projection && !uv {
+            self.stencil_input(ui, response, rect);
+            if ctrl {
+                return; // Ctrl+drag moves the image
+            }
+        }
         if pressed && response.hovered() && !alt && ctrl && self.tool == Tool::Clone {
             if let Some((src, part)) = pos.and_then(|p| self.uv_under(p, rect, uv)) {
                 self.clone_source = Some((src, part));
@@ -94,6 +100,7 @@ impl State {
                 Tool::Eraser => Some(StrokeMode::Erase),
                 Tool::Smudge => Some(StrokeMode::Smudge),
                 Tool::Clone => self.clone_mode(pos, rect, uv),
+                Tool::Projection => Some(StrokeMode::Project),
                 _ => Some(StrokeMode::Paint),
             };
             if let Some(mode) = mode
@@ -167,7 +174,12 @@ impl State {
 
     pub fn begin_stroke(&mut self, uv: bool, mode: StrokeMode) -> bool {
         // Erase, smudge and clone work on the channels the layer has; paint on the brush's.
-        let erase = mode != StrokeMode::Paint;
+        let erase = !matches!(mode, StrokeMode::Paint | StrokeMode::Project);
+        let project = mode == StrokeMode::Project;
+        if project && uv {
+            self.warn("The Projection tool paints in the 3D view".into());
+            return false;
+        }
         let Some(sel) = self.selected else {
             self.warn("Select a paint layer or a mask to paint on".into());
             return false;
@@ -187,6 +199,7 @@ impl State {
                 key: (node.id, MASK_SLOT),
                 value: [self.brush.mask_value; 3],
                 is_normal: false,
+                projected: project,
                 old: mask.paint.clone().unwrap_or_else(|| TileMap::new(res)),
             });
         } else {
@@ -204,7 +217,8 @@ impl State {
                 let wanted = if erase {
                     existing.is_some_and(|m| !m.tiles.is_empty())
                 } else {
-                    brush.enabled
+                    // The projected image always goes into base color.
+                    brush.enabled || (project && c == Channel::BaseColor)
                 };
                 if !wanted {
                     continue;
@@ -217,6 +231,7 @@ impl State {
                     key: (node.id, i as u8),
                     value,
                     is_normal: c == Channel::Normal,
+                    projected: project && c == Channel::BaseColor,
                     old: existing.cloned().unwrap_or_else(|| TileMap::new(res)),
                 });
             }
@@ -246,6 +261,12 @@ impl State {
             mode,
             self.brush.opacity,
         );
+        if project && !self.project_stencil(set_index) {
+            self.viewport
+                .paint_end(&self.device, &self.queue, &mut self.resources)
+                .ok();
+            return false;
+        }
         self.stroke = Some(ActiveStroke {
             node: node_id,
             set: set_index,
@@ -452,6 +473,7 @@ impl State {
             Tool::Smudge => "SMUDGE",
             Tool::Clone => "CLONE",
             Tool::Path => "PATH",
+            Tool::Projection => "PROJECTION",
             _ => "PAINT",
         }));
         ui.label(RichText::new(target).color(theme::WEAK));
@@ -621,6 +643,7 @@ impl State {
         for (key, tool) in [
             (Key::Num1, Tool::Paint),
             (Key::Num2, Tool::Eraser),
+            (Key::Num3, Tool::Projection),
             (Key::Num4, Tool::PolygonFill),
             (Key::Num5, Tool::Smudge),
             (Key::Num6, Tool::Clone),

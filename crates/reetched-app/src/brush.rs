@@ -87,6 +87,8 @@ impl Default for Brush {
                 (Channel::Roughness, ch(true, [0.4; 3])),
                 (Channel::Normal, ch(false, [0.0, 0.0, 1.0])),
                 (Channel::Height, ch(false, [0.25; 3])),
+                (Channel::Emissive, ch(false, [1.0, 0.6, 0.2])),
+                (Channel::Opacity, ch(false, [0.0; 3])),
             ]),
             mask_value: 1.0,
             alpha: None,

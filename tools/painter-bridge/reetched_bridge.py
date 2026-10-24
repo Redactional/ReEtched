@@ -44,6 +44,8 @@ CHANNELS = {
     "Roughness": "roughness",
     "Normal": "normal",
     "Height": "height",
+    "Emissive": "emissive",
+    "Opacity": "opacity",
 }
 
 # Background values (black pass, white pass) under captured content, per channel.
@@ -52,6 +54,8 @@ BACKGROUNDS = {
     "metallic": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     "roughness": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     "height": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "emissive": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    "opacity": ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
     # Flat normal, then one tilted in red and green; blue carries no information.
     "normal": ([0.5, 0.5, 1.0], [1.0, 1.0, 1.0]),
 }

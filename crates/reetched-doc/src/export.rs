@@ -20,8 +20,10 @@ pub enum MapSource {
     NormalOpenGl,
     NormalDirectX,
     Height,
-    /// White until mesh-map baking arrives (Phase 3).
+    /// Baked ambient occlusion (white if none).
     AmbientOcclusion,
+    Emissive,
+    Opacity,
     Black,
     White,
 }
@@ -239,6 +241,9 @@ pub struct ChannelData {
     /// Tangent-space unit vectors (OpenGL convention).
     pub normal: Vec<[f32; 3]>,
     pub height_map: Vec<f32>,
+    /// Linear RGB.
+    pub emissive: Vec<[f32; 3]>,
+    pub opacity: Vec<f32>,
     /// Texels inside a UV island.
     pub coverage: Vec<bool>,
     /// Baked ambient occlusion (empty = none, exported as white).
@@ -274,6 +279,16 @@ impl ChannelData {
             // ponytail: height 0 is stored as mid grey; revisit with Painter golden exports.
             MapSource::Height => self.height_map[i] + 0.5,
             MapSource::AmbientOcclusion => self.ambient_occlusion.get(i).copied().unwrap_or(1.0),
+            MapSource::Emissive => {
+                let v = if component == Component::L {
+                    let [r, g, b] = self.emissive[i];
+                    0.2126 * r + 0.7152 * g + 0.0722 * b
+                } else {
+                    self.emissive[i][c]
+                };
+                if encode_srgb { linear_to_srgb(v) } else { v }
+            }
+            MapSource::Opacity => self.opacity[i],
             MapSource::White => 1.0,
             MapSource::Black => 0.0,
         }
@@ -516,6 +531,8 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 OutputMap::gray("$mesh_$textureSet_Roughness", Roughness),
                 OutputMap::rgb("$mesh_$textureSet_Normal", NormalOpenGl),
                 OutputMap::gray("$mesh_$textureSet_Height", Height),
+                OutputMap::rgb("$mesh_$textureSet_Emissive", Emissive),
+                OutputMap::gray("$mesh_$textureSet_Opacity", Opacity),
             ],
         ),
         p(
@@ -524,6 +541,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 OutputMap::rgb("T_$textureSet_BaseColor", BaseColor),
                 OutputMap::rgb("T_$textureSet_Normal", NormalDirectX),
                 orm("T_$textureSet_OcclusionRoughnessMetallic"),
+                OutputMap::rgb("T_$textureSet_Emissive", Emissive),
             ],
         ),
         p(
@@ -556,9 +574,25 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p(
             "glTF PBR Metal Roughness",
             vec![
-                OutputMap::rgb("$mesh_$textureSet_baseColor", BaseColor),
+                OutputMap {
+                    file_name: "$mesh_$textureSet_baseColor".into(),
+                    links: [R, G, B]
+                        .map(|c| Link {
+                            dest: c,
+                            source: BaseColor,
+                            component: c,
+                        })
+                        .into_iter()
+                        .chain([Link {
+                            dest: A,
+                            source: Opacity,
+                            component: L,
+                        }])
+                        .collect(),
+                },
                 orm("$mesh_$textureSet_occlusionRoughnessMetallic"),
                 OutputMap::rgb("$mesh_$textureSet_normal", NormalOpenGl),
+                OutputMap::rgb("$mesh_$textureSet_emissive", Emissive),
             ],
         ),
         p(
@@ -598,6 +632,8 @@ fn painter_source(s: MapSource) -> Option<(&'static str, &'static str)> {
         MapSource::NormalOpenGl => ("virtualMap", "Normal_OpenGL"),
         MapSource::NormalDirectX => ("virtualMap", "Normal_DirectX"),
         MapSource::AmbientOcclusion => ("virtualMap", "Mixed_AO"),
+        MapSource::Emissive => ("documentMap", "emissive"),
+        MapSource::Opacity => ("documentMap", "opacity"),
         MapSource::Black | MapSource::White => return None,
     })
 }
@@ -608,6 +644,8 @@ fn from_painter_source(kind: &str, name: &str) -> Option<MapSource> {
         ("documentMap", "metallic") => MapSource::Metallic,
         ("documentMap", "roughness") => MapSource::Roughness,
         ("documentMap", "height") => MapSource::Height,
+        ("documentMap", "emissive") => MapSource::Emissive,
+        ("documentMap", "opacity") => MapSource::Opacity,
         ("documentMap", "normal") | ("virtualMap", "normal_opengl") => MapSource::NormalOpenGl,
         ("virtualMap", "normal_directx") => MapSource::NormalDirectX,
         ("virtualMap", "glossiness") => MapSource::Glossiness,
@@ -727,6 +765,8 @@ mod tests {
             roughness: vec![0.5, 0.25, 0.75, 0.5],
             normal: vec![[0.0, 0.0, 1.0]; 4],
             height_map: vec![0.0; 4],
+            emissive: vec![[0.0; 3]; 4],
+            opacity: vec![1.0; 4],
             coverage: vec![false, true, true, false],
             ambient_occlusion: Vec::new(),
         }
@@ -769,7 +809,7 @@ mod tests {
             ("p", "m", "Set"),
         )
         .unwrap();
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4, "base, normal, ORM, emissive");
         let orm = image::open(&files[2]).unwrap().to_rgb8();
         assert_eq!(orm.get_pixel(1, 0).0, [255, 64, 255]); // AO white, roughness 0.25, metal 1
         assert_eq!(
