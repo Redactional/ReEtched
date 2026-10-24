@@ -120,6 +120,8 @@ impl Brush {
 
 pub struct Hit {
     pub pos: Vec3,
+    /// UV coordinates at the hit point.
+    pub uv: Vec2,
     /// Texture set (mesh part) that was hit.
     pub part: usize,
 }
@@ -127,7 +129,7 @@ pub struct Hit {
 /// Nearest triangle hit along a ray (Möller–Trumbore).
 /// ponytail: brute force over every triangle; add a BVH (e.g. obvhs) when meshes get large.
 pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
-    let mut best: Option<(f32, usize)> = None;
+    let mut best: Option<(f32, usize, f32, f32)> = None;
     for (t_index, tri) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
         let [a, b, c] = tri.map(|i| Vec3::from(mesh.vertices[i as usize].position));
         let (e1, e2) = (b - a, c - a);
@@ -148,15 +150,17 @@ pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
             continue;
         }
         let t = e2.dot(q) * inv;
-        if t > 1e-6 && best.is_none_or(|(bt, _)| t < bt) {
-            best = Some((t, t_index));
+        if t > 1e-6 && best.is_none_or(|(bt, ..)| t < bt) {
+            best = Some((t, t_index, u, v));
         }
     }
-    let (t, t_index) = best?;
+    let (t, t_index, u, v) = best?;
     let first = t_index as u32 * 3;
     let part = mesh.parts.iter().position(|p| p.indices.contains(&first))?;
+    let uv = |k: u32| Vec2::from(mesh.vertices[mesh.indices[(first + k) as usize] as usize].uv);
     Some(Hit {
         pos: origin + dir * t,
+        uv: uv(0) * (1.0 - u - v) + uv(1) * u + uv(2) * v,
         part,
     })
 }
@@ -344,6 +348,7 @@ mod tests {
         };
         let hit = Hit {
             pos: Vec3::new(0.5, 0.0, 0.8),
+            uv: Vec2::ZERO,
             part: 0,
         };
         let dabs = world_dabs(&brush, &view, &hit, 1.0);

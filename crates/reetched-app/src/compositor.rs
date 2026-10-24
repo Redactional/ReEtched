@@ -4,8 +4,9 @@
 use glam::{EulerRot, Mat3};
 use reetched_doc::export::ChannelData;
 use reetched_doc::{
-    Channel, MaskBackground, Node, NodeId, NodeKind, Projection, ProjectionMode, ResourceId,
-    Resources, TILE_BYTES, TILE_SIZE, TextureSet, TileMap,
+    Channel, GeneratorKind, MAX_MASK_EFFECTS, MaskBackground, MaskBlend, MaskEffectKind, MeshMap,
+    Node, NodeId, NodeKind, Projection, ProjectionMode, ResourceId, Resources, TILE_BYTES,
+    TILE_SIZE, TextureSet, TileMap,
 };
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -50,6 +51,29 @@ struct ProjUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaskFx {
+    head: [f32; 4],
+    a: [f32; 4],
+    b: [f32; 4],
+    colors: [[f32; 4]; 4],
+}
+
+/// Mesh maps the compositor binds, in binding order (9..=14).
+const BOUND_MAPS: [MeshMap; 6] = [
+    MeshMap::Normal,
+    MeshMap::Curvature,
+    MeshMap::AmbientOcclusion,
+    MeshMap::Position,
+    MeshMap::Thickness,
+    MeshMap::Id,
+];
+
+/// Texture views for one pass: 0–4 channel bitmaps/paint, 5 mask bitmap,
+/// 6 painted mask, 7–12 mesh maps.
+type PassTextures = [Option<wgpu::TextureView>; 13];
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     values: [[f32; 4]; 5],
     blend: [[f32; 4]; 5],
@@ -57,6 +81,9 @@ struct Params {
     proj: ProjUniform,
     mask_proj: ProjUniform,
     misc: [f32; 4],
+    maps: [f32; 4],
+    maps2: [f32; 4],
+    fx: [MaskFx; MAX_MASK_EFFECTS],
 }
 
 /// The mesh triangles of one texture set.
@@ -64,6 +91,8 @@ pub struct MeshPart<'a> {
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
     pub range: std::ops::Range<u32>,
+    /// Mesh size (bounding-box diagonal), for scaling procedural noise.
+    pub scale: f32,
 }
 
 struct Pipelines {
@@ -121,7 +150,7 @@ impl Compositor {
                 count: None,
             },
         ];
-        entries.extend((2..9).map(|b| tex(b, true)));
+        entries.extend((2..15).map(|b| tex(b, true)));
         let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor params"),
             entries: &entries,
@@ -282,8 +311,30 @@ impl Compositor {
         let mut warnings = Vec::new();
         let mut enc = device.create_command_encoder(&Default::default());
 
+        // Baked mesh maps, shared by every pass of this set.
+        let mut maps: [Option<wgpu::TextureView>; 6] = Default::default();
+        for (slot, kind) in BOUND_MAPS.into_iter().enumerate() {
+            if let Some(id) = set.mesh_maps.get(&kind) {
+                maps[slot] = self.bitmap(device, queue, resources, id, false, &mut warnings);
+            }
+        }
+        let flag = |i: usize| if maps[i].is_some() { 1.0 } else { 0.0 };
+        let map_flags = (
+            [flag(0), flag(1), flag(2), flag(3)],
+            [flag(4), flag(5), 0.0, 0.0],
+        );
+        let with_maps = |mut p: Params, mut t: PassTextures| {
+            (p.maps, p.maps2) = map_flags;
+            p.misc[2] = mesh.scale;
+            for (slot, view) in maps.iter().enumerate() {
+                t[7 + slot] = view.clone();
+            }
+            (p, t)
+        };
+
         let start = self.take(device, res);
-        let default_params = self.params(device, queue, &Params::default(), &Default::default());
+        let (init, init_tex) = with_maps(Params::default(), Default::default());
+        let default_params = self.params(device, queue, &init, &init_tex);
         self.mesh_pass(
             &mut enc,
             &self.pipelines.init,
@@ -302,6 +353,7 @@ impl Compositor {
             start,
             resources,
             &mut warnings,
+            &with_maps,
         );
 
         // Height → normal, then grow the islands a few texels, ending in `out`.
@@ -352,10 +404,12 @@ impl Compositor {
         mut cur: ChannelSet,
         resources: &Resources,
         warnings: &mut Vec<String>,
+        with_maps: &dyn Fn(Params, PassTextures) -> (Params, PassTextures),
     ) -> ChannelSet {
         let res = cur.resolution;
         for node in nodes.iter().rev().filter(|n| n.visible) {
             let (params, bitmaps) = self.node_params(device, queue, node, res, resources, warnings);
+            let (params, bitmaps) = with_maps(params, bitmaps);
             let group = self.params(device, queue, &params, &bitmaps);
             let dst = self.take(device, res);
             match &node.kind {
@@ -385,7 +439,7 @@ impl Compositor {
                     let start = self.take(device, res);
                     copy_set(enc, &cur, &start);
                     let inner = self.eval(
-                        device, queue, enc, mesh, children, start, resources, warnings,
+                        device, queue, enc, mesh, children, start, resources, warnings, with_maps,
                     );
                     self.mesh_pass(
                         enc,
@@ -412,10 +466,9 @@ impl Compositor {
         res: u32,
         resources: &Resources,
         warnings: &mut Vec<String>,
-    ) -> (Params, [Option<wgpu::TextureView>; 7]) {
+    ) -> (Params, PassTextures) {
         let mut p = Params::default();
-        // Slots 0–4: channel bitmaps or paint, 5: mask bitmap, 6: painted mask.
-        let mut bitmaps: [Option<wgpu::TextureView>; 7] = Default::default();
+        let mut bitmaps: PassTextures = Default::default();
         for (i, c) in Channel::ALL.into_iter().enumerate() {
             let b = node.blend(c);
             p.blend[i] = [b.mode.index() as f32, b.opacity, 0.0, 0.0];
@@ -472,6 +525,12 @@ impl Compositor {
                 p.mask[2] = if bitmaps[5].is_some() { 1.0 } else { 0.0 };
             }
             p.mask_proj = proj_uniform(&mask.projection);
+            for (fx, e) in
+                p.fx.iter_mut()
+                    .zip(mask.effects.iter().filter(|e| e.enabled))
+            {
+                *fx = mask_fx(e);
+            }
             if let Some(map) = mask.paint.as_ref().filter(|m| !m.tiles.is_empty()) {
                 bitmaps[6] =
                     Some(self.paint_view(device, queue, (node.id, MASK_SLOT), map, res, resources));
@@ -521,7 +580,7 @@ impl Compositor {
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
         params: &Params,
-        bitmaps: &[Option<wgpu::TextureView>; 7],
+        bitmaps: &PassTextures,
     ) -> wgpu::BindGroup {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("layer params"),
@@ -666,6 +725,7 @@ impl Compositor {
             normal: t1.iter().map(|p| [p[0], p[1], p[2]]).collect(),
             height_map: t2.iter().map(|p| p[0]).collect(),
             coverage: t2.iter().map(|p| p[1] > 0.5).collect(),
+            ambient_occlusion: Vec::new(),
         })
     }
 }
@@ -832,6 +892,44 @@ fn make_set(
     }
 }
 
+fn mask_fx(e: &reetched_doc::MaskEffect) -> MaskFx {
+    let blend = MaskBlend::ALL
+        .iter()
+        .position(|&b| b == e.blend)
+        .unwrap_or(0) as f32;
+    let mut fx = MaskFx::default();
+    match &e.kind {
+        MaskEffectKind::Generator(g) => {
+            let kind = GeneratorKind::ALL
+                .iter()
+                .position(|&k| k == g.kind)
+                .unwrap_or(0) as f32;
+            fx.head = [1.0, blend, e.opacity, 0.0];
+            fx.a = [g.level, g.contrast, g.noise, g.noise_scale];
+            fx.b = [kind, g.axis as f32, if g.invert { 1.0 } else { 0.0 }, 0.0];
+        }
+        MaskEffectKind::Levels {
+            in_min,
+            in_max,
+            gamma,
+            out_min,
+            out_max,
+        } => {
+            fx.head = [2.0, blend, e.opacity, 0.0];
+            fx.a = [*in_min, *in_max, *gamma, *out_min];
+            fx.b = [*out_max, 0.0, 0.0, 0.0];
+        }
+        MaskEffectKind::ColorSelection { colors, tolerance } => {
+            fx.head = [3.0, blend, e.opacity, 0.0];
+            fx.b = [0.0, 0.0, 0.0, *tolerance];
+            for (dst, c) in fx.colors.iter_mut().zip(colors) {
+                *dst = [c[0], c[1], c[2], 1.0];
+            }
+        }
+    }
+    fx
+}
+
 fn new_paint_texture(device: &wgpu::Device, res: u32) -> PaintTexture {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("paint"),
@@ -950,7 +1048,11 @@ mod tests {
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&Default::default())).ok()
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()
     }
 
     fn quad(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
@@ -983,11 +1085,13 @@ mod tests {
             vertices: &vb,
             indices: &ib,
             range: 0..6,
+            scale: 1.0,
         };
         let set = TextureSet {
             name: "t".into(),
             resolution: RES,
             stack,
+            mesh_maps: Default::default(),
         };
         let mut comp = Compositor::new(&device, &queue);
         let mut out = None;

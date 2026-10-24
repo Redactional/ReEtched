@@ -29,6 +29,7 @@ const MODE_ROUGHNESS: u32 = 2u;
 const MODE_METALLIC: u32 = 3u;
 const MODE_NORMAL: u32 = 4u;
 const MODE_UV: u32 = 5u;
+const MODE_MESH_MAP: u32 = 6u;
 
 // Rotates a world direction into the environment's frame.
 fn env_frame(d: vec3<f32>) -> vec3<f32> {
@@ -87,6 +88,13 @@ fn solo(mode: u32, base: vec3<f32>, rough: f32, metal: f32, n: vec3<f32>, uv: ve
 @group(1) @binding(1) var set_t1: texture_2d<f32>;
 @group(1) @binding(2) var set_t2: texture_2d<f32>;
 @group(1) @binding(3) var set_smp: sampler;
+// Baked ambient occlusion (white if none) and the mesh map shown in MODE_MESH_MAP.
+@group(1) @binding(4) var set_ao: texture_2d<f32>;
+@group(1) @binding(5) var set_preview: texture_2d<f32>;
+
+fn image_uv(uv: vec2<f32>) -> vec2<f32> {
+    return vec2(uv.x, 1.0 - uv.y);
+}
 
 struct Surface {
     base: vec3<f32>,
@@ -144,9 +152,13 @@ fn fs_pbr(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let metal = s.metal;
 
     let mode = u32(g.view.x);
+    if mode == MODE_MESH_MAP {
+        return vec4(srgb_to_linear(textureSample(set_preview, set_smp, image_uv(in.uv)).rgb), 1.0);
+    }
     if mode != MODE_MATERIAL {
         return vec4(solo(mode, base, s.rough, metal, n, in.uv), 1.0);
     }
+    let ao = textureSample(set_ao, set_smp, image_uv(in.uv)).r;
 
     let v = normalize(g.eye.xyz - in.world);
     let f0 = mix(vec3(0.04), base, metal);
@@ -160,7 +172,8 @@ fn fs_pbr(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
 
     let spec = env(reflect(-v, n), rough * g.params.z) * (f0 * ab.x + ab.y);
     let diffuse = sh_irradiance(n) * base * (1.0 - metal);
-    return vec4(diffuse + spec, 1.0);
+    // Painter multiplies baked AO into the ambient lighting.
+    return vec4((diffuse + spec) * ao, 1.0);
 }
 
 @vertex
@@ -237,6 +250,9 @@ fn vs_uv(v: VsIn) -> VsOut {
 fn fs_uv(in: VsOut) -> @location(0) vec4<f32> {
     // Unlit: "Material" mode shows base color, like Painter's 2D view.
     let mode = u32(g.view.z);
+    if mode == MODE_MESH_MAP {
+        return vec4(textureSample(set_preview, set_smp, image_uv(in.uv)).rgb, 1.0);
+    }
     let s = surface(in.uv);
     // The 2D view shows the tangent-space normal map itself.
     let c = solo(mode, s.base, s.rough, s.metal, s.normal_ts, in.uv);

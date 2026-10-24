@@ -77,6 +77,15 @@ impl State {
                 {
                     self.duplicate_selected();
                 }
+                if ui
+                    .add_enabled_ui(sel_is_layer, |ui| {
+                        icon_button(ui, ic::ICON_SAVE, false, "Save as smart material…")
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.save_smart();
+                }
                 if icon_button(ui, ic::ICON_CREATE_NEW_FOLDER, false, "Add folder").clicked() {
                     let node = self.doc.new_folder("Folder 1".into());
                     self.add_node(node);
@@ -229,6 +238,8 @@ impl State {
             );
         }
         ui.add_space(8.0);
+        self.mesh_maps_ui(ui);
+        ui.add_space(8.0);
         ui.label(theme::header("CHANNELS"));
         egui::Grid::new("channels")
             .num_columns(2)
@@ -263,6 +274,13 @@ impl State {
             return;
         };
         let names = self.doc.resources.clone();
+        let maps = self
+            .doc
+            .texture_sets
+            .get(self.selected_part)
+            .map(|s| s.mesh_maps.clone())
+            .unwrap_or_default();
+        let mut effect_req = crate::effects_ui::EffectRequests::default();
         let mut pick: Option<BitmapSlot> = None;
         let mut clear: Option<BitmapSlot> = None;
         let mut show_brush = false;
@@ -327,6 +345,8 @@ impl State {
                         ui.add_space(8.0);
                         projection_ui(ui, &mut mask.projection, "mask_proj");
                     }
+                    ui.add_space(8.0);
+                    effect_req = crate::effects_ui::mask_effects_ui(ui, mask, &maps);
                     return;
                 }
 
@@ -396,6 +416,10 @@ impl State {
                     });
             });
 
+        if let Some(i) = effect_req.pick_color {
+            self.id_pick = Some((sel.node, i));
+            self.info("Click the model to pick an ID color".into());
+        }
         if show_brush {
             self.properties_tool = true;
             if !matches!(
@@ -692,6 +716,7 @@ impl State {
             &self.queue,
             &self.doc.texture_sets,
             &self.resources,
+            self.preview_map(),
         );
         for w in warnings {
             self.warn(w);
@@ -706,6 +731,10 @@ impl State {
             let result = self
                 .viewport
                 .read_back(&self.device, &self.queue, i)
+                .map(|mut data| {
+                    data.ambient_occlusion = baked_ao(set, &self.resources, data.width);
+                    data
+                })
                 .and_then(|data| {
                     export_texture_set(
                         &preset,
@@ -724,6 +753,31 @@ impl State {
             }
         }
         self.info(format!("Exported {written} textures to {}", dir.display()));
+    }
+}
+
+/// The texture set's baked AO, resized to `res` (empty if there is none).
+fn baked_ao(
+    set: &reetched_doc::TextureSet,
+    resources: &reetched_doc::Resources,
+    res: u32,
+) -> Vec<f32> {
+    let Some(bytes) = set
+        .mesh_maps
+        .get(&reetched_doc::MeshMap::AmbientOcclusion)
+        .and_then(|id| resources.files.get(id))
+    else {
+        return Vec::new();
+    };
+    match image::load_from_memory(bytes) {
+        Ok(img) => image::imageops::resize(
+            &img.to_luma32f(),
+            res,
+            res,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_raw(),
+        Err(_) => Vec::new(),
     }
 }
 

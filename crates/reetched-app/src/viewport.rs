@@ -7,7 +7,7 @@ use crate::{
     paint_gpu::{BrushShape, Camera, Dab, PaintGpu, StrokeTarget},
 };
 use glam::{Mat4, Vec3};
-use reetched_doc::{ResourceId, Resources, TextureSet, TileMap, export::ChannelData};
+use reetched_doc::{MeshMap, ResourceId, Resources, TextureSet, TileMap, export::ChannelData};
 use reetched_io::{Mesh, Vertex};
 use std::ops::Range;
 use wgpu::util::DeviceExt;
@@ -52,10 +52,12 @@ pub enum ViewMode {
     Metallic,
     Normal,
     Uv,
+    /// A baked mesh map, shown as-is.
+    Mesh(MeshMap),
 }
 
 impl ViewMode {
-    pub const ALL: [ViewMode; 6] = [
+    pub const CHANNELS: [ViewMode; 6] = [
         ViewMode::Material,
         ViewMode::BaseColor,
         ViewMode::Roughness,
@@ -72,6 +74,19 @@ impl ViewMode {
             ViewMode::Metallic => "Metallic",
             ViewMode::Normal => "Normal (mesh)",
             ViewMode::Uv => "UV coordinates",
+            ViewMode::Mesh(m) => m.label(),
+        }
+    }
+
+    fn shader_index(self) -> f32 {
+        match self {
+            ViewMode::Material => 0.0,
+            ViewMode::BaseColor => 1.0,
+            ViewMode::Roughness => 2.0,
+            ViewMode::Metallic => 3.0,
+            ViewMode::Normal => 4.0,
+            ViewMode::Uv => 5.0,
+            ViewMode::Mesh(_) => 6.0,
         }
     }
 }
@@ -87,6 +102,8 @@ pub struct Part {
     bind_group: Option<wgpu::BindGroup>,
     /// The texture set as last composited, to detect changes.
     composited: Option<TextureSet>,
+    /// (AO map, previewed mesh map) the bind group was built with.
+    bound_maps: (Option<ResourceId>, Option<ResourceId>),
 }
 
 pub struct FrameParams {
@@ -160,6 +177,9 @@ pub struct Viewport {
     env_sh: [[f32; 4]; 9],
     prefilter: wgpu::ComputePipeline,
     mesh: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Mesh bounding-box diagonal.
+    mesh_scale: f32,
+    white: wgpu::TextureView,
     compositor: Compositor,
     paint: PaintGpu,
     texture_sampler: wgpu::Sampler,
@@ -185,6 +205,7 @@ impl Viewport {
                 ),
             ],
         );
+        // Composited set (t0..t2), sampler, baked AO, previewed mesh map.
         let material_layout = bind_group_layout(
             device,
             &[
@@ -195,6 +216,8 @@ impl Viewport {
                     S::FRAGMENT,
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 ),
+                (S::FRAGMENT, texture_binding(true)),
+                (S::FRAGMENT, texture_binding(true)),
             ],
         );
         let hdr_layout = bind_group_layout(device, &[(S::FRAGMENT, texture_binding(false))]);
@@ -331,6 +354,28 @@ impl Viewport {
             env_sh,
             prefilter,
             mesh: None,
+            mesh_scale: 1.0,
+            white: device
+                .create_texture_with_data(
+                    queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("white"),
+                        size: wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &[255; 4],
+                )
+                .create_view(&Default::default()),
             compositor: Compositor::new(device, queue),
             paint: PaintGpu::new(device, queue),
             texture_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
@@ -361,6 +406,8 @@ impl Viewport {
                 wgpu::BufferUsages::INDEX,
             ),
         ));
+        let (lo, hi) = mesh.bounds();
+        self.mesh_scale = (hi - lo).length().max(1e-6);
         self.parts = mesh
             .parts
             .iter()
@@ -372,11 +419,11 @@ impl Viewport {
                 set: None,
                 bind_group: None,
                 composited: None,
+                bound_maps: (None, None),
             })
             .collect();
     }
 
-    /// Re-composites texture sets whose layer stack changed. Returns warnings.
     /// Starts a brush stroke on `targets` in texture set `res`.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_begin(
@@ -420,6 +467,7 @@ impl Viewport {
             vertices,
             indices,
             range: p.indices.clone(),
+            scale: self.mesh_scale,
         };
         let depth = (occlusion && self.view3d.size == self.view3d.requested_size)
             .then_some(&self.targets.depth);
@@ -464,34 +512,52 @@ impl Viewport {
         self.compositor.clear_paint();
     }
 
+    /// Re-composites texture sets whose layer stack changed, and binds their
+    /// baked AO and the previewed mesh map. Returns warnings.
     pub fn sync(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         sets: &[TextureSet],
         resources: &Resources,
+        preview: Option<MeshMap>,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         let Some((vertices, indices)) = &self.mesh else {
             return warnings;
         };
         for (part, set) in self.parts.iter_mut().zip(sets) {
-            if part.composited.as_ref() == Some(set) {
+            let maps = (
+                set.mesh_maps.get(&MeshMap::AmbientOcclusion).cloned(),
+                preview.and_then(|m| set.mesh_maps.get(&m).cloned()),
+            );
+            let changed = part.composited.as_ref() != Some(set);
+            if !changed && part.bound_maps == maps && part.bind_group.is_some() {
                 continue;
             }
-            let mesh = MeshPart {
-                vertices,
-                indices,
-                range: part.indices.clone(),
+            if changed {
+                let mesh = MeshPart {
+                    vertices,
+                    indices,
+                    range: part.indices.clone(),
+                    scale: self.mesh_scale,
+                };
+                warnings.extend(self.compositor.composite(
+                    device,
+                    queue,
+                    &mesh,
+                    set,
+                    resources,
+                    &mut part.set,
+                ));
+            }
+            let map_view = |id: &Option<ResourceId>, comp: &mut Compositor| {
+                id.as_ref()
+                    .and_then(|id| comp.bitmap_view(device, queue, resources, id))
             };
-            warnings.extend(self.compositor.composite(
-                device,
-                queue,
-                &mesh,
-                set,
-                resources,
-                &mut part.set,
-            ));
+            let ao = map_view(&maps.0, &mut self.compositor).unwrap_or_else(|| self.white.clone());
+            let shown =
+                map_view(&maps.1, &mut self.compositor).unwrap_or_else(|| self.white.clone());
             let views = &part.set.as_ref().expect("composite creates the set").views;
             part.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("texture set"),
@@ -513,9 +579,18 @@ impl Viewport {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&ao),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&shown),
+                    },
                 ],
             }));
             part.composited = Some(set.clone());
+            part.bound_maps = maps;
         }
         warnings
     }
@@ -588,9 +663,9 @@ impl Viewport {
                 p.background_blur * max_lod,
             ],
             view: [
-                p.view_mode as u32 as f32,
+                p.view_mode.shader_index(),
                 p.env_opacity,
-                p.uv_mode as u32 as f32,
+                p.uv_mode.shader_index(),
                 0.0,
             ],
             uv_xform: p.uv_xform,

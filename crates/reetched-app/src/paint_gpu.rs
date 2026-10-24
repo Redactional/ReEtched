@@ -621,8 +621,11 @@ mod tests {
     fn gpu() -> Option<Gpu> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()?;
         let v = |u: f32, w: f32| Vertex {
             position: [u, w, 0.0],
             normal: [0.0, 0.0, 1.0],
@@ -698,6 +701,7 @@ mod tests {
             vertices: &g.vb,
             indices: &g.ib,
             range: 0..6,
+            scale: 1.0,
         };
         let camera = Camera {
             view_proj: Mat4::IDENTITY,
@@ -754,6 +758,7 @@ mod tests {
             vertices: &g.vb,
             indices: &g.ib,
             range: 0..6,
+            scale: 1.0,
         };
         let mut fresh = Compositor::new(&g.device, &g.queue);
         let mut out = None;

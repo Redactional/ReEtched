@@ -293,6 +293,13 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
 - **Smart materials**: save a group as a reusable asset in the native format.
 - **Golden-image test harness**: render our compositor and compare it against textures exported from Painter for the same simple setups. Painter is the reference oracle (see §3).
 - **Exit:** bake a high-to-low asset, drop on a smart material, and get edge wear on the right edges.
+- **Status (done, first pass):**
+  - Built: `reetched-bake`, a CPU baker (obvhs BVH + rayon) for normal, world normal, ID (material), AO, curvature, position, thickness, height and opacity, with antialiasing, frontal/rear cage distances (rays follow averaged normals so hard-edged low polys bake cleanly) and dilation. Bakes run on a worker thread with progress and cancel. Maps are stored in the project as 16-bit PNGs (format v3). Painter-named maps can be imported.
+  - Mask effects (up to 4 per mask): generators (edge wear, cavity, AO, position gradient, thickness, noise), Levels and Color Selection with an ID picker. Generators are fixed shader code, not node graphs, until Phase 4.
+  - Smart materials: four built-ins, save/import `.rsm` (a layer or folder with its images and paint tiles).
+  - Exit test: a bevelled high-poly cube baked onto a hard low-poly cube with "Painted Steel Worn" shows steel on the edges and paint on the faces (`baked_edge_wear_shows_steel_on_bevelled_edges`).
+  - Needs a GPU that allows 19 sampled textures per shader stage; the app checks at startup.
+  - **Deferred:** custom cage meshes, match by mesh name, ID from vertex color/mesh, bent normals, GPU ray tracing and denoising, Compare Mask, Anchor Points, fill/paint effects and filters, geometry masks, layer instancing, smart masks, and the golden-image tests against Painter. Mesh maps are sampled at 8-bit precision in the compositor.
 
 ### Phase 4: Procedural engine and Substance graphs (≈4–6 months, highest technical risk)
 **Goal:** native procedural materials, and **`.sbs` support with no Adobe software needed**.

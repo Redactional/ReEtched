@@ -5,13 +5,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod bake_ui;
 mod brush;
 mod compositor;
+mod effects_ui;
 mod env;
 mod paint_gpu;
 mod paint_ui;
 mod panels;
 mod preview;
+mod smart_presets;
 mod stack_ui;
 mod theme;
 mod viewport;
@@ -137,6 +140,13 @@ impl Gfx {
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?})", info.name, info.backend);
 
+        // The layer compositor binds 19 textures per pass (above WebGPU's minimum of 16).
+        let textures = adapter.limits().max_sampled_textures_per_shader_stage;
+        if textures < 19 {
+            anyhow::bail!(
+                "this GPU can bind only {textures} textures per shader stage; ReEtched needs 19"
+            );
+        }
         let wireframe = adapter
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE);

@@ -2,7 +2,7 @@
 
 An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
 
-> **Status: early development (Phase 2 of 9 done).** You can paint and texture a model with layers, save projects and export game-ready textures. Baking and Substance import are not there yet. See the [roadmap](docs/PLAN.md).
+> **Status: early development (Phase 3 of 9 done).** You can bake mesh maps, paint and texture a model with layers and smart materials, save projects and export game-ready textures. Substance import is not there yet. See the [roadmap](docs/PLAN.md).
 
 ## What works today
 
@@ -13,6 +13,10 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - **Painting** on the model or in the 2D view: paint layers and paint inside masks, eraser, size/flow/stroke opacity/spacing/hardness/angle, image alphas, backface culling, mirror and radial symmetry, lazy mouse, Shift+click lines, pen pressure (**1** paint, **2** eraser, **[ ]** size)
 - **Layer stack** like Painter's: paint layers, fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image/painted masks, drag to reorder
 - Fill layers with a color or image per channel (base color, metallic, roughness, normal, height) and UV, tri-planar or planar projection
+- **Baking** (Texture Set Settings → Mesh maps → Bake…): normal (high to low, with cage distances), world-space normal, ID, ambient occlusion, curvature, position, thickness, height and opacity, with antialiasing and dilation; or import maps you baked in Painter (`TextureSetName_MeshMapName` naming)
+- **Mask effects**: generators driven by the mesh maps (edge wear, cavity, AO, position gradient, thickness, noise), Levels and Color Selection (pick ID colors on the model)
+- **Smart materials**: built-ins (Painted Steel Worn, Rusty Iron, Dusty Plastic, Gold Grime), save any layer or folder as a `.rsm` file and import it into other projects
+- View modes for every baked mesh map
 - Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack to add a fill layer
 - **Projects** (`.retx`): save and reopen everything, including the mesh and images; undo/redo
 - **Texture export** with presets for Unreal, Unity HDRP/URP, glTF, Blender and Godot; channel packing, padding, PNG/TGA/TIFF/EXR; import and save Painter export presets (`.spexp`)
@@ -42,14 +46,15 @@ cargo test --workspace
 ```
 crates/
   reetched-io/     mesh import (FBX, OBJ, glTF), tangent generation
-  reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, texture export
+  reetched-bake/   CPU mesh map baker (BVH ray casting)
+  reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, smart materials, texture export
   reetched-app/    the application: UI, GPU layer compositor, viewport renderer, shaders
 docs/
   PLAN.md          architecture, phases and the Substance compatibility strategy
   research/        sourced research on Painter's features, file formats and the Rust ecosystem
 ```
 
-More crates (procedural graphs, baking, Substance formats) arrive with their phases — see the plan.
+More crates (procedural graphs, Substance formats) arrive with their phases — see the plan.
 
 ## Substance Painter compatibility
 

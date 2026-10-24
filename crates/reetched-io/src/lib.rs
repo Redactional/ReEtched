@@ -16,11 +16,13 @@ pub struct Vertex {
     pub tangent: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct MeshPart {
     pub material: String,
     pub indices: Range<u32>,
 }
 
+#[derive(Clone)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,

@@ -2,7 +2,6 @@
 
 use crate::{
     app::{PresetDrag, State, icon_button},
-    preview::PRESETS,
     theme,
     viewport::ViewMode,
 };
@@ -22,10 +21,17 @@ impl State {
                 .desired_width(f32::INFINITY),
         );
         ui.horizontal(|ui| {
-            icon_button(ui, ic::ICON_DEPLOYED_CODE, true, "Materials");
+            use crate::app::AssetCategory as C;
+            for (icon, cat, name) in [
+                (ic::ICON_DEPLOYED_CODE, C::Materials, "Materials"),
+                (ic::ICON_AUTO_FIX_HIGH, C::SmartMaterials, "Smart materials"),
+            ] {
+                if icon_button(ui, icon, self.asset_category == cat, name).clicked() {
+                    self.asset_category = cat;
+                }
+            }
             ui.add_enabled_ui(false, |ui| {
                 for (icon, name) in [
-                    (ic::ICON_AUTO_FIX_HIGH, "Smart materials"),
                     (ic::ICON_MASKED_TRANSITIONS, "Smart masks"),
                     (ic::ICON_FILTER_ALT, "Filters"),
                     (ic::ICON_BRUSH, "Brushes"),
@@ -40,13 +46,21 @@ impl State {
         });
         ui.separator();
 
+        if self.asset_category == crate::app::AssetCategory::SmartMaterials
+            && ui.button("Import smart material…").clicked()
+        {
+            self.import_smart();
+        }
+
         let search = self.asset_search.to_lowercase();
         let mut apply = None;
+        let items = self.asset_items();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
-                for (i, preset) in PRESETS.iter().enumerate() {
-                    if !preset.name.to_lowercase().contains(&search) {
+                for (name, thumb_id, i) in &items {
+                    let i = *i;
+                    if !name.to_lowercase().contains(&search) {
                         continue;
                     }
                     let (rect, resp) = ui.allocate_exact_size(vec2(70.0, 86.0), Sense::click_and_drag());
@@ -59,20 +73,19 @@ impl State {
                         ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
                     }
                     let thumb = Rect::from_center_size(rect.center_top() + vec2(0.0, 34.0), vec2(62.0, 62.0));
-                    if let Some(tex) = self.thumbs.get(i) {
-                        ui.painter().image(tex.id(), thumb, unit_uv(), Color32::WHITE);
+                    if let Some(tex) = thumb_id {
+                        ui.painter().image(*tex, thumb, unit_uv(), Color32::WHITE);
                     }
-                    let name = truncate(preset.name, 11);
+                    let label = truncate(name, 11);
                     ui.painter().text(
                         rect.center_bottom() - vec2(0.0, 8.0),
                         egui::Align2::CENTER_CENTER,
-                        name,
+                        label,
                         egui::FontId::proportional(10.5),
                         theme::TEXT,
                     );
                     let resp = resp.on_hover_text(format!(
-                        "{}\nDouble-click or drag onto the model, a texture set or the layer stack to apply.",
-                        preset.name
+                        "{name}\nDouble-click or drag onto the model, a texture set or the layer stack to apply."
                     ));
                     if resp.clicked() {
                         self.selected_preset = Some(i);
@@ -84,11 +97,11 @@ impl State {
                         resp.dnd_set_drag_payload(PresetDrag(i));
                     }
                     if resp.dragged()
-                        && let (Some(tex), Some(pos)) = (self.thumbs.get(i), ui.ctx().pointer_interact_pos())
+                        && let (Some(tex), Some(pos)) = (thumb_id, ui.ctx().pointer_interact_pos())
                     {
                         let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("drag_preview"));
                         ui.ctx().layer_painter(layer).image(
-                            tex.id(),
+                            *tex,
                             Rect::from_center_size(pos, vec2(48.0, 48.0)),
                             unit_uv(),
                             Color32::from_white_alpha(220),
@@ -247,7 +260,13 @@ impl State {
         );
         self.accept_preset_drop(&response, None);
         drop_highlight(ui, &response);
-        self.paint_input(ui, &response, rect, false);
+        if self.id_pick.is_some() {
+            if response.clicked() {
+                self.pick_id_color(response.interact_pointer_pos(), rect);
+            }
+        } else {
+            self.paint_input(ui, &response, rect, false);
+        }
 
         // Painter's navigation: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, wheel zoom, F to frame.
         let (alt, scroll, frame_key) = ui.input(|i| {
@@ -400,8 +419,13 @@ fn view_mode_combo(ui: &mut Ui, mode: &mut ViewMode, id: &str) {
         .selected_text(mode.label())
         .width(130.0)
         .show_ui(ui, |ui| {
-            for m in ViewMode::ALL {
+            for m in ViewMode::CHANNELS {
                 ui.selectable_value(mode, m, m.label());
+            }
+            ui.separator();
+            ui.label(theme::header("MESH MAPS"));
+            for m in reetched_doc::MeshMap::ALL {
+                ui.selectable_value(mode, ViewMode::Mesh(m), m.label());
             }
         });
 }

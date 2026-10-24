@@ -5,13 +5,15 @@
 pub mod export;
 pub mod history;
 pub mod project;
+pub mod smart;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current `.retx` format version. Bump it and add a migration when the layout changes.
 /// v2: paint layers and painted masks.
-pub const FORMAT_VERSION: u32 = 2;
+/// v3: mesh maps and mask effects.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Texture channels of the metal/roughness workflow.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -387,6 +389,222 @@ impl Fill {
     }
 }
 
+/// Most mask effects the compositor evaluates per mask.
+pub const MAX_MASK_EFFECTS: usize = 4;
+
+/// Baked mesh maps a texture set can have (Painter's "mesh maps").
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum MeshMap {
+    Normal,
+    WorldNormal,
+    Id,
+    AmbientOcclusion,
+    Curvature,
+    Position,
+    Thickness,
+    Height,
+    Opacity,
+}
+
+impl MeshMap {
+    pub const ALL: [MeshMap; 9] = [
+        MeshMap::Normal,
+        MeshMap::WorldNormal,
+        MeshMap::Id,
+        MeshMap::AmbientOcclusion,
+        MeshMap::Curvature,
+        MeshMap::Position,
+        MeshMap::Thickness,
+        MeshMap::Height,
+        MeshMap::Opacity,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MeshMap::Normal => "Normal",
+            MeshMap::WorldNormal => "World space normal",
+            MeshMap::Id => "ID",
+            MeshMap::AmbientOcclusion => "Ambient occlusion",
+            MeshMap::Curvature => "Curvature",
+            MeshMap::Position => "Position",
+            MeshMap::Thickness => "Thickness",
+            MeshMap::Height => "Height",
+            MeshMap::Opacity => "Opacity",
+        }
+    }
+
+    /// Painter's file-name suffix when importing baked maps (`TextureSet_suffix.png`).
+    pub fn painter_suffix(self) -> &'static str {
+        match self {
+            MeshMap::Normal => "normal_base",
+            MeshMap::WorldNormal => "world_space_normals",
+            MeshMap::Id => "id",
+            MeshMap::AmbientOcclusion => "ambient_occlusion",
+            MeshMap::Curvature => "curvature",
+            MeshMap::Position => "position",
+            MeshMap::Thickness => "thickness",
+            MeshMap::Height => "height",
+            MeshMap::Opacity => "opacity",
+        }
+    }
+}
+
+/// Built-in generators: masks computed from mesh maps (stand-ins for Painter's sbsar generators).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum GeneratorKind {
+    /// Convex edges (curvature).
+    EdgeWear,
+    /// Concave creases (curvature).
+    Cavity,
+    /// Occluded areas (ambient occlusion).
+    AmbientOcclusion,
+    /// A ramp along an axis (position).
+    PositionGradient,
+    /// Thin parts (thickness).
+    Thickness,
+    /// Procedural noise only.
+    Noise,
+}
+
+impl GeneratorKind {
+    pub const ALL: [GeneratorKind; 6] = [
+        GeneratorKind::EdgeWear,
+        GeneratorKind::Cavity,
+        GeneratorKind::AmbientOcclusion,
+        GeneratorKind::PositionGradient,
+        GeneratorKind::Thickness,
+        GeneratorKind::Noise,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GeneratorKind::EdgeWear => "Edge wear",
+            GeneratorKind::Cavity => "Cavity dirt",
+            GeneratorKind::AmbientOcclusion => "Ambient occlusion dirt",
+            GeneratorKind::PositionGradient => "Position gradient",
+            GeneratorKind::Thickness => "Thin areas",
+            GeneratorKind::Noise => "Noise",
+        }
+    }
+
+    /// The mesh map this generator reads, if any.
+    pub fn needs(self) -> Option<MeshMap> {
+        match self {
+            GeneratorKind::EdgeWear | GeneratorKind::Cavity => Some(MeshMap::Curvature),
+            GeneratorKind::AmbientOcclusion => Some(MeshMap::AmbientOcclusion),
+            GeneratorKind::PositionGradient => Some(MeshMap::Position),
+            GeneratorKind::Thickness => Some(MeshMap::Thickness),
+            GeneratorKind::Noise => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Generator {
+    pub kind: GeneratorKind,
+    /// Threshold on the generator's signal (0..1).
+    pub level: f32,
+    /// Softness of the transition around `level`.
+    pub contrast: f32,
+    /// How much procedural noise breaks up the edge.
+    pub noise: f32,
+    /// Noise frequency (repeats per bounding-box size).
+    pub noise_scale: f32,
+    /// Position gradient axis: 0 = X, 1 = Y, 2 = Z.
+    pub axis: u8,
+    pub invert: bool,
+}
+
+impl Generator {
+    pub fn new(kind: GeneratorKind) -> Self {
+        let (level, contrast, noise) = match kind {
+            GeneratorKind::EdgeWear => (0.3, 0.12, 0.35),
+            GeneratorKind::Cavity => (0.25, 0.12, 0.3),
+            GeneratorKind::AmbientOcclusion => (0.4, 0.2, 0.25),
+            GeneratorKind::PositionGradient => (0.5, 0.3, 0.1),
+            GeneratorKind::Thickness => (0.5, 0.2, 0.1),
+            GeneratorKind::Noise => (0.5, 0.15, 1.0),
+        };
+        Self {
+            kind,
+            level,
+            contrast,
+            noise,
+            noise_scale: 6.0,
+            axis: 1,
+            invert: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub enum MaskEffectKind {
+    Generator(Generator),
+    Levels {
+        in_min: f32,
+        in_max: f32,
+        gamma: f32,
+        out_min: f32,
+        out_max: f32,
+    },
+    /// White where the ID map matches one of `colors` (Painter's color selection).
+    ColorSelection {
+        colors: Vec<[f32; 3]>,
+        tolerance: f32,
+    },
+}
+
+impl MaskEffectKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MaskEffectKind::Generator(g) => g.kind.label(),
+            MaskEffectKind::Levels { .. } => "Levels",
+            MaskEffectKind::ColorSelection { .. } => "Color selection",
+        }
+    }
+}
+
+/// How an effect combines with the mask below it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum MaskBlend {
+    Normal,
+    Multiply,
+    Add,
+    Subtract,
+    Min,
+    Max,
+}
+
+impl MaskBlend {
+    pub const ALL: [MaskBlend; 6] = [
+        MaskBlend::Normal,
+        MaskBlend::Multiply,
+        MaskBlend::Add,
+        MaskBlend::Subtract,
+        MaskBlend::Min,
+        MaskBlend::Max,
+    ];
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct MaskEffect {
+    pub enabled: bool,
+    pub blend: MaskBlend,
+    pub opacity: f32,
+    pub kind: MaskEffectKind,
+}
+
+impl MaskEffect {
+    pub fn new(kind: MaskEffectKind) -> Self {
+        Self {
+            enabled: true,
+            blend: MaskBlend::Normal,
+            opacity: 1.0,
+            kind,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MaskBackground {
     White,
@@ -404,6 +622,9 @@ pub struct Mask {
     /// Painted mask texels (value in R, coverage in A) on top of the background/bitmap.
     #[serde(default)]
     pub paint: Option<TileMap>,
+    /// Generators, levels, … applied after the background/bitmap, before the paint.
+    #[serde(default)]
+    pub effects: Vec<MaskEffect>,
 }
 
 impl Mask {
@@ -415,6 +636,7 @@ impl Mask {
             projection: Projection::default(),
             invert: false,
             paint: None,
+            effects: Vec::new(),
         }
     }
 }
@@ -478,6 +700,9 @@ pub struct TextureSet {
     pub resolution: u32,
     /// Layer stack, top layer first (Painter's order).
     pub stack: Vec<Node>,
+    /// Baked or imported mesh maps (image resources).
+    #[serde(default)]
+    pub mesh_maps: BTreeMap<MeshMap, ResourceId>,
 }
 
 pub const RESOLUTIONS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
@@ -509,6 +734,7 @@ impl Document {
                 name: name.clone(),
                 resolution: 2048,
                 stack: vec![layer],
+                mesh_maps: BTreeMap::new(),
             });
         }
         doc

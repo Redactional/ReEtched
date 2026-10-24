@@ -274,6 +274,51 @@ impl State {
         }
     }
 
+    /// Samples the ID map under `pos` into the pending color-selection effect.
+    pub fn pick_id_color(&mut self, pos: Option<egui::Pos2>, rect: Rect) {
+        let Some((node_id, fx)) = self.id_pick.take() else {
+            return;
+        };
+        let Some(p) = pos else { return };
+        let view = self.view_info(rect);
+        let ndc = Vec2::new(
+            (p.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+            1.0 - (p.y - rect.min.y) / rect.height() * 2.0,
+        );
+        let (origin, dir) = view_ray(view.view_proj, ndc);
+        let Some(hit) = raycast(&self.mesh, origin, dir) else {
+            self.warn("Missed the model — pick again".into());
+            return;
+        };
+        let set = &self.doc.texture_sets[hit.part];
+        let Some(img) = set
+            .mesh_maps
+            .get(&reetched_doc::MeshMap::Id)
+            .and_then(|id| self.resources.files.get(id))
+            .and_then(|b| image::load_from_memory(b).ok())
+            .map(|i| i.to_rgb32f())
+        else {
+            self.warn("This texture set has no ID map — bake one first".into());
+            return;
+        };
+        let (w, h) = img.dimensions();
+        let x = ((hit.uv.x.fract() + 1.0).fract() * w as f32) as u32;
+        let y = ((1.0 - (hit.uv.y.fract() + 1.0).fract()) * h as f32) as u32;
+        let color = img.get_pixel(x.min(w - 1), y.min(h - 1)).0;
+        if let Some(mask) = self
+            .doc
+            .texture_sets
+            .get_mut(hit.part)
+            .and_then(|s| find_node_mut(&mut s.stack, node_id))
+            .and_then(|n| n.mask.as_mut())
+            && let Some(reetched_doc::MaskEffectKind::ColorSelection { colors, .. }) =
+                mask.effects.get_mut(fx).map(|e| &mut e.kind)
+        {
+            colors.push(color);
+            self.info("Picked ID color".into());
+        }
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let radius = (self.bounds.1 - self.bounds.0).length() * 0.5;
         self.camera.view_proj(aspect, radius)

@@ -102,8 +102,18 @@ impl Tool {
     ];
 }
 
-/// Payload when dragging a material preset out of the Assets panel.
+/// Payload when dragging an asset out of the Assets panel: a material preset,
+/// or a smart material at `SMART_OFFSET + index`.
 pub struct PresetDrag(pub usize);
+
+/// Asset indices from here on are smart materials (built-ins, then imports).
+pub const SMART_OFFSET: usize = 10_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AssetCategory {
+    Materials,
+    SmartMaterials,
+}
 
 pub struct App {
     tree: egui_tiles::Tree<Pane>,
@@ -131,6 +141,9 @@ pub struct State {
     /// Folders collapsed in the layer stack.
     pub collapsed: HashSet<NodeId>,
     pub export: ExportUi,
+    pub bake: crate::bake_ui::BakeUi,
+    /// Picking an ID-map color for (layer, mask effect index).
+    pub id_pick: Option<(NodeId, usize)>,
     /// Set by the export window; handled after it draws (file dialogs block).
     pub pending_preset_import: bool,
     pub pending_preset_save: bool,
@@ -156,6 +169,10 @@ pub struct State {
     /// Where the 3D view was drawn last frame.
     pub view3d_rect: egui::Rect,
     pub asset_search: String,
+    pub asset_category: AssetCategory,
+    /// Smart materials imported this session (with their images and tiles).
+    pub smart_imports: Vec<(reetched_doc::smart::SmartMaterial, Resources)>,
+    pub smart_thumbs: Vec<egui::TextureHandle>,
     pub selected_preset: Option<usize>,
     pub preview_env: PreviewEnv,
     pub thumbs: Vec<egui::TextureHandle>,
@@ -218,6 +235,8 @@ impl App {
             collapsed: HashSet::new(),
             pending_preset_import: false,
             pending_preset_save: false,
+            bake: Default::default(),
+            id_pick: None,
             export: ExportUi {
                 open: false,
                 dir: String::new(),
@@ -243,6 +262,9 @@ impl App {
             last_stroke_end: None,
             view3d_rect: egui::Rect::NOTHING,
             asset_search: String::new(),
+            asset_category: AssetCategory::Materials,
+            smart_imports: Vec::new(),
+            smart_thumbs: Vec::new(),
             selected_preset: None,
             thumbs: Vec::new(),
             log: Vec::new(),
@@ -333,6 +355,7 @@ impl App {
             .frame(Frame::new().fill(theme::GAP))
             .show(ui, |ui| self.tree.ui(&mut self.state, ui));
         self.state.export_window(&ctx);
+        self.state.bake_window(&ctx);
 
         // A whole drag or text edit becomes one undo step.
         let interacting =
@@ -381,6 +404,9 @@ impl App {
             ui.separator();
             if shortcut(ui, "Export textures…", "Ctrl+Shift+E") {
                 self.state.export.open = true;
+            }
+            if ui.button("Bake mesh maps…").clicked() {
+                self.state.bake.open = true;
             }
             if ui.button("Load environment…").clicked() {
                 self.state.pick_environment();
@@ -469,9 +495,13 @@ impl App {
             self.state.view_proj(w.max(1) as f32 / h.max(1) as f32)
         };
         let s = &mut self.state;
-        let warnings = s
-            .viewport
-            .sync(&s.device, &s.queue, &s.doc.texture_sets, &s.resources);
+        let warnings = s.viewport.sync(
+            &s.device,
+            &s.queue,
+            &s.doc.texture_sets,
+            &s.resources,
+            s.preview_map(),
+        );
         for w in warnings {
             s.warn(w);
         }
@@ -735,6 +765,16 @@ impl State {
         self.info(format!("Loaded {}", self.mesh_label));
     }
 
+    /// The mesh map a view is showing, if any (the 3D view wins).
+    pub fn preview_map(&self) -> Option<reetched_doc::MeshMap> {
+        [self.view_mode, self.uv_mode]
+            .into_iter()
+            .find_map(|m| match m {
+                ViewMode::Mesh(map) => Some(map),
+                _ => None,
+            })
+    }
+
     pub fn stack(&self) -> Option<&Vec<Node>> {
         self.doc
             .texture_sets
@@ -848,16 +888,129 @@ impl State {
                 ctx.load_texture(p.name, img, egui::TextureOptions::LINEAR)
             })
             .collect();
+        let grey = crate::preview::Look {
+            base: [0.2; 3],
+            metallic: 0.0,
+            roughness: 0.5,
+        };
+        let looks = crate::smart_presets::BUILTIN
+            .iter()
+            .map(|p| (p.name.to_string(), &p.look))
+            .chain(
+                self.smart_imports
+                    .iter()
+                    .map(|(sm, _)| (sm.name.clone(), &grey)),
+            );
+        self.smart_thumbs = looks
+            .map(|(name, look)| {
+                ctx.load_texture(
+                    name,
+                    self.preview_env.render(look, THUMB_SIZE),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .collect();
     }
 
     /// Adds a fill layer with a material preset to the selected texture set (like dropping
     /// a material onto Painter's layer stack).
     pub fn apply_preset(&mut self, index: usize) {
+        if index >= SMART_OFFSET {
+            self.apply_smart(index - SMART_OFFSET);
+            return;
+        }
         let Some(preset) = PRESETS.get(index) else {
             return;
         };
         let node = self.doc.new_fill(preset.name.to_owned(), preset.fill());
         self.add_node(node);
+    }
+
+    /// Adds smart material `k` (built-ins first, then imports) to the selected texture set.
+    fn apply_smart(&mut self, k: usize) {
+        let builtin = crate::smart_presets::BUILTIN;
+        let node = if let Some(p) = builtin.get(k) {
+            (p.build)(&mut self.doc)
+        } else if let Some((sm, res)) = self.smart_imports.get(k - builtin.len()) {
+            sm.instantiate(&mut self.doc, res, &mut self.resources)
+        } else {
+            return;
+        };
+        let name = node.name.clone();
+        self.add_node(node);
+        if !self
+            .doc
+            .texture_sets
+            .get(self.selected_part)
+            .is_some_and(|s| !s.mesh_maps.is_empty())
+        {
+            self.warn(format!(
+                "{name}: bake mesh maps so its generators have curvature, AO, … to work with"
+            ));
+        }
+    }
+
+    /// The asset list for the current category: (name, thumbnail, PresetDrag index).
+    pub fn asset_items(&self) -> Vec<(String, Option<egui::TextureId>, usize)> {
+        match self.asset_category {
+            AssetCategory::Materials => PRESETS
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.name.to_string(), self.thumbs.get(i).map(|t| t.id()), i))
+                .collect(),
+            AssetCategory::SmartMaterials => crate::smart_presets::BUILTIN
+                .iter()
+                .map(|p| p.name.to_string())
+                .chain(self.smart_imports.iter().map(|(sm, _)| sm.name.clone()))
+                .enumerate()
+                .map(|(k, name)| {
+                    (
+                        name,
+                        self.smart_thumbs.get(k).map(|t| t.id()),
+                        SMART_OFFSET + k,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub fn save_smart(&mut self) {
+        let Some(sel) = self.selected else { return };
+        let Some(node) = self.stack().and_then(|s| find_node(s, sel.node)).cloned() else {
+            return;
+        };
+        let sm = reetched_doc::smart::SmartMaterial::capture(&node, &self.doc);
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Smart material", &[reetched_doc::smart::EXTENSION])
+            .set_file_name(format!("{}.{}", node.name, reetched_doc::smart::EXTENSION))
+            .save_file()
+        else {
+            return;
+        };
+        match reetched_doc::smart::save(&path, &sm, &self.resources) {
+            Ok(()) => self.info(format!("Saved smart material {}", path.display())),
+            Err(e) => self.error(format!("Could not save the smart material: {e:#}")),
+        }
+    }
+
+    pub fn import_smart(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Smart material", &[reetched_doc::smart::EXTENSION])
+            .pick_files()
+        else {
+            return;
+        };
+        for path in paths {
+            match reetched_doc::smart::load(&path) {
+                Ok(item) => {
+                    self.info(format!("Imported smart material {}", item.0.name));
+                    self.smart_imports.push(item);
+                }
+                Err(e) => self.error(format!("Could not import {}: {e:#}", file_name(&path))),
+            }
+        }
+        self.thumbs.clear(); // rebuild thumbnails, including the new ones
+        self.asset_category = AssetCategory::SmartMaterials;
     }
 
     fn push_log(&mut self, text: String, error: bool) {
@@ -1095,6 +1248,7 @@ impl UvCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec2;
     use reetched_doc::NodeKind;
 
     struct Harness {
@@ -1111,7 +1265,11 @@ mod tests {
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
             let (device, queue) =
-                pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                }))
+                .ok()?;
             let ctx = egui::Context::default();
             theme::apply(&ctx);
             let mut renderer = egui_wgpu::Renderer::new(
@@ -1227,5 +1385,134 @@ mod tests {
             rect.center() + vec2(40.0, 0.0),
         );
         assert!(h.base_color_tiles() < painted || h.base_color_tiles() == 0);
+    }
+
+    /// Unit cube faces: (normal, u axis, v axis), with u × v = normal.
+    const FACES: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+        ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ];
+
+    /// A cube in [-1, 1]³ whose faces are `n`×`n` grids; `round` rounds the edges with that radius.
+    /// UVs: each face gets a cell of a 3×2 atlas (inset a little).
+    fn cube(n: u32, round: f32) -> Mesh {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (f, (normal, u, v)) in FACES.iter().enumerate() {
+            let (normal, u, v) = (Vec3::from(*normal), Vec3::from(*u), Vec3::from(*v));
+            let cell = Vec2::new((f % 3) as f32 / 3.0, (f / 3) as f32 / 2.0);
+            let base = vertices.len() as u32;
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (a, b) = (
+                        i as f32 / n as f32 * 2.0 - 1.0,
+                        j as f32 / n as f32 * 2.0 - 1.0,
+                    );
+                    let p = normal + u * a + v * b;
+                    let (pos, nrm) = if round > 0.0 {
+                        let q = p.clamp(Vec3::splat(-(1.0 - round)), Vec3::splat(1.0 - round));
+                        let dir = (p - q).normalize();
+                        (q + dir * round, dir)
+                    } else {
+                        (p, normal)
+                    };
+                    let uv = cell
+                        + Vec2::new(
+                            (a + 1.0) * 0.5 * 0.3 + 0.0167,
+                            (b + 1.0) * 0.5 * 0.45 + 0.025,
+                        ) * Vec2::new(1.0, 1.0);
+                    vertices.push(reetched_io::Vertex {
+                        position: pos.into(),
+                        normal: nrm.into(),
+                        uv: uv.into(),
+                        tangent: [u.x, u.y, u.z, 1.0],
+                    });
+                }
+            }
+            for j in 0..n {
+                for i in 0..n {
+                    let k = base + j * (n + 1) + i;
+                    indices.extend([k, k + 1, k + n + 2, k, k + n + 2, k + n + 1]);
+                }
+            }
+        }
+        let count = indices.len() as u32;
+        Mesh {
+            vertices,
+            indices,
+            parts: vec![reetched_io::MeshPart {
+                material: "cube".into(),
+                indices: 0..count,
+            }],
+            has_uvs: true,
+        }
+    }
+
+    #[test]
+    fn baked_edge_wear_shows_steel_on_bevelled_edges() {
+        let Some(mut h) = Harness::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (low, high) = (cube(1, 0.0), cube(48, 0.15));
+        h.app.state.set_mesh(low.clone(), "cube".into(), None);
+        h.app.state.doc.texture_sets[0].resolution = 256;
+        let settings = reetched_bake::Settings {
+            resolution: 256,
+            max_frontal: 0.05,
+            max_rear: 0.05,
+            ao_rays: 16,
+            maps: vec![
+                reetched_bake::MapKind::Normal,
+                reetched_bake::MapKind::Curvature,
+                reetched_bake::MapKind::AmbientOcclusion,
+            ],
+            ..Default::default()
+        };
+        let maps =
+            reetched_bake::bake(&low, 0, Some(&high), &settings, &Default::default()).unwrap();
+        for (kind, img) in maps {
+            let id = h
+                .app
+                .state
+                .resources
+                .add(crate::bake_ui::encode_png16(&img, kind).unwrap());
+            h.app.state.doc.texture_sets[0]
+                .mesh_maps
+                .insert(crate::bake_ui::mesh_map(kind), id);
+        }
+        h.app.state.apply_preset(SMART_OFFSET); // Painted Steel Worn
+        h.frame(vec![]);
+        let d = h
+            .app
+            .state
+            .viewport
+            .read_back(&h.device, &h.queue, 0)
+            .unwrap();
+        // Walk across the middle of face 0's cell: painted in the middle, steel at the bevels.
+        let row = (256.0 * (1.0 - (0.025 + 0.225))) as u32;
+        let (x0, x1) = (
+            (256.0 * 0.0167) as u32 + 1,
+            (256.0 * (0.0167 + 0.3)) as u32 - 1,
+        );
+        let metal = |x: u32| d.metallic[(row * 256 + x) as usize];
+        let mid = (x0 + x1) / 2;
+        assert!(
+            metal(mid) < 0.1,
+            "face centre keeps its paint: {}",
+            metal(mid)
+        );
+        let edge = (x0..x0 + 6)
+            .chain(x1 - 6..=x1)
+            .filter(|&x| metal(x) > 0.5)
+            .count();
+        assert!(
+            edge >= 4,
+            "steel shows through near the bevelled edges ({edge} texels)"
+        );
     }
 }

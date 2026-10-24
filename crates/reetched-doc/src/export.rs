@@ -241,6 +241,8 @@ pub struct ChannelData {
     pub height_map: Vec<f32>,
     /// Texels inside a UV island.
     pub coverage: Vec<bool>,
+    /// Baked ambient occlusion (empty = none, exported as white).
+    pub ambient_occlusion: Vec<f32>,
 }
 
 impl ChannelData {
@@ -271,7 +273,8 @@ impl ChannelData {
             }
             // ponytail: height 0 is stored as mid grey; revisit with Painter golden exports.
             MapSource::Height => self.height_map[i] + 0.5,
-            MapSource::AmbientOcclusion | MapSource::White => 1.0,
+            MapSource::AmbientOcclusion => self.ambient_occlusion.get(i).copied().unwrap_or(1.0),
+            MapSource::White => 1.0,
             MapSource::Black => 0.0,
         }
     }
@@ -725,6 +728,7 @@ mod tests {
             normal: vec![[0.0, 0.0, 1.0]; 4],
             height_map: vec![0.0; 4],
             coverage: vec![false, true, true, false],
+            ambient_occlusion: Vec::new(),
         }
     }
 

@@ -17,6 +17,18 @@ struct Proj {
     r2: vec4<f32>,
 };
 
+// One mask effect (see MaskEffect in reetched-doc).
+struct MaskFx {
+    // x: kind (0 none, 1 generator, 2 levels, 3 color selection), y: blend, z: opacity
+    head: vec4<f32>,
+    // generator: level, contrast, noise, noise scale; levels: in min, in max, gamma, out min
+    a: vec4<f32>,
+    // generator: kind, axis, invert; levels: out max; color selection: tolerance in w
+    b: vec4<f32>,
+    // color selection: up to 4 colors (w = used)
+    colors: array<vec4<f32>, 4>,
+};
+
 struct Params {
     // xyz: uniform value, w: channel enabled
     values: array<vec4<f32>, 5>,
@@ -26,8 +38,13 @@ struct Params {
     mask: vec4<f32>,
     proj: Proj,
     mask_proj: Proj,
-    // x: height-to-normal strength, y: has painted mask
+    // x: height-to-normal strength, y: has painted mask, z: scene size (noise scale)
     misc: vec4<f32>,
+    // Which mesh maps exist: x normal, y curvature, z AO, w position
+    maps: vec4<f32>,
+    // x thickness, y ID
+    maps2: vec4<f32>,
+    fx: array<MaskFx, 4>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -40,6 +57,113 @@ struct Params {
 @group(0) @binding(7) var t_mask: texture_2d<f32>;
 // Painted mask texels (value in r, coverage in a), same size as the texture set.
 @group(0) @binding(8) var t_mask_paint: texture_2d<f32>;
+// Baked mesh maps (image orientation: row 0 = v 1).
+@group(0) @binding(9) var m_normal: texture_2d<f32>;
+@group(0) @binding(10) var m_curvature: texture_2d<f32>;
+@group(0) @binding(11) var m_ao: texture_2d<f32>;
+@group(0) @binding(12) var m_position: texture_2d<f32>;
+@group(0) @binding(13) var m_thickness: texture_2d<f32>;
+@group(0) @binding(14) var m_id: texture_2d<f32>;
+
+fn mesh_map(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(t, smp, vec2(uv.x, 1.0 - uv.y), 0.0);
+}
+
+// ---------------------------------------------------------------- noise
+
+fn hash3(p: vec3<f32>) -> f32 {
+    let q = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)) * 17.0;
+    return fract(q.x * q.y * q.z * (q.x + q.y + q.z));
+}
+
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let n = mix(
+        mix(mix(hash3(i), hash3(i + vec3(1.0, 0.0, 0.0)), u.x),
+            mix(hash3(i + vec3(0.0, 1.0, 0.0)), hash3(i + vec3(1.0, 1.0, 0.0)), u.x), u.y),
+        mix(mix(hash3(i + vec3(0.0, 0.0, 1.0)), hash3(i + vec3(1.0, 0.0, 1.0)), u.x),
+            mix(hash3(i + vec3(0.0, 1.0, 1.0)), hash3(i + vec3(1.0, 1.0, 1.0)), u.x), u.y),
+        u.z);
+    return n;
+}
+
+fn fbm(p: vec3<f32>) -> f32 {
+    var sum = 0.0;
+    var amp = 0.5;
+    var q = p;
+    for (var i = 0; i < 5; i++) {
+        sum += value_noise(q) * amp;
+        q = q * 2.03 + vec3(17.1, 9.3, 4.7);
+        amp *= 0.5;
+    }
+    return sum / 0.96875;
+}
+
+// ---------------------------------------------------------------- mask effects
+
+fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
+    let noise_p = pos / max(P.misc.z, 1e-5) * fx.a.w;
+    var v = 0.0;
+    switch u32(fx.b.x) {
+        case 0u: { v = (select(0.5, mesh_map(m_curvature, uv).r, P.maps.y > 0.5) - 0.5) * 2.0; }
+        case 1u: { v = (0.5 - select(0.5, mesh_map(m_curvature, uv).r, P.maps.y > 0.5)) * 2.0; }
+        case 2u: { v = 1.0 - select(1.0, mesh_map(m_ao, uv).r, P.maps.z > 0.5); }
+        case 3u: {
+            let p = select(vec3(0.5), mesh_map(m_position, uv).rgb, P.maps.w > 0.5);
+            let axis = u32(fx.b.y);
+            v = select(select(p.z, p.y, axis == 1u), p.x, axis == 0u);
+        }
+        case 4u: { v = 1.0 - select(1.0, mesh_map(m_thickness, uv).r, P.maps2.x > 0.5); }
+        default: { v = fbm(noise_p); }
+    }
+    if fx.a.z > 0.0 && u32(fx.b.x) != 5u {
+        v += (fbm(noise_p) - 0.5) * fx.a.z;
+    }
+    var m = smoothstep(fx.a.x - fx.a.y, fx.a.x + fx.a.y, v);
+    if fx.b.z > 0.5 {
+        m = 1.0 - m;
+    }
+    return m;
+}
+
+fn effect_value(fx: MaskFx, below: f32, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
+    switch u32(fx.head.x) {
+        case 1u: { return generator_value(fx, uv, pos); }
+        case 2u: {
+            let t = clamp((below - fx.a.x) / max(fx.a.y - fx.a.x, 1e-5), 0.0, 1.0);
+            return mix(fx.a.w, fx.b.x, pow(t, 1.0 / max(fx.a.z, 1e-3)));
+        }
+        case 3u: {
+            if P.maps2.y < 0.5 {
+                return 0.0;
+            }
+            let id = mesh_map(m_id, uv).rgb;
+            var sel = 0.0;
+            for (var k = 0; k < 4; k++) {
+                let c = fx.colors[k];
+                if c.w > 0.5 {
+                    let tol = max(fx.b.w, 1e-3);
+                    sel = max(sel, 1.0 - smoothstep(tol * 0.5, tol, distance(id, c.rgb)));
+                }
+            }
+            return sel;
+        }
+        default: { return below; }
+    }
+}
+
+fn mask_blend(mode: u32, a: f32, b: f32, opacity: f32) -> f32 {
+    switch mode {
+        case 1u: { return mix(a, a * b, opacity); }
+        case 2u: { return clamp(a + b * opacity, 0.0, 1.0); }
+        case 3u: { return clamp(a - b * opacity, 0.0, 1.0); }
+        case 4u: { return mix(a, min(a, b), opacity); }
+        case 5u: { return mix(a, max(a, b), opacity); }
+        default: { return mix(a, b, opacity); }
+    }
+}
 
 // The stack so far.
 @group(1) @binding(0) var s0: texture_2d<f32>;
@@ -158,6 +282,13 @@ fn mask_value(uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>, p: vec2<i32>) -> f32 
     if P.mask.z > 0.5 {
         m = sample_proj(t_mask, P.mask_proj, uv, pos, n).r;
     }
+    for (var i = 0u; i < 4u; i++) {
+        let fx = P.fx[i];
+        if u32(fx.head.x) == 0u {
+            continue;
+        }
+        m = mask_blend(u32(fx.head.y), m, effect_value(fx, m, uv, pos), fx.head.z);
+    }
     if P.misc.y > 0.5 {
         let painted = textureLoad(t_mask_paint, p, 0);
         m = mix(m, painted.r, painted.a);
@@ -272,9 +403,14 @@ fn composite(mode: u32, d: vec3<f32>, s: vec3<f32>, a: f32, is_normal: bool) -> 
 
 // ---------------------------------------------------------------- passes
 
+// The empty stack, with the baked normal map (if any) as the base normal, like Painter.
 @fragment
 fn fs_init(in: VsOut) -> Out {
-    return pack(empty());
+    var c = empty();
+    if P.maps.x > 0.5 {
+        c.normal = normalize(mesh_map(m_normal, in.uv).xyz * 2.0 - 1.0);
+    }
+    return pack(c);
 }
 
 fn mode_of(i: u32) -> u32 {
