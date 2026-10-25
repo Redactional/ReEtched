@@ -1,6 +1,6 @@
 //! Embeds the app icon and version info into the Windows executable.
-//! (macOS and Linux get their icons from the app bundle / desktop entry; see
-//! `[package.metadata.bundle]` in Cargo.toml.)
+//! (macOS and Linux get their icons from the installer; see
+//! `[package.metadata.packager]` in Cargo.toml.)
 
 fn main() {
     println!("cargo:rerun-if-changed=../../assets/icons/ReEtched.ico");

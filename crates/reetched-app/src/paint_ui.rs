@@ -770,23 +770,22 @@ impl State {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        use egui::Key;
-        let (smaller, bigger) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::OpenBracket),
-                i.key_pressed(Key::CloseBracket),
-            )
-        });
-        for (key, tool) in [
-            (Key::Num1, Tool::Paint),
-            (Key::Num2, Tool::Eraser),
-            (Key::Num3, Tool::Projection),
-            (Key::Num4, Tool::PolygonFill),
-            (Key::Num5, Tool::Smudge),
-            (Key::Num6, Tool::Clone),
-            (Key::Num7, Tool::Path),
+        use crate::keymap::Action as A;
+        if self.rebinding.is_some() {
+            return;
+        }
+        let smaller = self.keymap.pressed(ctx, A::BrushSmaller);
+        let bigger = self.keymap.pressed(ctx, A::BrushBigger);
+        for (action, tool) in [
+            (A::ToolPaint, Tool::Paint),
+            (A::ToolEraser, Tool::Eraser),
+            (A::ToolProjection, Tool::Projection),
+            (A::ToolPolygonFill, Tool::PolygonFill),
+            (A::ToolSmudge, Tool::Smudge),
+            (A::ToolClone, Tool::Clone),
+            (A::ToolPath, Tool::Path),
         ] {
-            if ctx.input(|i| i.key_pressed(key)) {
+            if self.keymap.pressed(ctx, action) {
                 self.tool = tool;
                 self.properties_tool = true;
             }

@@ -415,26 +415,38 @@ impl State {
             self.path_input(ui, &response, rect);
         }
 
-        // Painter's navigation: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, wheel zoom, F to frame.
-        let (alt, scroll, frame_key) = ui.input(|i| {
+        // Navigation by keymap preset. Painter: Alt+LMB orbit, (Alt+)MMB pan,
+        // Alt+RMB zoom. Blender: MMB orbit, Shift+MMB pan, Ctrl+MMB zoom.
+        // Both: wheel zoom, the Frame View key.
+        let (mods, scroll) = ui.input(|i| (i.modifiers, i.smooth_scroll_delta.y));
+        let frame_key = self.frame_key(ui.ctx());
+        let blender = self.keymap.preset == crate::keymap::Preset::Blender;
+        let mmb = response.dragged_by(PointerButton::Middle);
+        let (orbit, pan, zoom) = if blender {
             (
-                i.modifiers.alt,
-                i.smooth_scroll_delta.y,
-                i.key_pressed(egui::Key::F),
+                mmb && !mods.shift && !mods.command,
+                mmb && mods.shift,
+                mmb && mods.command,
             )
-        });
+        } else {
+            (
+                mods.alt && response.dragged_by(PointerButton::Primary),
+                mmb,
+                mods.alt && response.dragged_by(PointerButton::Secondary),
+            )
+        };
         let d = response.drag_delta();
         let cam = &mut self.camera;
-        if alt && response.dragged_by(PointerButton::Primary) {
+        if orbit {
             cam.yaw -= d.x * 0.008;
             cam.pitch = (cam.pitch + d.y * 0.008).clamp(-1.55, 1.55);
         }
-        if response.dragged_by(PointerButton::Middle) {
+        if pan {
             let (right, up) = cam.right_up();
             let scale = cam.distance * cam.fov_y_deg.to_radians() / rect.height().max(1.0);
             cam.target += (-right * d.x + up * d.y) * scale;
         }
-        if alt && response.dragged_by(PointerButton::Secondary) {
+        if zoom {
             cam.distance *= (d.y * 0.01).exp();
         }
         if response.hovered() && scroll != 0.0 {
@@ -504,14 +516,9 @@ impl State {
             );
         }
 
-        // Pan: MMB (or Alt+MMB); zoom: wheel or Alt+RMB; F frames the tile.
-        let (alt, scroll, frame_key) = ui.input(|i| {
-            (
-                i.modifiers.alt,
-                i.smooth_scroll_delta.y,
-                i.key_pressed(egui::Key::F),
-            )
-        });
+        // Pan: MMB (or Alt+MMB); zoom: wheel or Alt+RMB; the Frame View key frames the tile.
+        let (alt, scroll) = ui.input(|i| (i.modifiers.alt, i.smooth_scroll_delta.y));
+        let frame_key = self.frame_key(ui.ctx());
         let d = response.drag_delta();
         let cam = &mut self.uv_camera;
         if response.dragged_by(PointerButton::Middle)

@@ -189,6 +189,10 @@ pub struct State {
     pub settings: crate::settings::Settings,
     pub library: crate::library_ui::LibraryUi,
     pub settings_open: bool,
+    pub keymap: crate::keymap::Keymap,
+    /// Settings: the action waiting for a new key.
+    pub rebinding: Option<crate::keymap::Action>,
+    pub updates: crate::updates::Updates,
     pub script: crate::scripting::Scripting,
     /// The loaded environment map (None = the built-in sky).
     pub env_path: Option<PathBuf>,
@@ -255,6 +259,7 @@ impl App {
     ) -> Self {
         let env = EnvImage::procedural_sky();
         let settings = crate::settings::Settings::load();
+        let keymap = crate::keymap::Keymap::new(&settings.keymap);
         let mut state = State {
             device: device.clone(),
             queue: queue.clone(),
@@ -314,6 +319,9 @@ impl App {
             library: crate::library_ui::LibraryUi::new(&settings.library_roots),
             settings,
             settings_open: false,
+            keymap,
+            rebinding: None,
+            updates: Default::default(),
             script: Default::default(),
             env_path: None,
             session: crate::session::Session::start(),
@@ -366,6 +374,10 @@ impl App {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let scale = self.state.settings.ui_scale.clamp(0.5, 3.0);
+        if (ctx.zoom_factor() - scale).abs() > 1e-3 {
+            ctx.set_zoom_factor(scale);
+        }
         if self.state.thumbs.is_empty() {
             self.state.refresh_thumbnails(&ctx);
         }
@@ -449,6 +461,8 @@ impl App {
         self.state.text_window(&ctx);
         self.state.new_project_window(&ctx);
         self.state.settings_window(&ctx);
+        let auto = self.state.settings.check_updates;
+        self.state.updates.ui(&ctx, auto);
         self.state.recovery_window(&ctx);
         self.state.console_window(&ctx);
         self.state.plugins_window(&ctx);
@@ -499,10 +513,19 @@ impl App {
                 .clicked()
         };
         ui.menu_button("File", |ui| {
-            if shortcut(ui, "New project…", "Ctrl+N") {
+            use crate::keymap::Action as A;
+            let keys = |a| self.state.keymap.text(a);
+            let (k_new, k_open, k_save, k_save_as, k_export) = (
+                keys(A::NewProject),
+                keys(A::OpenProject),
+                keys(A::Save),
+                keys(A::SaveAs),
+                keys(A::ExportTextures),
+            );
+            if shortcut(ui, "New project…", &k_new) {
                 self.state.open_new_project();
             }
-            if shortcut(ui, "Open project…", "Ctrl+O") {
+            if shortcut(ui, "Open project…", &k_open) {
                 self.state.pick_project();
             }
             let recent = self.state.settings.recent_projects.clone();
@@ -519,10 +542,10 @@ impl App {
                     }
                 });
             });
-            if shortcut(ui, "Save", "Ctrl+S") {
+            if shortcut(ui, "Save", &k_save) {
                 self.state.save(false);
             }
-            if shortcut(ui, "Save as…", "Ctrl+Shift+S") {
+            if shortcut(ui, "Save as…", &k_save_as) {
                 self.state.save(true);
             }
             if ui
@@ -543,7 +566,7 @@ impl App {
                 self.state.reimport_mesh_dialog();
             }
             ui.separator();
-            if shortcut(ui, "Export textures…", "Ctrl+Shift+E") {
+            if shortcut(ui, "Export textures…", &k_export) {
                 self.state.export.open = true;
             }
             if ui.button("Bake mesh maps…").clicked() {
@@ -575,11 +598,13 @@ impl App {
         });
         ui.menu_button("Edit", |ui| {
             let s = &mut self.state;
-            let undo = egui::Button::new("Undo").shortcut_text("Ctrl+Z");
+            let undo =
+                egui::Button::new("Undo").shortcut_text(s.keymap.text(crate::keymap::Action::Undo));
             if ui.add_enabled(s.history.can_undo(), undo).clicked() {
                 s.history.undo(&mut s.doc);
             }
-            let redo = egui::Button::new("Redo").shortcut_text("Ctrl+Y");
+            let redo =
+                egui::Button::new("Redo").shortcut_text(s.keymap.text(crate::keymap::Action::Redo));
             if ui.add_enabled(s.history.can_redo(), redo).clicked() {
                 s.history.redo(&mut s.doc);
             }
@@ -595,6 +620,25 @@ impl App {
             ui.separator();
             if ui.button("Reset layout").clicked() {
                 self.tree = default_layout();
+            }
+        });
+        ui.menu_button("Help", |ui| {
+            let repo = env!("CARGO_PKG_REPOSITORY");
+            if ui.button("Documentation").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(format!("{repo}#readme")));
+            }
+            if ui.button("Report a problem").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(format!("{repo}/issues")));
+            }
+            ui.separator();
+            if ui.button("Check for updates").clicked() {
+                let ctx = ui.ctx().clone();
+                self.state.updates.check(&ctx, true);
+            }
+            if ui.button("About ReEtched").clicked() {
+                self.state.updates.about_open = true;
             }
         });
     }
@@ -618,7 +662,17 @@ impl App {
                 }
             }
             ui.separator();
-            if icon_button(ui, ic::ICON_CENTER_FOCUS_STRONG, false, "Fit view (F)").clicked() {
+            if icon_button(
+                ui,
+                ic::ICON_CENTER_FOCUS_STRONG,
+                false,
+                &format!(
+                    "Fit view ({})",
+                    self.state.keymap.text(crate::keymap::Action::FrameView)
+                ),
+            )
+            .clicked()
+            {
                 self.state.camera.frame(self.state.bounds);
                 self.state.uv_camera.zoom = 0.0;
             }
@@ -897,19 +951,23 @@ impl State {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, KeyboardShortcut, Modifiers};
-        let cmd = Modifiers::COMMAND;
-        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
-        let pressed = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
-        // Shifted versions first so Ctrl+S doesn't swallow Ctrl+Shift+S.
-        let redo = pressed(cmd_shift, Key::Z) || pressed(cmd, Key::Y);
-        let save_as = pressed(cmd_shift, Key::S);
-        let export = pressed(cmd_shift, Key::E);
-        let undo = pressed(cmd, Key::Z);
-        let save = pressed(cmd, Key::S);
-        let open = pressed(cmd, Key::O);
-        let new = pressed(cmd, Key::N);
+        use crate::keymap::Action as A;
+        // While Settings waits for a new key, that key is the binding.
+        if self.rebinding.is_some() {
+            return;
+        }
         let typing = ctx.memory(|m| m.focused().is_some());
+        let pressed = |a| self.keymap.pressed(ctx, a);
+        let (redo, save_as, export, undo, save, open, new, delete) = (
+            pressed(A::Redo),
+            pressed(A::SaveAs),
+            pressed(A::ExportTextures),
+            pressed(A::Undo),
+            pressed(A::Save),
+            pressed(A::OpenProject),
+            pressed(A::NewProject),
+            !typing && pressed(A::Delete),
+        );
         if redo && !typing {
             self.history.redo(&mut self.doc);
         }
@@ -930,7 +988,7 @@ impl State {
         if new {
             self.open_new_project();
         }
-        if !typing && ctx.input(|i| i.key_pressed(Key::Delete)) {
+        if delete {
             self.delete_selected();
         }
     }

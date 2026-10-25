@@ -15,6 +15,7 @@ mod effects_ui;
 mod env;
 mod gpu_cache;
 mod images;
+mod keymap;
 mod library_ui;
 mod paint_gpu;
 mod paint_ui;
@@ -36,6 +37,7 @@ mod text_ui;
 mod theme;
 mod thumbs;
 mod tools_ui;
+mod updates;
 mod viewport;
 
 /// GPU tests take turns: many devices at once, at low process priority,

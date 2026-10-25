@@ -36,7 +36,9 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - **Asset library**: point Settings at your folders of textures, environments, alphas, brushes, smart materials and masks, Substance graphs, shaders, OCIO configs, templates and meshes; search, tags, favorites and thumbnails, updated as files change on disk. Save brush presets and smart masks into it
 - **Autosave and crash recovery**, Save and compact (drops unused images), recent projects, and **project templates** (New project, Ctrl+N) with built-ins for PBR metal/rough, ASM, OpenPBR, Unreal, Unity HDRP and mobile
 - Layer and mask thumbnails in the layer stack, a GPU memory budget for cached textures, and a shader pipeline cache
-- Painter-style navigation: **Alt+LMB** orbit, **Alt+MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame
+- Painter-style navigation and shortcuts by default (**Alt+LMB** orbit, **MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame), or a Blender-style keymap (**MMB** orbit, **Shift+MMB** pan, **Ctrl+MMB** zoom, **Home** to frame); every shortcut can be rebound in Settings
+- Interface size setting (75–200 %), a Help menu, and an optional startup check for new releases (it only tells you; nothing is downloaded)
+- Coming from Painter? See [the migration guide](docs/migrating-from-painter.md)
 
 ## Building
 
@@ -59,14 +61,19 @@ cargo test --workspace
 
 ### Packaging
 
-App icons live in `assets/icons/`. The Windows executable gets `ReEtched.ico` embedded at build time (needs the Windows SDK's resource compiler, which comes with the Visual Studio Build Tools). For macOS and Linux, [cargo-bundle](https://github.com/burtonageo/cargo-bundle) builds a `.app` with `ReEtched.icns` or a `.deb` with the PNG icons:
+App icons live in `assets/icons/`. The Windows executable gets `ReEtched.ico` embedded at build time (needs the Windows SDK's resource compiler, which comes with the Visual Studio Build Tools).
+
+Installers are built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager): NSIS on Windows, `.app`/`.dmg` on macOS, `.deb`/AppImage on Linux. Copy the `reetched_python` library (`.dll` / `.dylib` / `.so`) into `target/release/bridge/` so scripting ships with it, then:
 
 ```bash
-cargo install cargo-bundle
-cargo bundle --release -p reetched-app
+cargo install cargo-packager --locked
+cargo build --release -p reetched-app -p reetched-python
+cargo packager --release -p reetched-app
 ```
 
-Other Linux packages can use `assets/reetched.desktop` with the PNGs in `assets/icons/linux/`, installed as `hicolor/<size>/apps/reetched.png`. Ship `reetched_python` (`.dll` / `.dylib` / `.so`) next to the executable for scripting.
+Pushing a `v*` tag runs the same steps on all three platforms (`.github/workflows/release.yml`) and attaches the installers to a draft GitHub release.
+
+Other Linux packages can use `assets/reetched.desktop` with the PNGs in `assets/icons/linux/`, installed as `hicolor/<size>/apps/reetched.png`.
 
 ## Project layout
 
@@ -100,7 +107,7 @@ Bringing Painter projects over cleanly is a core goal. The short version of what
 
 - **Open formats** (`.sbs` graphs, `.sbsar` parameters, export presets, shaders) — read natively.
 - **Painter projects (`.spp`)** — via a small plugin that runs inside Painter and exports the full layer stack through Adobe's official API. Paint layers come over as full-resolution pixels.
-- **Reading `.spp` directly, without Painter** — long-term research.
+- **Reading `.spp` directly, without Painter** — a read-only conversion into a ReEtched project (File > Import Painter project). The `.spp` is never written to; see [the format notes](docs/spp-format.md).
 
 ReEtched is not affiliated with or endorsed by Adobe. "Substance" and "Adobe" are trademarks of Adobe Inc.
 

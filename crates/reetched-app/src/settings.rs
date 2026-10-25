@@ -40,6 +40,11 @@ pub struct Settings {
     pub python: Option<PathBuf>,
     /// GPU memory the compositor's caches may use, in MB (0 = automatic).
     pub vram_budget_mb: u32,
+    pub keymap: crate::keymap::KeymapSettings,
+    /// Size of the whole interface (1 = 100 %).
+    pub ui_scale: f32,
+    /// Look for a newer release at startup (notify only).
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +56,9 @@ impl Default for Settings {
             plugins_enabled: Vec::new(),
             python: None,
             vram_budget_mb: 0,
+            keymap: Default::default(),
+            ui_scale: 1.0,
+            check_updates: true,
         }
     }
 }

@@ -5,6 +5,89 @@ use egui::{RichText, vec2};
 use reetched_doc::project;
 
 impl State {
+    /// The Frame View key, unless a text field or rebinding has the keyboard.
+    pub fn frame_key(&self, ctx: &egui::Context) -> bool {
+        self.rebinding.is_none()
+            && ctx.memory(|m| m.focused().is_none())
+            && self.keymap.down(ctx, crate::keymap::Action::FrameView)
+    }
+
+    /// Keyboard settings: preset, per-action bindings (click, then press a key).
+    fn keymap_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::keymap::{Action, Preset, captured};
+        ui.label(theme::header("KEYBOARD AND MOUSE"));
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Preset");
+            let k = &mut self.settings.keymap;
+            egui::ComboBox::from_id_salt("keymap_preset")
+                .selected_text(k.preset.label())
+                .show_ui(ui, |ui| {
+                    for p in Preset::ALL {
+                        changed |= ui.selectable_value(&mut k.preset, p, p.label()).changed();
+                    }
+                });
+            if !k.overrides.is_empty() && ui.small_button("Reset changes").clicked() {
+                k.overrides.clear();
+                changed = true;
+            }
+        });
+        ui.label(
+            RichText::new(match self.settings.keymap.preset {
+                Preset::Painter => {
+                    "Alt + left drag orbits, middle drag pans, Alt + right drag zooms"
+                }
+                Preset::Blender => "Middle drag orbits, Shift + middle pans, Ctrl + middle zooms",
+            })
+            .small()
+            .color(theme::WEAK),
+        );
+        // A key pressed while waiting becomes the binding (Escape cancels).
+        if let Some(a) = self.rebinding {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.rebinding = None;
+            } else if let Some(s) = captured(ui.ctx()) {
+                self.settings.keymap.overrides.insert(a, vec![s.text()]);
+                self.rebinding = None;
+                changed = true;
+            }
+        }
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .show(ui, |ui| {
+                egui::Grid::new("keymap")
+                    .num_columns(2)
+                    .spacing(vec2(12.0, 4.0))
+                    .show(ui, |ui| {
+                        for a in Action::ALL {
+                            ui.label(a.label());
+                            let text = if self.rebinding == Some(a) {
+                                "press a key…".to_owned()
+                            } else {
+                                let t: Vec<String> =
+                                    self.keymap.shortcuts(a).iter().map(|s| s.text()).collect();
+                                if t.is_empty() {
+                                    "—".to_owned()
+                                } else {
+                                    t.join(", ")
+                                }
+                            };
+                            if ui
+                                .button(text)
+                                .on_hover_text("Click, then press the new key (Escape cancels)")
+                                .clicked()
+                            {
+                                self.rebinding = Some(a);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if changed {
+            self.keymap = crate::keymap::Keymap::new(&self.settings.keymap);
+        }
+    }
+
     pub fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -39,6 +122,16 @@ impl State {
                                 .suffix(" MB"),
                         )
                         .on_hover_text("Paint and image textures beyond this are dropped and reloaded when needed (0 = automatic)");
+                        ui.end_row();
+                        ui.label("Interface size");
+                        ui.add(
+                            egui::Slider::new(&mut s.ui_scale, 0.75..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                        );
+                        ui.end_row();
+                        ui.label("Updates");
+                        ui.checkbox(&mut s.check_updates, "Check for a new version at startup")
+                            .on_hover_text("Only tells you; nothing is downloaded or installed.");
                         ui.end_row();
                         ui.label("Python");
                         ui.horizontal(|ui| {
@@ -85,6 +178,8 @@ impl State {
                         open_folder(&dir);
                     }
                 });
+                ui.add_space(8.0);
+                self.keymap_ui(ui);
             });
         if let Some(i) = remove_root {
             self.settings.library_roots.remove(i);

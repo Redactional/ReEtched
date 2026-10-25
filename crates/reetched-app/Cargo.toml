@@ -10,17 +10,21 @@ rust-version.workspace = true
 name = "reetched"
 path = "src/main.rs"
 
-# App bundles (`cargo bundle --release -p reetched-app`): a .app with the .icns
-# on macOS, a .deb with the PNG icons on Linux.
-[package.metadata.bundle]
-name = "ReEtched"
+# Installers (`cargo packager --release`, see README): NSIS on Windows, .app/.dmg
+# on macOS, .deb/AppImage on Linux. Put the reetched_python library in
+# target/release/bridge/ first; it ships next to the executable.
+[package.metadata.packager]
+product-name = "ReEtched"
 identifier = "io.github.redactional.reetched"
-icon = [
+description = "Open-source 3D texture painter"
+category = "GraphicsAndDesign"
+icons = [
+    "../../assets/icons/ReEtched.ico",
     "../../assets/icons/ReEtched.icns",
     "../../assets/icons/linux/ReEtched_*.png",
 ]
-category = "public.app-category.graphics-design"
-short_description = "Open-source 3D texture painter"
+resources = [{ src = "../../target/release/bridge/*", target = "." }]
+before-packaging-command = "cargo build --release -p reetched-app -p reetched-python"
 
 [dependencies]
 reetched-io.workspace = true

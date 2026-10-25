@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            formats: nsis
+          - os: macos-latest
+            formats: dmg
+          - os: ubuntu-latest
+            formats: deb,appimage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Build
+        run: cargo build --release -p reetched-app -p reetched-python
+      - name: Stage the Python bridge
+        shell: bash
+        run: |
+          mkdir -p target/release/bridge
+          for f in target/release/reetched_python.dll target/release/libreetched_python.dylib target/release/libreetched_python.so; do
+            [ -f "$f" ] && cp "$f" target/release/bridge/
+          done
+          ls target/release/bridge
+      - name: Package
+        run: cargo packager --release -p reetched-app --formats ${{ matrix.formats }} --binaries-dir target/release --out-dir dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.deb
+            dist/*.AppImage

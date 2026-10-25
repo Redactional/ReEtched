@@ -82,19 +82,27 @@ pub fn library_name() -> String {
 }
 
 /// Where the bridge library is: `REETCHED_PYTHON_LIB` if set, else next to the
-/// executable, else one level up (test and example binaries live in
-/// `target/<profile>/deps` and `.../examples`, the library in `target/<profile>`).
+/// executable, one level up (test and example binaries live in
+/// `target/<profile>/deps` and `.../examples`), or where installers put
+/// resources (`Contents/Resources` in a macOS app, `usr/lib` on Linux).
 pub fn find_library() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("REETCHED_PYTHON_LIB") {
         return Some(p.into());
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
+    let up = dir.parent()?;
     let name = library_name();
-    [Some(dir.join(&name)), dir.parent().map(|d| d.join(&name))]
-        .into_iter()
-        .flatten()
-        .find(|p| p.is_file())
+    [
+        dir.to_path_buf(),
+        up.to_path_buf(),
+        up.join("Resources"),
+        up.join("lib"),
+        up.join("lib/reetched"),
+    ]
+    .into_iter()
+    .map(|d| d.join(&name))
+    .find(|p| p.is_file())
 }
 
 // ---------------------------------------------------------------- C ABI

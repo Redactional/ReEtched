@@ -423,6 +423,7 @@ Each phase ends in something **usable and testable**. Estimates assume 2–3 exp
 - UI/UX pass with Painter-familiar shortcuts as the default keymap, and an optional Blender-style keymap.
 - Localization, accessibility (keyboard navigation, UI scaling), docs site, tutorials and migration guide.
 - Installers (MSI, DMG, AppImage/Flatpak) and auto-update.
+- **Status (first pass):** Painter (default) and Blender keymaps with per-shortcut rebinding in Settings, navigation following the keymap, an interface-size setting, a Help menu with About, and a notify-only update check against GitHub releases (opt-out in Settings). Installers are built with cargo-packager (NSIS, `.app`/`.dmg`, `.deb`/AppImage) by a release workflow on `v*` tags. A [migration guide](migrating-from-painter.md) covers the move from Painter. Not done yet: localization, Flatpak, MSI, signed builds and a docs site.
 
 ---
 
