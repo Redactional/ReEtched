@@ -114,6 +114,10 @@ struct Ctx<'a> {
     images: HashMap<String, Option<ResourceId>>,
     /// Dataset names in `resources/`.
     resource_names: Vec<String>,
+    /// Channels of the last converted fill that use Painter's result.
+    stand_in: Vec<Channel>,
+    /// Painter's computed channels of the set being converted.
+    result_images: std::collections::BTreeMap<Channel, ResourceId>,
     /// Paint actions and polygon fills to replay, in Painter's order.
     jobs: Vec<Job>,
     /// Set being converted (index and name), and its channels.
@@ -181,6 +185,7 @@ impl Ctx<'_> {
 
     fn layer(&mut self, l: &Value) -> Node {
         let name = l["label"].as_str().unwrap_or("Layer").to_owned();
+        self.stand_in.clear();
         let mut node = if ty(l) == "DataLayerGroup" {
             let mut f = self.doc.new_folder(name.clone());
             let kids = if l["subStack"].is_object() {
@@ -218,6 +223,25 @@ impl Ctx<'_> {
                 node.blend.insert(c, ChannelBlend { mode: m, opacity });
             }
         }
+        // Painter's result already holds everything below: replace, don't blend again.
+        for c in std::mem::take(&mut self.stand_in) {
+            let b = node.blend(c);
+            if matches!(
+                b.mode,
+                BlendMode::Normal
+                    | BlendMode::NormalMapCombine
+                    | BlendMode::NormalMapDetail
+                    | BlendMode::LinearDodge
+            ) {
+                node.blend.insert(
+                    c,
+                    ChannelBlend {
+                        mode: BlendMode::Replace,
+                        opacity: b.opacity,
+                    },
+                );
+            }
+        }
         if !l["maskActions"].is_null() {
             let background = if int(l, "maskInitial") == 0 {
                 MaskBackground::Black
@@ -226,7 +250,8 @@ impl Ctx<'_> {
             };
             let mut mask = Mask::new(background);
             mask.enabled = int(l, "maskEnabled") != 0;
-            self.mask_actions(&l["maskActions"], node.id, &mut mask);
+            let start = self.jobs.len();
+            self.mask_actions(&l["maskActions"], node.id, &mut mask, start);
             node.mask = Some(mask);
         }
         node
@@ -234,18 +259,34 @@ impl Ctx<'_> {
 
     /// Paint actions become jobs, Light fills and Levels filters become mask
     /// effects; counts what isn't converted.
-    fn mask_actions(&mut self, actions: &Value, node: reetched_doc::NodeId, mask: &mut Mask) {
+    /// Mask actions are listed bottom first; `start` is where this mask's jobs begin.
+    fn mask_actions(
+        &mut self,
+        actions: &Value,
+        node: reetched_doc::NodeId,
+        mask: &mut Mask,
+        start: usize,
+    ) {
         for a in items(actions).iter().filter(|a| !a.is_null()) {
             match ty(a) {
-                "DataActionGroup" => self.mask_actions(&a["subStack"], node, mask),
+                "DataActionGroup" => self.mask_actions(&a["subStack"], node, mask, start),
                 "DataActionPaint" | "DataActionEraser" => self.job(a, node, true),
                 "DataActionSmudge" => self.note("smudge strokes (not replayed)"),
-                "DataActionFill" => match mask_light(a) {
-                    Some(fx) if mask.effects.len() < reetched_doc::MAX_MASK_EFFECTS => {
-                        mask.effects.push(fx)
+                "DataActionFill" => {
+                    // A fill at Normal and full opacity covers everything below it.
+                    let (blend, opacity) = mask_blend(a);
+                    if blend == reetched_doc::MaskBlend::Normal && opacity >= 0.99 {
+                        self.jobs.truncate(start);
+                        mask.effects.clear();
+                        mask.paint = None;
                     }
-                    _ => self.note("fills inside masks"),
-                },
+                    match mask_light(a) {
+                        Some(fx) if mask.effects.len() < reetched_doc::MAX_MASK_EFFECTS => {
+                            mask.effects.push(fx)
+                        }
+                        _ => self.note("fills inside masks"),
+                    }
+                }
                 "DataActionFilterLevels" if mask.effects.len() < reetched_doc::MAX_MASK_EFFECTS => {
                     mask.effects.push(mask_levels(a))
                 }
@@ -314,6 +355,7 @@ impl Ctx<'_> {
             s.enabled = false;
         }
         fill.projection = projection(f);
+        let mut procedural = false;
         if !matches!(int(f, "projection"), 0 | 2 | 6 | 7) {
             self.note("fill projections ReEtched doesn't map yet (used UV)");
         }
@@ -349,10 +391,33 @@ impl Ctx<'_> {
                         s.bitmap = id.clone();
                     }
                 }
-                "DataSourceProcedural" => self.note("procedural (.sbsar) fill channels"),
+                // We can't run .sbsar graphs; Painter's computed result shows
+                // what this layer looks like wherever it's visible.
+                "DataSourceProcedural" => {
+                    let mut used = false;
+                    for c in chans {
+                        if let Some(id) = self.result_images.get(&c).cloned() {
+                            self.stand_in.push(c);
+                            let s = fill.channels.entry(c).or_insert_with(|| default_source(c));
+                            s.enabled = true;
+                            s.bitmap = Some(id);
+                            used = true;
+                        }
+                    }
+                    if used {
+                        procedural = true;
+                        self.note("procedural (.sbsar) fills shown with Painter's computed result");
+                    } else {
+                        self.note("procedural (.sbsar) fill channels");
+                    }
+                }
                 "DataSourceText" => self.note("text fills"),
                 _ => self.note("other fill sources"),
             }
+        }
+        // Painter's result is laid out in UV space, one copy.
+        if procedural {
+            fill.projection = Projection::default();
         }
         fill
     }
@@ -393,8 +458,8 @@ fn mask_light(a: &Value) -> Option<reetched_doc::MaskEffect> {
             .map_or(default, |t| float(t, "value", default))
     };
     let mut g = reetched_doc::Generator::new(reetched_doc::GeneratorKind::Light);
-    // ponytail: the light model is a half-Lambert approximation of Painter's
-    // generator; attenuation becomes the transition width.
+    // Our Light generator is fitted to Painter's (wrapped Lambert squared,
+    // scaled by 1 - attenuation / 2); the attenuation rides in `contrast`.
     g.light = [
         tweak("Horizontal_Angle", 0.25),
         tweak("Vertical_Angle", 0.5),
@@ -559,14 +624,39 @@ pub const RESULT_LAYER: &str = "Painter result";
 
 /// A fill layer holding Painter's own computed channels, so the converted
 /// project looks like Painter's even where the rebuilt layers don't match yet.
-fn result_layer(cx: &mut Ctx, set_name: &str, refs: &[Reference]) -> Option<Node> {
-    if refs.is_empty() {
+fn result_layer(cx: &mut Ctx) -> Option<Node> {
+    if cx.result_images.is_empty() {
         return None;
     }
     let mut fill = Fill::new([0.5; 3], 0.0, 0.5);
     for s in fill.channels.values_mut() {
         s.enabled = false;
     }
+    for (&c, id) in &cx.result_images {
+        let s = fill.channels.entry(c).or_insert_with(|| default_source(c));
+        s.enabled = true;
+        s.bitmap = Some(id.clone());
+    }
+    let mut node = cx.doc.new_fill(RESULT_LAYER.into(), fill);
+    for &c in cx.result_images.keys() {
+        node.blend.insert(
+            c,
+            ChannelBlend {
+                mode: BlendMode::Replace,
+                opacity: 1.0,
+            },
+        );
+    }
+    Some(node)
+}
+
+/// Painter's computed channels of a texture set as project images.
+fn result_images(
+    cx: &mut Ctx,
+    set_name: &str,
+    refs: &[Reference],
+) -> std::collections::BTreeMap<Channel, ResourceId> {
+    let mut out = std::collections::BTreeMap::new();
     for r in refs {
         let (w, h) = (r.width, r.height);
         let q16 = |v: f32| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
@@ -605,24 +695,9 @@ fn result_layer(cx: &mut Ctx, set_name: &str, refs: &[Reference]) -> Option<Node
                 name: format!("{set_name} Painter {}.png", r.channel.id()),
             },
         );
-        let s = fill
-            .channels
-            .entry(r.channel)
-            .or_insert_with(|| default_source(r.channel));
-        s.enabled = true;
-        s.bitmap = Some(id);
+        out.insert(r.channel, id);
     }
-    let mut node = cx.doc.new_fill(RESULT_LAYER.into(), fill);
-    for r in refs {
-        node.blend.insert(
-            r.channel,
-            ChannelBlend {
-                mode: BlendMode::Replace,
-                opacity: 1.0,
-            },
-        );
-    }
-    Some(node)
+    out
 }
 
 /// Converts the project at `path`.
@@ -642,6 +717,8 @@ pub fn convert(path: &Path) -> Result<Converted> {
         set: String::new(),
         set_channels: Vec::new(),
         skipped: HashMap::new(),
+        result_images: Default::default(),
+        stand_in: Vec::new(),
         jobs: Vec::new(),
         set_index: 0,
     };
@@ -672,6 +749,10 @@ pub fn convert(path: &Path) -> Result<Converted> {
             }
         }
         cx.set_channels = set_channels.clone();
+        // Painter's own result, used by procedural fills and the top layer.
+        let uid = m["sceneMaterialUID"].as_u64().unwrap_or(0).to_string();
+        let refs = references_for(&c, &uid, index);
+        cx.result_images = result_images(&mut cx, &name, &refs);
         let nodes = cx.stack(&stack["stack"]);
         let res =
             floats::<2>(m, "resolutionLog2").map_or(2048, |r| 1u32 << (r[0] as u32).clamp(8, 13));
@@ -713,9 +794,7 @@ pub fn convert(path: &Path) -> Result<Converted> {
             cx.log.push(format!("{name}: {n} {what}"));
         }
         // Painter's own computed channels for this set.
-        let uid = m["sceneMaterialUID"].as_u64().unwrap_or(0).to_string();
-        let refs = references_for(&c, &uid, index);
-        if let Some(node) = result_layer(&mut cx, &name, &refs) {
+        if let Some(node) = result_layer(&mut cx) {
             result_layers.push((index, node.id));
             cx.doc.texture_sets[index].stack.insert(0, node);
         }

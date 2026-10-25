@@ -2,7 +2,7 @@
 //! brush engine (Painter stores strokes, not painted pixels).
 
 use crate::app::State;
-use crate::brush::{raycast, view_ray};
+use crate::brush::raycast;
 use crate::compositor::MASK_SLOT;
 use crate::paint_gpu::{BrushShape, Camera, DAB_UV_SPACE, Dab, StrokeMode, StrokeTarget};
 use glam::{Mat4, Vec2, Vec3};
@@ -271,11 +271,9 @@ impl State {
                     let (a, b) = (uv_of(lo), uv_of(hi));
                     let (ulo, uhi) = (a.min(b), a.max(b));
                     for t in range.clone() {
-                        let c = (0..3)
-                            .map(|k| Vec2::from(self.mesh.vertices[corner(t, k)].uv))
-                            .sum::<Vec2>()
-                            / 3.0;
-                        if c.cmpge(ulo).all() && c.cmple(uhi).all() {
+                        let tri =
+                            [0, 1, 2].map(|k| Vec2::from(self.mesh.vertices[corner(t, k)].uv));
+                        if center_inside(tri, ulo, uhi) {
                             seeds.push((t, Vec3::ZERO));
                         }
                     }
@@ -289,26 +287,69 @@ impl State {
                 let view_proj = inv.inverse();
                 let ndc = |p: Vec2| Vec2::new(p.x * 2.0 - 1.0, p.y * 2.0 - 1.0);
                 if hit.rect {
-                    let eye = inv.project_point3(Vec3::new(0.0, 0.0, 0.0));
                     let (a, b) = (ndc(lo), ndc(hi));
                     let (nlo, nhi) = (a.min(b), a.max(b));
                     for t in range.clone() {
                         let [p0, p1, p2] = [0, 1, 2]
                             .map(|k| Vec3::from(self.mesh.vertices[corner(t, k)].position));
                         let c = (p0 + p1 + p2) / 3.0;
-                        let facing = (p1 - p0).cross(p2 - p0).dot(eye - c) > 0.0;
-                        let q = view_proj.project_point3(c).truncate();
-                        if facing && q.cmpge(nlo).all() && q.cmple(nhi).all() {
-                            seeds.push((t, c));
+                        let q = [p0, p1, p2].map(|p| view_proj.project_point3(p).truncate());
+                        if !center_inside(q, nlo, nhi) {
+                            continue;
                         }
+                        // Faces turned away from the camera count too.
+                        seeds.push((t, c));
                     }
                 } else {
-                    let (o, d) = view_ray(view_proj, ndc(lo));
+                    let (o, d) = gl_ray(view_proj, ndc(lo));
                     if let Some(h) = raycast(&self.mesh, o, d).filter(|h| h.part == set) {
                         seeds.push((h.tri as u32, h.pos));
                     }
                 }
             }
+        }
+        // Symmetry: the mirror image of each selected face (Painter mirrors
+        // polygon fills like strokes).
+        if let Some(m) = hit.mirror.map(|m| Mat4::from_cols_array(&m)) {
+            let centroid = |t: u32| {
+                (0..3)
+                    .map(|k| Vec3::from(self.mesh.vertices[corner(t, k)].position))
+                    .sum::<Vec3>()
+                    / 3.0
+            };
+            // Faces by grid cell, to find the face nearest a mirrored point.
+            let cell = |p: Vec3| (p / 0.05).floor().as_ivec3();
+            let mut grid: std::collections::HashMap<glam::IVec3, Vec<u32>> = Default::default();
+            for t in range.clone() {
+                grid.entry(cell(centroid(t))).or_default().push(t);
+            }
+            let mirrored: Vec<(u32, Vec3)> = seeds
+                .iter()
+                .filter_map(|&(t, at)| {
+                    let at = if at == Vec3::ZERO { centroid(t) } else { at };
+                    let p = m.transform_point3(at);
+                    let c = cell(p);
+                    let mut best: Option<(f32, u32)> = None;
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            for dz in -1..=1 {
+                                for &u in grid
+                                    .get(&(c + glam::IVec3::new(dx, dy, dz)))
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    let d = centroid(u).distance_squared(p);
+                                    if best.is_none_or(|(bd, _)| d < bd) {
+                                        best = Some((d, u));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    best.map(|(_, u)| (u, p))
+                })
+                .collect();
+            seeds.extend(mirrored);
         }
         if mode == Selection::Triangle {
             return seeds.into_iter().map(|(t, _)| t).collect();
@@ -407,14 +448,34 @@ impl State {
         }
         use rayon::prelude::*;
         let mesh = &self.mesh;
+        // The brush's radius on screen (NDC) at the mesh's distance, for
+        // footprints whose center misses the mesh.
+        let (lo, hi) = mesh.bounds();
+        let depth =
+            ((lo + hi) * 0.5 - eye).dot((-inv_view.z_axis.truncate()).normalize_or(Vec3::NEG_Z));
+        let screen_r = radius * s.proj[0].abs() / depth.max(0.05);
+        let hit = |n: Vec2| {
+            let (o, d) = gl_ray(view_proj, n);
+            raycast(mesh, o, d)
+                .filter(|h| h.part == job.set)
+                .map(|h| h.pos)
+        };
         let hits: Vec<Option<Vec3>> = s
             .points
             .par_iter()
             .map(|&p| {
-                let (o, d) = view_ray(view_proj, ndc(p));
-                raycast(mesh, o, d)
-                    .filter(|h| h.part == job.set)
-                    .map(|h| h.pos)
+                let c = ndc(p);
+                hit(c).or_else(|| {
+                    // Like Painter's brush, paint what the footprint overlaps:
+                    // the hit nearest the center on rings across the footprint.
+                    (1..=4).find_map(|ring| {
+                        let r = screen_r * ring as f32 / 4.0;
+                        (0..8).find_map(|k| {
+                            let a = k as f32 * std::f32::consts::TAU / 8.0;
+                            hit(c + Vec2::new(a.cos(), a.sin()) * r)
+                        })
+                    })
+                })
             })
             .collect();
         let missed = hits.iter().filter(|h| h.is_none()).count();
@@ -447,6 +508,22 @@ impl State {
     }
 }
 
+/// Painter's rectangle Polygon Fill takes the faces whose center falls
+/// inside the rectangle (checked against Painter's output).
+fn center_inside(t: [Vec2; 3], lo: Vec2, hi: Vec2) -> bool {
+    let c = (t[0] + t[1] + t[2]) / 3.0;
+    c.cmpge(lo).all() && c.cmple(hi).all()
+}
+
+/// A ray through `ndc` for Painter's OpenGL-style projections, whose near
+/// plane is at z = -1 (cameras can sit very close to the surface).
+fn gl_ray(view_proj: Mat4, ndc: Vec2) -> (Vec3, Vec3) {
+    let inv = view_proj.inverse();
+    let near = inv.project_point3(ndc.extend(-1.0));
+    let far = inv.project_point3(ndc.extend(1.0));
+    (near, (far - near).normalize_or(Vec3::NEG_Z))
+}
+
 /// Points every `step` along a polyline (the first point always).
 fn spaced<T: Copy>(
     pts: &[T],
@@ -477,6 +554,23 @@ fn spaced<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rectangles_take_faces_centered_inside() {
+        let (lo, hi) = (Vec2::ZERO, Vec2::ONE);
+        let tri = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| [a, b, c].map(Vec2::from);
+        assert!(center_inside(
+            tri([0.1, 0.1], [0.9, 0.1], [0.5, 0.9]),
+            lo,
+            hi
+        ));
+        // Overlapping, but centered outside.
+        assert!(!center_inside(
+            tri([0.5, 0.5], [3.0, 0.5], [3.0, 3.0]),
+            lo,
+            hi
+        ));
+    }
 
     #[test]
     fn dabs_are_evenly_spaced_along_the_path() {

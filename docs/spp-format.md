@@ -98,11 +98,21 @@ mean defaults (fields differ between versions).
   `position0/1`), in the same coordinates as stroke points, with the inverse
   view-projection in `projViewInvMatrix` (all zero for 2D-view hits, whose
   positions are UVs). `granularity`: 0 triangle, 1 polygon, 2 mesh, 3 UV
-  island; `color` is the fill value.
+  island; `color` is the fill value. A rectangle takes the faces whose
+  center falls inside it on screen, including faces turned away from the
+  camera.
 - **Mask generators**: Painter's Light generator (`light.sbsar`, the most
   used) takes the baked world normal and position maps and `Horizontal_Angle`
   (turns), `Vertical_Angle` (-1..1), `light_attenuation`, `invert`. Baked
-  maps named `…normalobj` are world-space normals.
+  maps named `…normalobj` are world-space normals. Fitted against Painter's
+  output on a project whose highlight mask is almost pure Light: the angles
+  give the direction *away* from the light, and the mask is
+  ((1 + n·L) / 2)² × (1 − attenuation / 2) (correlation 0.83).
+- **Mask contents** are listed bottom first; a fill at Normal and full
+  opacity covers the paint below it.
+- **Brush footprints**: Painter paints whatever the brush disk overlaps on
+  screen, even when its center misses the mesh (close-up views). Projections
+  use OpenGL depth (near plane at z = -1).
 - **Painter's result**: `texture-cache` holds the final channels per texture
   set; the converter puts them in a top "Painter result" layer.
 

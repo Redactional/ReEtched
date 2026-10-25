@@ -144,11 +144,15 @@ fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>) -> f
         }
         case 4u: { v = 1.0 - select(1.0, mesh_map(m_thickness, uv).r, P.maps2.x > 0.5); }
         case 6u: {
-            // Light: horizontal angle in turns (b.y), vertical -1..1 (b.w).
+            // Light: angles (b.y turns, b.w -1..1) point away from the light;
+            // wrapped Lambert squared, scaled down by the attenuation (a.y).
+            // Fitted to Painter's Light generator output.
             let h = fx.b.y * 6.2831853;
             let e = fx.b.w * 1.5707963;
-            let l = vec3(cos(e) * sin(h), sin(e), cos(e) * cos(h));
-            v = dot(normalize(n), l) * 0.5 + 0.5;
+            let l = -vec3(cos(e) * sin(h), sin(e), cos(e) * cos(h));
+            let w = dot(normalize(n), l) * 0.5 + 0.5;
+            let lit = w * w * (1.0 - 0.5 * fx.a.y);
+            return select(lit, 1.0 - lit, fx.b.z > 0.5);
         }
         default: { v = fbm(noise_p); }
     }
