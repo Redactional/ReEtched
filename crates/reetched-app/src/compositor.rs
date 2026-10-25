@@ -1098,7 +1098,8 @@ fn proj_uniform(p: &Projection) -> ProjUniform {
         .enumerate()
         .map(|(i, &m)| if m { 1 << i } else { 0 })
         .sum::<u32>() as f32
-        + if p.repeat { 0.0 } else { 8.0 };
+        + if p.repeat { 0.0 } else { 8.0 }
+        + if p.front_only { 16.0 } else { 0.0 };
     let w = &p.warp;
     ProjUniform {
         a: [
@@ -1270,7 +1271,12 @@ fn mask_fx(e: &reetched_doc::MaskEffect) -> MaskFx {
                 .unwrap_or(0) as f32;
             fx.head = [1.0, blend, e.opacity, 0.0];
             fx.a = [g.level, g.contrast, g.noise, g.noise_scale];
-            fx.b = [kind, g.axis as f32, if g.invert { 1.0 } else { 0.0 }, 0.0];
+            let (b1, b3) = if g.kind == GeneratorKind::Light {
+                (g.light[0], g.light[1])
+            } else {
+                (g.axis as f32, 0.0)
+            };
+            fx.b = [kind, b1, if g.invert { 1.0 } else { 0.0 }, b3];
         }
         MaskEffectKind::Levels {
             in_min,

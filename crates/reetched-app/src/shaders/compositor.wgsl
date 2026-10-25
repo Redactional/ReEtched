@@ -20,7 +20,8 @@ struct Proj {
     a: vec4<f32>,
     // xy: uv scale, zw: uv offset
     so: vec4<f32>,
-    // xyz: projector position, w: mirror bits (1 x, 2 y, 4 z), 8 = no repeat
+    // xyz: projector position, w: mirror bits (1 x, 2 y, 4 z), 8 = no repeat,
+    // 16 = planar onto front faces only
     origin: vec4<f32>,
     // Rows of the inverse projector rotation.
     r0: vec4<f32>,
@@ -129,7 +130,7 @@ fn fbm(p: vec3<f32>) -> f32 {
 
 // ---------------------------------------------------------------- mask effects
 
-fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
+fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>) -> f32 {
     let noise_p = pos / max(P.misc.z, 1e-5) * fx.a.w;
     var v = 0.0;
     switch u32(fx.b.x) {
@@ -142,9 +143,16 @@ fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
             v = select(select(p.z, p.y, axis == 1u), p.x, axis == 0u);
         }
         case 4u: { v = 1.0 - select(1.0, mesh_map(m_thickness, uv).r, P.maps2.x > 0.5); }
+        case 6u: {
+            // Light: horizontal angle in turns (b.y), vertical -1..1 (b.w).
+            let h = fx.b.y * 6.2831853;
+            let e = fx.b.w * 1.5707963;
+            let l = vec3(cos(e) * sin(h), sin(e), cos(e) * cos(h));
+            v = dot(normalize(n), l) * 0.5 + 0.5;
+        }
         default: { v = fbm(noise_p); }
     }
-    if fx.a.z > 0.0 && u32(fx.b.x) != 5u {
+    if fx.a.z > 0.0 && u32(fx.b.x) != 5u && u32(fx.b.x) != 6u {
         v += (fbm(noise_p) - 0.5) * fx.a.z;
     }
     var m = smoothstep(fx.a.x - fx.a.y, fx.a.x + fx.a.y, v);
@@ -154,9 +162,9 @@ fn generator_value(fx: MaskFx, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
     return m;
 }
 
-fn effect_value(fx: MaskFx, below: f32, uv: vec2<f32>, pos: vec3<f32>) -> f32 {
+fn effect_value(fx: MaskFx, below: f32, uv: vec2<f32>, pos: vec3<f32>, n: vec3<f32>) -> f32 {
     switch u32(fx.head.x) {
-        case 1u: { return generator_value(fx, uv, pos); }
+        case 1u: { return generator_value(fx, uv, pos, n); }
         case 2u: {
             let t = clamp((below - fx.a.x) / max(fx.a.y - fx.a.x, 1e-5), 0.0, 1.0);
             return mix(fx.a.w, fx.b.x, pow(t, 1.0 / max(fx.a.z, 1e-3)));
@@ -346,7 +354,8 @@ fn sample_proj(t: texture_2d<f32>, pr: Proj, in: VsOut, n: vec3<f32>) -> vec4<f3
     if mode == 2u {
         let t0 = uv_xform(q.xy + 0.5, pr);
         let s = textureSample(t, smp, vec2(t0.x, 1.0 - t0.y));
-        return select(s, vec4(0.0), clipped(t0, pr));
+        let back = (bits & 16u) != 0u && local_dir(mn, pr).z < 0.0;
+        return select(s, vec4(0.0), clipped(t0, pr) || back);
     }
     if mode == 3u || mode == 4u {
         // Around the projector's Y axis; u wraps once around.
@@ -381,7 +390,7 @@ fn mask_value(in: VsOut, n: vec3<f32>, p: vec2<i32>) -> f32 {
         if u32(fx.head.x) == 0u {
             continue;
         }
-        m = mask_blend(u32(fx.head.y), m, effect_value(fx, m, in.uv, in.world), fx.head.z);
+        m = mask_blend(u32(fx.head.y), m, effect_value(fx, m, in.uv, in.world, n), fx.head.z);
     }
     if P.misc.y > 0.5 {
         let painted = textureLoad(t_mask_paint, p, 0);

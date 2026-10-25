@@ -134,12 +134,15 @@ pub fn read(
                 .flatten()
                 .into_iter()
                 .collect();
+            let (view, proj) = (mat(&s["viewMatrix"])?, mat(&s["projectionMatrix"])?);
+            // 2D-view strokes store no camera; their points are UVs.
+            let uv_view = s["viewType"].as_i64() == Some(0);
             Some(Stroke {
                 points,
                 pressure,
-                view: mat(&s["viewMatrix"])?,
-                proj: mat(&s["projectionMatrix"])?,
-                uv_view: s["viewType"].as_i64() == Some(0),
+                view,
+                proj,
+                uv_view,
                 mirrors,
             })
         })
@@ -160,5 +163,125 @@ pub fn read(
         pressure_size: on(emitter, "pressureSizeEnabled"),
         pressure_flow: on(emitter, "pressureFlowEnabled"),
         strokes,
+    }
+}
+
+/// A Polygon Fill action ("decal"): clicks and rectangles that fill faces.
+#[derive(Clone, Debug)]
+pub struct DecalJob {
+    pub set: usize,
+    pub node: NodeId,
+    pub mask: bool,
+    pub hits: Vec<DecalHit>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecalHit {
+    /// A click (both corners equal) or a rectangle, in normalized view
+    /// coordinates (y down); UVs for 2D-view hits.
+    pub corners: [[f32; 2]; 2],
+    pub rect: bool,
+    /// Column-major inverse view-projection of the 3D view (None: 2D view).
+    pub inv_view_proj: Option<[f32; 16]>,
+    /// 0 triangle, 1 polygon, 2 mesh, 3 UV island.
+    pub granularity: i64,
+    /// Fill value (mask grey in x).
+    pub color: [f32; 3],
+    pub mirror: Option<[f32; 16]>,
+}
+
+fn pair(v: &Value, k: &str) -> Option<[f32; 2]> {
+    let a = v[k].as_array()?;
+    Some([a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+}
+
+/// Reads one decal action.
+pub fn read_decal(action: &Value, set: usize, node: NodeId, mask: bool) -> DecalJob {
+    let hits = action["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| {
+            let rect = h["@type"] == "DataDecalHitRect";
+            let corners = if rect {
+                [pair(h, "position0")?, pair(h, "position1")?]
+            } else {
+                let p = pair(h, "position")?;
+                [p, p]
+            };
+            let color = h["color"]
+                .as_array()
+                .map(|a| {
+                    let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                    [g(0), g(1), g(2)]
+                })
+                .unwrap_or([1.0; 3]);
+            let inv = mat(&h["projViewInvMatrix"]).filter(|m| m.iter().any(|x| *x != 0.0));
+            Some(DecalHit {
+                corners,
+                rect,
+                inv_view_proj: if h["viewType"].as_i64() == Some(0) {
+                    None
+                } else {
+                    inv
+                },
+                granularity: h["granularity"].as_i64().unwrap_or(0),
+                color,
+                mirror: (h["duplicateCount"].as_i64().unwrap_or(0) > 0)
+                    .then(|| mat(&h["duplicateMatrix"]))
+                    .flatten(),
+            })
+        })
+        .collect();
+    DecalJob {
+        set,
+        node,
+        mask,
+        hits,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strokes_and_fills_read_from_painter_objects() {
+        let zero = [0.0; 16];
+        let action = json!({
+            "@type": "DataActionPaint",
+            "opacity": 0.5,
+            "brush": {"brushSize": 0.2, "brushSizeSpace": 1, "flow": 0.8,
+                      "stampsEmitter": {"spacing": 0.1, "pressureSizeEnabled": 255}},
+            "sourceColor": [{"@type": "DataSourceUniform", "channelTypes": 1, "color": [1.0, 0.0, 0.0]}],
+            "sourceTransparent": [{"procedural": {"tweaks": [{"identifier": "hardness", "value": 0.9}]}}],
+            "strokes": [{
+                "points": [{"position": [0.1, 0.2]}, {"position": [0.3, 0.4]}],
+                "pressure": [], "viewType": 0, "viewMatrix": zero, "projectionMatrix": zero,
+                "duplicateCount": 1,
+                "duplicateMatrix": [-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            }]
+        });
+        let job = read(&action, 0, 7, false, &|_| vec![Channel::BaseColor]);
+        assert_eq!((job.node, job.opacity, job.hardness), (7, 0.5, 0.9));
+        assert_eq!(job.values, vec![(Channel::BaseColor, [1.0, 0.0, 0.0])]);
+        let s = &job.strokes[0];
+        assert!(s.uv_view && s.points == vec![[0.1, 0.2], [0.3, 0.4]]);
+        assert_eq!(s.mirrors.len(), 1);
+
+        let decal = json!({"hits": [
+            {"@type": "DataDecalHitRect", "position0": [0.1, 0.1], "position1": [0.2, 0.3],
+             "viewType": 0, "projViewInvMatrix": zero, "granularity": 3, "color": [1.0, 1.0, 1.0]},
+            {"@type": "DataDecalHitPunctual", "position": [0.5, 0.5], "viewType": 1,
+             "projViewInvMatrix": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+             "granularity": 0, "color": [0.0, 0.0, 0.0]}
+        ]});
+        let d = read_decal(&decal, 1, 9, true);
+        assert_eq!(d.hits.len(), 2);
+        assert!(d.hits[0].rect && d.hits[0].inv_view_proj.is_none() && d.hits[0].granularity == 3);
+        assert!(
+            !d.hits[1].rect && d.hits[1].inv_view_proj.is_some() && d.hits[1].color == [0.0; 3]
+        );
     }
 }

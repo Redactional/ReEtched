@@ -1609,6 +1609,12 @@ fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
             ui.checkbox(&mut p.repeat, "")
                 .on_hover_text("Off: the image appears once; the fill covers nothing outside it");
             ui.end_row();
+            if p.mode == ProjectionMode::Planar {
+                ui.label("Front faces only");
+                ui.checkbox(&mut p.front_only, "")
+                    .on_hover_text("Skip surfaces facing away from the projector");
+                ui.end_row();
+            }
             if !p.mode.is_uv() {
                 ui.label("Size");
                 ui.add(

@@ -5,7 +5,11 @@
 //! Painter's numeric codes (channel bits, blend modes, projections) were
 //! matched up from the user's own projects; see docs/spp-format.md.
 
-use crate::{container::Container, document, image, strokes::PaintJob};
+use crate::{
+    container::Container,
+    document, image,
+    strokes::{DecalJob, PaintJob},
+};
 use anyhow::{Context, Result};
 use reetched_doc::{
     BlendMode, Channel, ChannelBlend, Document, Fill, Mask, MaskBackground, MeshMap, Node,
@@ -110,8 +114,8 @@ struct Ctx<'a> {
     images: HashMap<String, Option<ResourceId>>,
     /// Dataset names in `resources/`.
     resource_names: Vec<String>,
-    /// Paint actions to replay, in order.
-    jobs: Vec<PaintJob>,
+    /// Paint actions and polygon fills to replay, in Painter's order.
+    jobs: Vec<Job>,
     /// Set being converted (index and name), and its channels.
     set_index: usize,
     set: String,
@@ -222,21 +226,35 @@ impl Ctx<'_> {
             };
             let mut mask = Mask::new(background);
             mask.enabled = int(l, "maskEnabled") != 0;
-            self.mask_actions(&l["maskActions"], node.id);
+            self.mask_actions(&l["maskActions"], node.id, &mut mask);
             node.mask = Some(mask);
         }
         node
     }
 
-    /// Paint actions become jobs; counts what isn't converted.
-    fn mask_actions(&mut self, actions: &Value, node: reetched_doc::NodeId) {
+    /// Paint actions become jobs, Light fills and Levels filters become mask
+    /// effects; counts what isn't converted.
+    fn mask_actions(&mut self, actions: &Value, node: reetched_doc::NodeId, mask: &mut Mask) {
         for a in items(actions).iter().filter(|a| !a.is_null()) {
             match ty(a) {
-                "DataActionGroup" => self.mask_actions(&a["subStack"], node),
+                "DataActionGroup" => self.mask_actions(&a["subStack"], node, mask),
                 "DataActionPaint" | "DataActionEraser" => self.job(a, node, true),
                 "DataActionSmudge" => self.note("smudge strokes (not replayed)"),
-                "DataActionFill" => self.note("fills inside masks"),
-                "DataActionDecal" => self.note("mask decals"),
+                "DataActionFill" => match mask_light(a) {
+                    Some(fx) if mask.effects.len() < reetched_doc::MAX_MASK_EFFECTS => {
+                        mask.effects.push(fx)
+                    }
+                    _ => self.note("fills inside masks"),
+                },
+                "DataActionFilterLevels" if mask.effects.len() < reetched_doc::MAX_MASK_EFFECTS => {
+                    mask.effects.push(mask_levels(a))
+                }
+                "DataActionDecal" => {
+                    let d = crate::strokes::read_decal(a, self.set_index, node, true);
+                    if !d.hits.is_empty() {
+                        self.jobs.push(Job::Decal(d));
+                    }
+                }
                 t if t.starts_with("DataActionFilter") => self.note("mask filters and generators"),
                 _ => self.note("other mask effects"),
             }
@@ -247,7 +265,7 @@ impl Ctx<'_> {
         let all = self.set_channels.clone();
         let job = crate::strokes::read(action, self.set_index, node, mask, &|m| channels(m, &all));
         if !job.strokes.is_empty() {
-            self.jobs.push(job);
+            self.jobs.push(Job::Paint(job));
         }
     }
 
@@ -340,6 +358,81 @@ impl Ctx<'_> {
     }
 }
 
+/// A mask action's blend and opacity (Painter keeps them per channel; masks use the first).
+fn mask_blend(a: &Value) -> (reetched_doc::MaskBlend, f32) {
+    let b = a["perChannelBlending"]
+        .as_array()
+        .and_then(|l| l.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let blend = match blend_mode(int(&b, "blendingMode")).map(|(m, _)| m) {
+        Some(BlendMode::Multiply) => reetched_doc::MaskBlend::Multiply,
+        Some(BlendMode::LinearDodge) => reetched_doc::MaskBlend::Add,
+        Some(BlendMode::Subtract) => reetched_doc::MaskBlend::Subtract,
+        Some(BlendMode::Darken) => reetched_doc::MaskBlend::Min,
+        Some(BlendMode::Lighten | BlendMode::Screen) => reetched_doc::MaskBlend::Max,
+        _ => reetched_doc::MaskBlend::Normal,
+    };
+    (blend, float(&b, "opacity", 1.0))
+}
+
+/// Painter's Light generator in a mask, as our Light generator.
+fn mask_light(a: &Value) -> Option<reetched_doc::MaskEffect> {
+    let src = a["sources"].as_array()?.iter().find(|s| {
+        s["@type"] == "DataSourceProcedural"
+            && s["procedural"]["urlToSbsRes"]
+                .as_str()
+                .is_some_and(|u| u.contains("/light/light"))
+    })?;
+    let tweak = |name: &str, default: f32| {
+        src["procedural"]["tweaks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["identifier"] == name)
+            .map_or(default, |t| float(t, "value", default))
+    };
+    let mut g = reetched_doc::Generator::new(reetched_doc::GeneratorKind::Light);
+    // ponytail: the light model is a half-Lambert approximation of Painter's
+    // generator; attenuation becomes the transition width.
+    g.light = [
+        tweak("Horizontal_Angle", 0.25),
+        tweak("Vertical_Angle", 0.5),
+    ];
+    g.contrast = tweak("light_attenuation", 0.25).max(0.01);
+    g.invert = tweak("invert", 0.0) != 0.0;
+    let (blend, opacity) = mask_blend(a);
+    let mut fx = reetched_doc::MaskEffect::new(reetched_doc::MaskEffectKind::Generator(g));
+    fx.blend = blend;
+    fx.opacity = opacity * float(src, "opacity", 1.0);
+    Some(fx)
+}
+
+/// A Levels filter in a mask.
+fn mask_levels(a: &Value) -> reetched_doc::MaskEffect {
+    let l = &a["levels"];
+    let first = |k: &str, d: f32| {
+        l[k].as_f64()
+            .or_else(|| {
+                l[k].as_array()
+                    .and_then(|v| v.first())
+                    .and_then(Value::as_f64)
+            })
+            .map_or(d, |v| v as f32)
+    };
+    let (blend, opacity) = mask_blend(a);
+    let mut fx = reetched_doc::MaskEffect::new(reetched_doc::MaskEffectKind::Levels {
+        in_min: first("inputMinimum", 0.0),
+        in_max: first("inputMaximum", 1.0),
+        gamma: first("gamma", 1.0),
+        out_min: first("outputMinimum", 0.0),
+        out_max: first("outputMaximum", 1.0),
+    });
+    fx.blend = blend;
+    fx.opacity = opacity;
+    fx
+}
+
 fn default_source(c: Channel) -> reetched_doc::ChannelSource {
     reetched_doc::ChannelSource {
         enabled: false,
@@ -379,7 +472,18 @@ fn projection(f: &Value) -> Projection {
         p.rotation3d_deg = floats::<3>(f, "dddEulerAngles")
             .unwrap_or([0.0; 3])
             .map(f32::to_degrees);
-        p.size = floats::<3>(f, "dddSize").map_or(1.0, |s| s[0]);
+        // Planar images can be non-square: size covers the width, the scale the height.
+        // dddSize holds half-extents.
+        let size = floats::<3>(f, "dddSize")
+            .unwrap_or([0.5; 3])
+            .map(|v| 2.0 * v);
+        p.size = size[0].max(1e-4);
+        if p.mode == ProjectionMode::Planar {
+            let sy = size[1].max(1e-4);
+            p.scale = [p.scale[0], p.scale[1] * p.size / sy];
+            p.offset = [0.5 - 0.5 * p.scale[0], 0.5 - 0.5 * p.scale[1]];
+            p.front_only = int(f, "backfaceCulling") != 0;
+        }
         p.hardness = float(f, "sideHardness", 0.5);
     }
     p
@@ -388,27 +492,32 @@ fn projection(f: &Value) -> Projection {
 /// Baked mesh map by its resource name ("Ambient Occlusion Map from Mesh Rings").
 fn mesh_map(name: &str) -> Option<MeshMap> {
     let n = name.to_ascii_lowercase();
-    Some(if n.contains("world space normal") {
-        MeshMap::WorldNormal
-    } else if n.contains("normal") {
-        MeshMap::Normal
-    } else if n.contains("ambient occlusion") || n.ends_with("_ao") {
-        MeshMap::AmbientOcclusion
-    } else if n.contains("curvature") || n.ends_with("_curve") || n.ends_with("_curvature") {
-        MeshMap::Curvature
-    } else if n.contains("position") {
-        MeshMap::Position
-    } else if n.contains("thickness") {
-        MeshMap::Thickness
-    } else if n.contains("color map") || n.contains(" id") {
-        MeshMap::Id
-    } else if n.contains("height") {
-        MeshMap::Height
-    } else if n.contains("opacity") {
-        MeshMap::Opacity
-    } else {
-        return None;
-    })
+    Some(
+        if n.contains("world space normal")
+            || n.ends_with("normalobj")
+            || n.contains("world normal")
+        {
+            MeshMap::WorldNormal
+        } else if n.contains("normal") {
+            MeshMap::Normal
+        } else if n.contains("ambient occlusion") || n.ends_with("_ao") {
+            MeshMap::AmbientOcclusion
+        } else if n.contains("curvature") || n.ends_with("_curve") || n.ends_with("_curvature") {
+            MeshMap::Curvature
+        } else if n.contains("position") {
+            MeshMap::Position
+        } else if n.contains("thickness") {
+            MeshMap::Thickness
+        } else if n.contains("color map") || n.contains(" id") {
+            MeshMap::Id
+        } else if n.contains("height") {
+            MeshMap::Height
+        } else if n.contains("opacity") {
+            MeshMap::Opacity
+        } else {
+            return None;
+        },
+    )
 }
 
 /// The mesh part for texture set `name`: same name, else a name containing
@@ -433,9 +542,87 @@ fn match_part(parts: &[String], name: &str, sets: usize) -> Option<usize> {
 }
 
 /// A converted project, and the paint strokes still to replay onto it.
+/// Something to paint after loading.
+pub enum Job {
+    Paint(PaintJob),
+    Decal(DecalJob),
+}
+
 pub struct Converted {
     pub imported: Imported,
-    pub jobs: Vec<PaintJob>,
+    pub jobs: Vec<Job>,
+    /// The "Painter result" layer of each texture set (set index, node).
+    pub result_layers: Vec<(usize, reetched_doc::NodeId)>,
+}
+
+pub const RESULT_LAYER: &str = "Painter result";
+
+/// A fill layer holding Painter's own computed channels, so the converted
+/// project looks like Painter's even where the rebuilt layers don't match yet.
+fn result_layer(cx: &mut Ctx, set_name: &str, refs: &[Reference]) -> Option<Node> {
+    if refs.is_empty() {
+        return None;
+    }
+    let mut fill = Fill::new([0.5; 3], 0.0, 0.5);
+    for s in fill.channels.values_mut() {
+        s.enabled = false;
+    }
+    for r in refs {
+        let (w, h) = (r.width, r.height);
+        let q16 = |v: f32| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let img = match r.channel {
+            Channel::BaseColor => {
+                ::image::DynamicImage::ImageRgb8(::image::ImageBuffer::from_fn(w, h, |x, y| {
+                    let p = r.pixels[(y * w + x) as usize];
+                    ::image::Rgb(p.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
+                }))
+            }
+            Channel::Normal => {
+                ::image::DynamicImage::ImageRgb16(::image::ImageBuffer::from_fn(w, h, |x, y| {
+                    ::image::Rgb(r.pixels[(y * w + x) as usize].map(q16))
+                }))
+            }
+            // Our height bitmaps put 0 at mid-grey.
+            Channel::Height => {
+                ::image::DynamicImage::ImageLuma16(::image::ImageBuffer::from_fn(w, h, |x, y| {
+                    ::image::Luma([q16(r.pixels[(y * w + x) as usize][0] + 0.5)])
+                }))
+            }
+            _ => ::image::DynamicImage::ImageLuma8(::image::ImageBuffer::from_fn(w, h, |x, y| {
+                ::image::Luma([
+                    (r.pixels[(y * w + x) as usize][0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ])
+            })),
+        };
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        if img.write_to(&mut bytes, ::image::ImageFormat::Png).is_err() {
+            continue;
+        }
+        let id = cx.resources.add(bytes.into_inner());
+        cx.doc.resources.insert(
+            id.clone(),
+            ResourceInfo {
+                name: format!("{set_name} Painter {}.png", r.channel.id()),
+            },
+        );
+        let s = fill
+            .channels
+            .entry(r.channel)
+            .or_insert_with(|| default_source(r.channel));
+        s.enabled = true;
+        s.bitmap = Some(id);
+    }
+    let mut node = cx.doc.new_fill(RESULT_LAYER.into(), fill);
+    for r in refs {
+        node.blend.insert(
+            r.channel,
+            ChannelBlend {
+                mode: BlendMode::Replace,
+                opacity: 1.0,
+            },
+        );
+    }
+    Some(node)
 }
 
 /// Converts the project at `path`.
@@ -460,6 +647,7 @@ pub fn convert(path: &Path) -> Result<Converted> {
     };
     cx.doc.mesh_source = Some(path.display().to_string());
     let mut references = Vec::new();
+    let mut result_layers = Vec::new();
     let materials = tree["materials"].as_array().cloned().unwrap_or_default();
     for m in &materials {
         let name = m["sceneMaterialName"].as_str().unwrap_or("").to_owned();
@@ -526,19 +714,30 @@ pub fn convert(path: &Path) -> Result<Converted> {
         }
         // Painter's own computed channels for this set.
         let uid = m["sceneMaterialUID"].as_u64().unwrap_or(0).to_string();
-        references.extend(references_for(&c, &uid, index));
+        let refs = references_for(&c, &uid, index);
+        if let Some(node) = result_layer(&mut cx, &name, &refs) {
+            result_layers.push((index, node.id));
+            cx.doc.texture_sets[index].stack.insert(0, node);
+        }
+        references.extend(refs);
     }
     cx.log.insert(
         0,
         format!("Painter document version {version}; layers, fills, blending and masks converted"),
     );
-    let strokes: usize = cx.jobs.iter().map(|j| j.strokes.len()).sum();
+    let (mut paints, mut strokes, mut fills) = (0, 0, 0);
+    for j in &cx.jobs {
+        match j {
+            Job::Paint(p) => {
+                paints += 1;
+                strokes += p.strokes.len();
+            }
+            Job::Decal(d) => fills += d.hits.len(),
+        }
+    }
     cx.log.insert(
         1,
-        format!(
-            "{} paint actions with {strokes} strokes to replay",
-            cx.jobs.len()
-        ),
+        format!("{paints} paint actions ({strokes} strokes) and {fills} polygon fills to replay"),
     );
     let Ctx {
         doc,
@@ -557,6 +756,7 @@ pub fn convert(path: &Path) -> Result<Converted> {
             references,
         },
         jobs,
+        result_layers,
     })
 }
 
@@ -633,5 +833,48 @@ mod tests {
         assert_eq!(match_part(&parts, "Body", 2), Some(0));
         assert_eq!(match_part(&parts, "Zipper", 2), Some(1));
         assert_eq!(match_part(&parts, "Hood", 2), None);
+    }
+
+    #[test]
+    fn mask_effects_and_planar_projections() {
+        use serde_json::json;
+        let light = json!({
+            "perChannelBlending": [{"blendingMode": 4, "channelTypes": 0, "opacity": 0.5}],
+            "sources": [{"@type": "DataSourceProcedural", "opacity": 1.0, "procedural": {
+                "urlToSbsRes": "resource://starter_assets/light/light?version=1",
+                "tweaks": [
+                    {"identifier": "Horizontal_Angle", "value": 0.75},
+                    {"identifier": "Vertical_Angle", "value": -0.25},
+                    {"identifier": "light_attenuation", "value": 0.35},
+                    {"identifier": "invert", "value": 1}
+                ]}}]
+        });
+        let fx = mask_light(&light).expect("a Light generator");
+        assert_eq!(
+            (fx.blend, fx.opacity),
+            (reetched_doc::MaskBlend::Multiply, 0.5)
+        );
+        let reetched_doc::MaskEffectKind::Generator(g) = fx.kind else {
+            panic!("generator");
+        };
+        assert_eq!(g.kind, reetched_doc::GeneratorKind::Light);
+        assert_eq!(g.light, [0.75, -0.25]);
+        assert!(g.invert && (g.contrast - 0.35).abs() < 1e-6);
+        let levels = mask_levels(
+            &json!({"levels": {"inputMinimum": 0.2, "inputMaximum": 0.8, "gamma": 1.5}}),
+        );
+        assert!(
+            matches!(levels.kind, reetched_doc::MaskEffectKind::Levels { in_min, .. } if (in_min - 0.2).abs() < 1e-6)
+        );
+
+        // A planar decal: half-extents, non-square, front faces only, no repeat.
+        let p = projection(&json!({
+            "projection": 7, "uvSamplingWrap": 0, "backfaceCulling": 255,
+            "dddSize": [0.3, 0.15, 0.2], "dddPosition": [0.0, 0.5, 0.1], "dddEulerAngles": [0.0, 0.0, 0.0]
+        }));
+        assert_eq!(p.mode, ProjectionMode::Planar);
+        assert!(p.front_only && !p.repeat);
+        assert!((p.size - 0.6).abs() < 1e-6 && (p.scale[1] - 2.0).abs() < 1e-5);
+        assert!((p.offset[1] + 0.5).abs() < 1e-5);
     }
 }

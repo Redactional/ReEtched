@@ -650,6 +650,9 @@ pub struct Projection {
     /// outside it (UV, warp and planar projections).
     #[serde(default = "default_true")]
     pub repeat: bool,
+    /// Planar: only surfaces facing the projector (no copy through to the back).
+    #[serde(default)]
+    pub front_only: bool,
 }
 
 fn default_true() -> bool {
@@ -670,6 +673,7 @@ impl Default for Projection {
             mirror: [false; 3],
             warp: warp_identity(),
             repeat: true,
+            front_only: false,
         }
     }
 }
@@ -900,16 +904,19 @@ pub enum GeneratorKind {
     Thickness,
     /// Procedural noise only.
     Noise,
+    /// Lit by a directional light (half-Lambert on the surface normal).
+    Light,
 }
 
 impl GeneratorKind {
-    pub const ALL: [GeneratorKind; 6] = [
+    pub const ALL: [GeneratorKind; 7] = [
         GeneratorKind::EdgeWear,
         GeneratorKind::Cavity,
         GeneratorKind::AmbientOcclusion,
         GeneratorKind::PositionGradient,
         GeneratorKind::Thickness,
         GeneratorKind::Noise,
+        GeneratorKind::Light,
     ];
 
     pub fn label(self) -> &'static str {
@@ -920,6 +927,7 @@ impl GeneratorKind {
             GeneratorKind::PositionGradient => "Position gradient",
             GeneratorKind::Thickness => "Thin areas",
             GeneratorKind::Noise => "Noise",
+            GeneratorKind::Light => "Light",
         }
     }
 
@@ -930,7 +938,7 @@ impl GeneratorKind {
             GeneratorKind::AmbientOcclusion => Some(MeshMap::AmbientOcclusion),
             GeneratorKind::PositionGradient => Some(MeshMap::Position),
             GeneratorKind::Thickness => Some(MeshMap::Thickness),
-            GeneratorKind::Noise => None,
+            GeneratorKind::Noise | GeneratorKind::Light => None,
         }
     }
 }
@@ -949,6 +957,13 @@ pub struct Generator {
     /// Position gradient axis: 0 = X, 1 = Y, 2 = Z.
     pub axis: u8,
     pub invert: bool,
+    /// Light: direction as (horizontal turns 0..1, vertical -1..1 = straight down..up).
+    #[serde(default = "default_light")]
+    pub light: [f32; 2],
+}
+
+fn default_light() -> [f32; 2] {
+    [0.25, 0.5]
 }
 
 impl Generator {
@@ -960,6 +975,7 @@ impl Generator {
             GeneratorKind::PositionGradient => (0.5, 0.3, 0.1),
             GeneratorKind::Thickness => (0.5, 0.2, 0.1),
             GeneratorKind::Noise => (0.5, 0.15, 1.0),
+            GeneratorKind::Light => (0.5, 0.25, 0.0),
         };
         Self {
             kind,
@@ -969,6 +985,7 @@ impl Generator {
             noise_scale: 6.0,
             axis: 1,
             invert: false,
+            light: default_light(),
         }
     }
 }

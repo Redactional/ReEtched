@@ -74,8 +74,30 @@ impl State {
         let references = converted.imported.references.clone();
         self.apply_imported(converted.imported, name, "Painter project");
         self.replay_strokes(&converted.jobs);
+        // Check the rebuilt layers, not Painter's own result on top of them.
+        let show = |s: &mut Self, on: bool| {
+            for &(set, id) in &converted.result_layers {
+                if let Some(n) = s
+                    .doc
+                    .texture_sets
+                    .get_mut(set)
+                    .and_then(|t| reetched_doc::find_node_mut(&mut t.stack, id))
+                {
+                    n.visible = on;
+                }
+            }
+        };
+        show(self, false);
+        let checks = self.report_checks(&references, "Painter project");
+        show(self, true);
+        if !converted.result_layers.is_empty() {
+            self.info(format!(
+                "The top layer “{}” is Painter's own result; hide it to see and edit the rebuilt layers",
+                reetched_spp::convert::RESULT_LAYER
+            ));
+        }
         self.history = reetched_doc::history::History::new(&self.doc);
-        self.report_checks(&references, "Painter project")
+        checks
     }
 
     /// Shows an imported project, logs what didn't carry over and checks it
@@ -124,7 +146,7 @@ impl State {
     }
 
     /// Re-composites the document and compares it with Painter's exports.
-    fn verify(&mut self, refs: &[Reference]) -> Vec<Check> {
+    pub(crate) fn verify(&mut self, refs: &[Reference]) -> Vec<Check> {
         for w in self.viewport.sync(
             &self.device,
             &self.queue,

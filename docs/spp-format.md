@@ -82,14 +82,29 @@ mean defaults (fields differ between versions).
 - **Fill projection**: 0 UV, 2 tri-planar, 7 planar; 6 appears for
   generators in masks (treated as UV). `uvSamplingWrap` 0 = the image
   appears once. UV transform: Painter scales and rotates about the image
-  center, which `translation` moves from (0.5, 0.5).
-- **Strokes**: `DataStroke.points` are normalized view positions (y down) with
-  the view's `viewMatrix` / `projectionMatrix` (column-major), in the
-  normalized mesh space. `duplicateMatrix` (with `duplicateCount`) is the
-  symmetry copy. 2D-view strokes (`viewType` 0) store no camera; their points
-  are 2D view positions whose mapping to UVs isn't known yet. Brushes are
-  Painter's round "shape" brush with a `hardness` tweak; `brushSize` (size
-  space 1) is relative to the normalized scene.
+  center, which `translation` moves from (0.5, 0.5). Planar: `dddSize` holds
+  half-extents (non-square images), `dddEulerAngles` are radians, and
+  `backfaceCulling` keeps the image off surfaces facing away.
+- **Strokes**: `DataStroke.points` are normalized view positions (**y up**)
+  with the view's `viewMatrix` / `projectionMatrix` (column-major, square
+  aspect), in the normalized mesh space. `duplicateMatrix` (with
+  `duplicateCount`) is the symmetry copy, an object-space mirror even for
+  2D-view strokes. 2D-view strokes (`viewType` 0) store all-zero matrices and
+  their points are UVs. Brushes are Painter's round "shape" brush with a
+  `hardness` tweak; `brushSize` (size space 1) is relative to the normalized
+  scene (radius ≈ half the size) or, in the 2D view, to the UV square.
+- **Polygon Fill** (`DataActionDecal`): `hits` are clicks
+  (`DataDecalHitPunctual.position`) and rectangles (`DataDecalHitRect`
+  `position0/1`), in the same coordinates as stroke points, with the inverse
+  view-projection in `projViewInvMatrix` (all zero for 2D-view hits, whose
+  positions are UVs). `granularity`: 0 triangle, 1 polygon, 2 mesh, 3 UV
+  island; `color` is the fill value.
+- **Mask generators**: Painter's Light generator (`light.sbsar`, the most
+  used) takes the baked world normal and position maps and `Horizontal_Angle`
+  (turns), `Vertical_Angle` (-1..1), `light_attenuation`, `invert`. Baked
+  maps named `…normalobj` are world-space normals.
+- **Painter's result**: `texture-cache` holds the final channels per texture
+  set; the converter puts them in a top "Painter result" layer.
 
 ## Provenance
 

@@ -2887,6 +2887,20 @@ assert r.all_files(), r
         files.sort();
         for path in files {
             let checks = h.app.state.import_spp(&path);
+            // With Painter's result layer on top, the composite is Painter's.
+            let refs = reetched_spp::convert::convert(&path)
+                .unwrap()
+                .imported
+                .references;
+            for c in h.app.state.verify(&refs) {
+                assert!(
+                    c.mean < 0.02,
+                    "{}: with the Painter result layer, {} differs by {}",
+                    path.display(),
+                    c.channel.label(),
+                    c.mean
+                );
+            }
             let s = &h.app.state;
             for l in s.log.iter().filter(|l| l.text.contains("troke")) {
                 eprintln!("    log: {}", l.text);
@@ -2894,11 +2908,16 @@ assert r.all_files(), r
             assert!(!s.doc.texture_sets.is_empty(), "{}", path.display());
             eprintln!("{}", path.file_name().unwrap().to_string_lossy());
             // Side-by-side images (ours | Painter's) for looking at differences.
+            // (ours without Painter's result layer | Painter's)
             if let Some(out) = std::env::var_os("REETCHED_SPP_OUT") {
-                let refs = reetched_spp::convert::convert(&path)
-                    .unwrap()
-                    .imported
-                    .references;
+                for set in &mut h.app.state.doc.texture_sets {
+                    for n in &mut set.stack {
+                        if n.name == reetched_spp::convert::RESULT_LAYER {
+                            n.visible = false;
+                        }
+                    }
+                }
+                h.app.state.verify(&refs);
                 let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
                 for r in refs.iter().filter(|r| {
                     matches!(

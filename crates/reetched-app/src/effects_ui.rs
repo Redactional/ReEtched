@@ -156,6 +156,14 @@ pub fn mask_effects_ui(
                                     });
                                     ui.end_row();
                                 }
+                                if g.kind == GeneratorKind::Light {
+                                    ui.label("Light direction");
+                                    ui.add(Slider::new(&mut g.light[0], 0.0..=1.0).text("around"));
+                                    ui.end_row();
+                                    ui.label("");
+                                    ui.add(Slider::new(&mut g.light[1], -1.0..=1.0).text("height"));
+                                    ui.end_row();
+                                }
                                 ui.label("Invert");
                                 ui.checkbox(&mut g.invert, "");
                                 ui.end_row();
