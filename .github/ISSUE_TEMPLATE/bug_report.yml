@@ -1,0 +1,80 @@
+name: Bug report
+description: Something doesn't work, crashes or looks wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! A clear description and steps to reproduce make bugs much faster to fix.
+        Please check the [open issues](https://github.com/Redactional/ReEtched/issues) first in case it's already known.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+      placeholder: When I bake ambient occlusion on a mesh with UDIM tiles, the second tile comes out black. I expected...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. File > New project with ...
+        2. Bake mesh maps with ...
+        3. See ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Painting and tools
+        - Layers, masks and effects
+        - Baking
+        - Materials and Substance graphs
+        - Viewport, rendering and color
+        - Import and export
+        - Painter project (.spp) conversion
+        - Python scripting
+        - Interface and settings
+        - Crash or freeze
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ReEtched version
+      description: Shown at the right of the status bar and in Help > About.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Shown at the right of the status bar, for example "NVIDIA GeForce RTX 3070 (Vulkan)".
+  - type: textarea
+    id: log
+    attributes:
+      label: Debug log
+      description: Turn on Settings > Developer > Show the console window, reproduce the problem and paste what it printed.
+      render: text
+  - type: textarea
+    id: files
+    attributes:
+      label: Screenshots or files
+      description: Drag images or a small mesh here. Please only attach files you're allowed to share.

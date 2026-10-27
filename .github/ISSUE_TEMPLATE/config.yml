@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installing or updating with ReLauncher
+    url: https://github.com/Redactional/ReLauncher/issues/new/choose
+    about: Problems installing, updating or launching ReEtched through ReLauncher.
+  - name: Coming from Substance Painter
+    url: https://github.com/Redactional/ReEtched/blob/main/docs/migrating-from-painter.md
+    about: What converts from Painter and what works differently.
+  - name: Security issue
+    url: https://github.com/Redactional/ReEtched/security/policy
+    about: Please report security problems privately.

@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a new feature or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the idea! Describing the problem you're solving helps more than a finished design.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: The task or workflow that's hard or impossible today.
+      placeholder: I'd like to paint across several texture sets in one stroke, because...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: How could ReEtched help?
+      description: What you imagine. If Substance Painter or another tool does this well, describe how.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Painting and tools
+        - Layers, masks and effects
+        - Baking
+        - Materials and Substance graphs
+        - Viewport, rendering and color
+        - Import and export
+        - Painter project (.spp) conversion
+        - Python scripting
+        - Interface and settings
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Mockups, examples or links.

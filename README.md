@@ -1,125 +1,119 @@
-# ReEtched
+<p align="center">
+  <img src="assets/icons/ReEtched_1024.png" alt="ReEtched" width="150">
+</p>
 
-An open-source 3D texture painter written in Rust, in the spirit of Adobe Substance 3D Painter — with the goal of opening your existing Painter projects and assets instead of making you start over.
+<h1 align="center">ReEtched</h1>
 
-> **Status: early development (Phase 7 of 9 done).** You can bake mesh maps, paint and texture a model (UDIM tiles included) with layers, procedural and smart materials, shade it with metal/rough, Adobe Standard Material, OpenPBR or your own Painter GLSL shaders under OCIO color management, preview it with a GPU path tracer, open Substance Designer `.sbs` graphs and Painter projects (through a Painter plugin), automate it all with Python, save projects and export game-ready textures, PSDs and USD/OBJ meshes. See the [roadmap](docs/PLAN.md).
+<p align="center">
+  <b>Open-source 3D texture painting.</b><br>
+  Paint, bake and texture your models, and bring your Substance Painter projects with you.
+</p>
 
-## What works today
+<p align="center">
+  <a href="https://github.com/Redactional/ReEtched/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Redactional/ReEtched?label=release&color=4a90d9"></a>
+  <a href="https://github.com/Redactional/ReEtched/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Redactional/ReEtched/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-555">
+  <a href="#license"><img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-555"></a>
+</p>
 
-- Load **FBX, OBJ, glTF/GLB** meshes; each material becomes a texture set, like in Painter. Meshes without UVs are unwrapped automatically
-- **Reimport mesh** (File menu): swap in a changed mesh and keep the paint, re-projected onto the new UVs
-- Painter-style interface: tool strip, Assets, 3D and 2D (UV) views, Texture Set List, Layers, Properties — every panel can be dragged, re-docked, closed and restored from the **Window** menu
-- PBR (metal/rough) 3D view with HDR image-based lighting, emissive, opacity (cutout or blended), parallax displacement from height, ACES/AgX/Khronos Neutral tone mapping, bloom, vignette, progressive anti-aliasing, wireframe, perspective/orthographic cameras and solo-channel view modes
-- 2D UV view of the selected texture set
-- **Painting** on the model or in the 2D view: paint layers and paint inside masks, eraser, size/flow/stroke opacity/spacing/hardness/angle, image alphas, backface culling, mirror and radial symmetry, lazy mouse, Shift+click lines, pen pressure (**1** paint, **2** eraser, **[ ]** size)
-- **Projection** (**3**): load an image, place it over the 3D view (Ctrl+drag, size, rotation) and paint it onto the model
-- **Polygon Fill** (**4**): fill a triangle, flat polygon, UV island or whole mesh with a click, or every front face in a dragged rectangle (Ctrl erases); **Smudge** (**5**); **Clone** (**6**, Ctrl+click sets the source); **Path** (**7**): click points, Enter paints along a smooth curve through them
-- **Layer stack** like Painter's: paint layers, fill layers and folders, every blend mode, blend mode and opacity per channel, white/black/image/painted masks, drag to reorder
-- Channels: base color, metallic, roughness, normal, height, emissive, opacity
-- Fill layers with a color or image per channel (per-image sRGB/linear color space) and UV, tri-planar, planar, spherical or cylindrical projection, with optional symmetry
-- **Baking** (Texture Set Settings → Mesh maps → Bake…): normal (high to low, with cage distances), world-space normal, ID, ambient occlusion, curvature, position, thickness, height and opacity, with antialiasing and dilation; or import maps you baked in Painter (`TextureSetName_MeshMapName` naming)
-- **Mask effects**: generators driven by the mesh maps (edge wear, cavity, AO, position gradient, thickness, noise), Levels and Color Selection (pick ID colors on the model)
-- **Smart materials**: built-ins (Painted Steel Worn, Rusty Iron, Dusty Plastic, Gold Grime), save any layer or folder as a `.rsm` file and import it into other projects
-- View modes for every baked mesh map
-- **Procedural materials**: a built-in library (brushed steel, plastic, wood planks, fabric, concrete, rust, leather, bricks) with editable parameters, rendered in the background at any resolution
-- **Painter `.spp` projects without Painter** (File > Import Painter project, or drag and drop; read-only, the `.spp` is never changed): texture sets, channels, the layer stack with folders, fills (colors and images, UV/tri-planar/planar), blending, opacity and masks, baked mesh maps and the mesh, with paint replayed from the stored brush strokes and polygon fills, and Painter's Light mask generator. A top "Painter result" layer holds Painter's own final channels, so the project looks right immediately; hide it to work on the rebuilt layers, which are checked against Painter's output on import. Procedural (`.sbsar`) fills, most filters, smudge strokes and text aren't converted yet, and stroke replay is approximate (see [the format notes](docs/spp-format.md))
-- **Painter projects through Painter**: the [ReEtched Bridge](tools/painter-bridge) plugin exports a project from Painter 10+; File > Import Painter bridge rebuilds its layer stack (blend modes, opacities, masks, fills) with paint as editable pixels, then checks the result against Painter's own export. The plugin has not been tried in Painter yet
-- **Substance Designer `.sbs` graphs**: import them (File menu, Assets panel or drag and drop) and use them as fill layers with their own parameters — no Adobe software needed. Graphs that use Designer's `sbs://` library need Substance Designer installed; anything missing is reported
-- Built-in material presets — double-click or drag them onto the model, a texture set or the layer stack to add a fill layer
-- **Projects** (`.retx`): save and reopen everything, including the mesh and images; undo/redo
-- **Texture export** with presets for Unreal, Unity HDRP/URP, glTF, Blender and Godot; channel packing, padding, PNG/TGA/TIFF/EXR; import and save Painter export presets (`.spexp`)
-- **Mesh export** as USD (`.usda`, UsdPreviewSurface materials) or OBJ + MTL, with its textures and optional displacement from the height channel
-- **Layered PSD export**: one Photoshop file per texture set and channel, keeping layers, folders, masks, blend modes and opacities
-- Load your own **.hdr / .exr** environment maps
-- **Path tracer** (Display settings → Renderer): a GPU path tracer for the material view, with image-based lighting, reflections, shadows, bounce light, cutout opacity and depth of field, refining while the view stays still
-- **Python scripting** with your own Python 3.8+ install: a console, script files, plugins with their own menu entries, and an API for projects, texture sets, layers, resources, export, baking and display settings (see [Python scripting](crates/reetched-script/README.md))
-- **Asset library**: point Settings at your folders of textures, environments, alphas, brushes, smart materials and masks, Substance graphs, shaders, OCIO configs, templates and meshes; search, tags, favorites and thumbnails, updated as files change on disk. Save brush presets and smart masks into it
-- **Autosave and crash recovery**, Save and compact (drops unused images), recent projects, and **project templates** (New project, Ctrl+N) with built-ins for PBR metal/rough, ASM, OpenPBR, Unreal, Unity HDRP and mobile
-- Layer and mask thumbnails in the layer stack, a GPU memory budget for cached textures, and a shader pipeline cache
-- Painter-style navigation and shortcuts by default (**Alt+LMB** orbit, **MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame), or a Blender-style keymap (**MMB** orbit, **Shift+MMB** pan, **Ctrl+MMB** zoom, **Home** to frame); every shortcut can be rebound in Settings
-- A welcome screen at startup (new, open or import a project, or pick a recent one), an interface size setting (75–200 %), a Help menu, and an optional startup check for new releases (it only tells you; nothing is downloaded)
-- Coming from Painter? See [the migration guide](docs/migrating-from-painter.md)
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#features">Features</a> ·
+  <a href="docs/migrating-from-painter.md">Coming from Painter</a> ·
+  <a href="https://github.com/Redactional/ReEtched/issues/new/choose">Report a bug</a>
+</p>
 
-## Building
+---
 
-You need a recent stable [Rust toolchain](https://rustup.rs) (1.88+) and a C compiler (the FBX loader is C):
+ReEtched is a full texturing app for game and film assets: a layer stack with masks and smart materials, a mesh map baker, procedural materials, a real-time PBR viewport and a GPU path tracer. It looks and works like Substance 3D Painter, keyboard shortcuts included, so you can start right away. It's free, open source and runs on Windows, macOS and Linux.
 
-- **Windows:** Visual Studio Build Tools with "Desktop development with C++"
-- **macOS:** `xcode-select --install`
-- **Linux:** `gcc` or `clang`
+## Download
+
+**The easy way: [ReLauncher](https://github.com/Redactional/ReLauncher).** It installs ReEtched, keeps it up to date and sets up everything it needs.
+
+Or grab an installer from the [latest release](https://github.com/Redactional/ReEtched/releases/latest):
+
+| System | Download |
+|---|---|
+| Windows 10 / 11 (64-bit) | Installer (`.exe`) |
+| macOS (Apple Silicon) | Disk image (`.dmg`) |
+| Linux (x86-64) | `.deb` package or `.AppImage` |
+
+Portable `.zip` builds for each system are on the release page too.
+
+### System requirements
+
+- A GPU with Vulkan, Metal or DirectX 12 support. A dedicated GPU is recommended for 4K texture sets.
+- Optional: [Python 3.8 or newer](https://www.python.org/downloads/) for scripts and plugins.
+
+## Features
+
+### Painting
+- Paint on the model or in the 2D UV view, with pen pressure, mirror and radial symmetry, lazy mouse and image alphas.
+- Tools: **Paint**, **Eraser**, **Projection**, **Polygon Fill** (triangles, polygons, UV islands or the whole mesh), **Smudge**, **Clone** and **Path**.
+- UDIM tiles.
+
+### Layers and materials
+- A Painter-style layer stack: paint and fill layers, folders, every blend mode, and blending and opacity per channel.
+- Masks painted by hand, from images, or generated from the mesh maps: edge wear, cavity, ambient occlusion, gradients, thickness, noise, Levels and ID color selection.
+- **Smart materials** and smart masks: built-ins, or save your own and reuse them across projects.
+- **Procedural materials** with editable parameters, and **Substance Designer `.sbs` graphs** used directly as fills, no Adobe software needed.
+- Fill projections: UV, tri-planar, planar, spherical and cylindrical.
+
+### Baking
+- Normal (high to low poly, with cage), world-space normal, ID, ambient occlusion, curvature, position, thickness, height and opacity, with antialiasing and dilation.
+- Or import maps you baked elsewhere.
+
+### Viewport and rendering
+- Real-time PBR with HDR image-based lighting, parallax from height, bloom and ACES, AgX or Khronos Neutral tone mapping.
+- Shading models: metal/rough, Adobe Standard Material and OpenPBR, plus your own Painter `.glsl` shaders.
+- OpenColorIO color management with the ACES 1.x and 2.x configs built in.
+- A GPU **path tracer** for final-quality previews.
+
+### Import and export
+- Meshes: FBX, OBJ, glTF/GLB and USD. Each material becomes a texture set. Swap in an updated mesh and keep your paint.
+- Texture export presets for Unreal, Unity, glTF, Blender and Godot, with channel packing, padding and PNG, TGA, TIFF or EXR output. Painter `.spexp` presets work too.
+- Layered **PSD export**, and mesh export as USD or OBJ with textures.
+
+### Substance Painter projects
+- **Open `.spp` files without Painter installed.** ReEtched converts them into its own projects (the original is never changed) with texture sets, the layer stack, fills, masks and baked maps. Paint is rebuilt from Painter's stored strokes.
+- Painter's own final result comes along as a top layer, so the project looks right immediately.
+- See [Coming from Painter](docs/migrating-from-painter.md) for what converts and what's different.
+
+### Workflow
+- Python scripting: a console, scripts and plugins with their own menu entries ([API guide](crates/reetched-script/README.md)).
+- An asset library over your own folders, with search, tags, favorites and thumbnails.
+- Project templates, autosave and crash recovery.
+- Painter or Blender keymaps with every shortcut rebindable, and an adjustable interface size.
+
+## Getting started
+
+1. **File → New project** (or <kbd>Ctrl</kbd>+<kbd>N</kbd>): pick a mesh and a template.
+2. **Bake** the mesh maps under *Texture Set Settings → Mesh maps* so generators and smart materials can follow the shape.
+3. **Paint** with <kbd>1</kbd>, or drag a material from the Assets panel onto the model.
+4. **File → Export textures** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>) with the preset for your engine.
+
+Navigation: <kbd>Alt</kbd>+left drag orbits, middle drag pans, <kbd>Alt</kbd>+right drag or the wheel zooms, <kbd>F</kbd> frames the model.
+
+## Building from source
+
+You need [Rust](https://rustup.rs) 1.96 or newer and a C compiler (Visual Studio Build Tools on Windows, `xcode-select --install` on macOS, `gcc` or `clang` on Linux).
 
 ```bash
-cargo build --release --workspace
-cargo run --release -p reetched-app -- path/to/mesh.fbx
+cargo run --release -p reetched-app
 ```
 
-The mesh argument is optional — without it you get a preview sphere. You can also drag meshes and HDRIs onto the window. The workspace build also builds `reetched_python` (the Python bridge library) next to the executable; without it, or without Python installed, everything except scripting works.
-
-```bash
-cargo test --workspace
-```
-
-### Packaging
-
-App icons live in `assets/icons/`. The Windows executable gets `ReEtched.ico` embedded at build time (needs the Windows SDK's resource compiler, which comes with the Visual Studio Build Tools).
-
-Installers are built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager): NSIS on Windows, `.app`/`.dmg` on macOS, `.deb`/AppImage on Linux. Copy the `reetched_python` library (`.dll` / `.dylib` / `.so`) into `target/release/bridge/` so scripting ships with it, then:
-
-```bash
-cargo install cargo-packager --locked
-cargo build --release -p reetched-app -p reetched-python
-cargo packager --release -p reetched-app
-```
-
-Pushing a `v*` tag runs the same steps on all three platforms (`.github/workflows/release.yml`) and attaches the installers to a draft GitHub release.
-
-Other Linux packages can use `assets/reetched.desktop` with the PNGs in `assets/icons/linux/`, installed as `hicolor/<size>/apps/reetched.png`.
-
-## Project layout
-
-```
-crates/
-  reetched-io/     mesh import (FBX, OBJ, glTF, USD), mesh export (USD, USDZ, OBJ), topology, unwrapping
-  reetched-bake/   CPU mesh map baker (BVH ray casting)
-  reetched-graph/  procedural graph engine: Designer-style atomic nodes, function graphs, material library
-  reetched-substance/ Substance file readers (.sbs) and the Painter bridge importer
-  reetched-color/  pure-Rust OpenColorIO v2 subset: configs, transforms, LUTs, ACES 1.x / 2.x
-  reetched-shader/ Painter custom shader (.glsl) translation, with our own implementation of its shader API
-  reetched-trace/  GPU path tracer (wgpu compute, BVH)
-  reetched-spp/    read-only Painter project (.spp) conversion
-  reetched-library/ asset library: folder scanning, kinds, tags, favorites, thumbnails, file watching
-  reetched-script/ Python scripting host: finds your Python and drives the bridge
-  reetched-python/ the Python side: the `reetched` module and plugin loader (pyo3, loaded at runtime)
-  reetched-doc/    the document: texture sets, layer stack, undo, .retx projects, smart materials, texture export
-  reetched-app/    the application: UI, GPU layer compositor, viewport renderer, shaders
-tools/
-  painter-bridge/  the Painter plugin that exports projects for ReEtched
-docs/
-  PLAN.md          architecture, phases and the Substance compatibility strategy
-  research/        sourced research on Painter's features, file formats and the Rust ecosystem
-```
-
-More crates (Painter project import, …) arrive with their phases — see the plan.
-
-## Substance Painter compatibility
-
-Bringing Painter projects over cleanly is a core goal. The short version of what research shows is possible (details and sources in [docs/PLAN.md](docs/PLAN.md#0-the-compatibility-plan-in-plain-terms)):
-
-- **Open formats** (`.sbs` graphs, `.sbsar` parameters, export presets, shaders) — read natively.
-- **Painter projects (`.spp`)** — via a small plugin that runs inside Painter and exports the full layer stack through Adobe's official API. Paint layers come over as full-resolution pixels.
-- **Reading `.spp` directly, without Painter** — a read-only conversion into a ReEtched project (File > Import Painter project). The `.spp` is never written to; see [the format notes](docs/spp-format.md).
-
-ReEtched is not affiliated with or endorsed by Adobe. "Substance" and "Adobe" are trademarks of Adobe Inc.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project layout, tests and how releases are made.
 
 ## Contributing
 
-Contributions are welcome — please read [CONTRIBUTING.md](CONTRIBUTING.md) first, especially the rules about Adobe code and assets.
+Bug reports, ideas and pull requests are welcome.
+
+- **Found a bug or have an idea?** [Open an issue](https://github.com/Redactional/ReEtched/issues/new/choose). The forms ask for what's needed to act on it.
+- **Want to contribute code?** Read [CONTRIBUTING.md](CONTRIBUTING.md) first, especially the rules about Adobe files and code.
 
 ## License
 
-Licensed under either of
+ReEtched is dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+ReEtched is not affiliated with or endorsed by Adobe. Adobe and Substance are trademarks of Adobe Inc.

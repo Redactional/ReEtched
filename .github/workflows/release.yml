@@ -1,21 +1,29 @@
+# Builds ReEtched for Windows, macOS and Linux and publishes a GitHub release.
+# Runs when a version tag (v1.2.3) is pushed, or by hand for an existing tag.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (for example v0.2.0)
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  package:
-    name: ${{ matrix.os }}
+  build:
+    name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - os: windows-latest
@@ -28,13 +36,27 @@ jobs:
             formats: deb,appimage
             platform: linux-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches the version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "reetched-app") | .version')
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Tag $TAG doesn't match the version in Cargo.toml ($version). Update [workspace.package] version first."
+            exit 1
+          fi
+
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
+
       - name: Build
         run: cargo build --release -p reetched-app -p reetched-python
+
       - name: Stage the Python bridge
         shell: bash
         run: |
@@ -42,16 +64,16 @@ jobs:
           for f in target/release/reetched_python.dll target/release/libreetched_python.dylib target/release/libreetched_python.so; do
             if [ -f "$f" ]; then cp "$f" target/release/bridge/; fi
           done
-          ls target/release/bridge
-      - name: Package
+
+      - name: Installers
         run: cargo packager --release -p reetched-app --formats ${{ matrix.formats }} --binaries-dir target/release --out-dir dist
+
       # The portable copy ReLauncher installs: ReEtched-<version>-<platform>.zip
-      # (ReLauncher picks the asset whose name ends with -<platform>.zip).
       - name: Portable archive
         shell: bash
         run: |
-          name="ReEtched-${GITHUB_REF_NAME#v}-${{ matrix.platform }}.zip"
-          rm -rf portable && mkdir -p portable dist
+          name="ReEtched-${TAG#v}-${{ matrix.platform }}.zip"
+          rm -rf portable && mkdir -p portable
           case "${{ matrix.platform }}" in
             windows-*)
               cp target/release/reetched.exe target/release/bridge/* portable/
@@ -64,12 +86,33 @@ jobs:
               (cd portable && zip -r "../dist/$name" .) ;;
           esac
           ls -l dist
-      - uses: softprops/action-gh-release@v2
+
+      - uses: actions/upload-artifact@v4
         with:
-          draft: true
-          files: |
+          name: dist-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
             dist/*.exe
             dist/*.dmg
             dist/*.deb
             dist/*.AppImage
             dist/*.zip
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ReEtched ${{ env.TAG }}
+          generate_release_notes: true
+          # v1.2.3-beta.1 and similar are pre-releases (ReLauncher skips them).
+          prerelease: ${{ contains(env.TAG, '-') }}
+          fail_on_unmatched_files: true
+          files: dist/*
