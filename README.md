@@ -37,7 +37,7 @@ An open-source 3D texture painter written in Rust, in the spirit of Adobe Substa
 - **Autosave and crash recovery**, Save and compact (drops unused images), recent projects, and **project templates** (New project, Ctrl+N) with built-ins for PBR metal/rough, ASM, OpenPBR, Unreal, Unity HDRP and mobile
 - Layer and mask thumbnails in the layer stack, a GPU memory budget for cached textures, and a shader pipeline cache
 - Painter-style navigation and shortcuts by default (**Alt+LMB** orbit, **MMB** pan, **Alt+RMB** zoom, wheel zoom, **F** to frame), or a Blender-style keymap (**MMB** orbit, **Shift+MMB** pan, **Ctrl+MMB** zoom, **Home** to frame); every shortcut can be rebound in Settings
-- Interface size setting (75–200 %), a Help menu, and an optional startup check for new releases (it only tells you; nothing is downloaded)
+- A welcome screen at startup (new, open or import a project, or pick a recent one), an interface size setting (75–200 %), a Help menu, and an optional startup check for new releases (it only tells you; nothing is downloaded)
 - Coming from Painter? See [the migration guide](docs/migrating-from-painter.md)
 
 ## Building

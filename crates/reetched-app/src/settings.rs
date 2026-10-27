@@ -45,6 +45,8 @@ pub struct Settings {
     pub ui_scale: f32,
     /// Look for a newer release at startup (notify only).
     pub check_updates: bool,
+    /// Show the welcome screen at startup.
+    pub show_welcome: bool,
 }
 
 impl Default for Settings {
@@ -59,6 +61,7 @@ impl Default for Settings {
             keymap: Default::default(),
             ui_scale: 1.0,
             check_updates: true,
+            show_welcome: true,
         }
     }
 }

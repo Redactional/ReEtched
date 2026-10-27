@@ -39,6 +39,7 @@ mod thumbs;
 mod tools_ui;
 mod updates;
 mod viewport;
+mod welcome;
 
 /// GPU tests take turns: many devices at once, at low process priority,
 /// stall some drivers.

@@ -129,6 +129,9 @@ impl State {
                                 .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
                         );
                         ui.end_row();
+                        ui.label("Startup");
+                        ui.checkbox(&mut s.show_welcome, "Show the welcome screen");
+                        ui.end_row();
                         ui.label("Updates");
                         ui.checkbox(&mut s.check_updates, "Check for a new version at startup")
                             .on_hover_text("Only tells you; nothing is downloaded or installed.");

@@ -193,6 +193,7 @@ pub struct State {
     /// Settings: the action waiting for a new key.
     pub rebinding: Option<crate::keymap::Action>,
     pub updates: crate::updates::Updates,
+    pub welcome: crate::welcome::Welcome,
     pub script: crate::scripting::Scripting,
     /// The loaded environment map (None = the built-in sky).
     pub env_path: Option<PathBuf>,
@@ -322,6 +323,7 @@ impl App {
             keymap,
             rebinding: None,
             updates: Default::default(),
+            welcome: Default::default(),
             script: Default::default(),
             env_path: None,
             session: crate::session::Session::start(),
@@ -347,6 +349,8 @@ impl App {
         if !cfg!(test) {
             state.start_scripting();
         }
+        // Tests drive the UI directly, without the welcome screen in the way.
+        state.welcome.open = state.settings.show_welcome && !cfg!(test);
         if let Some(path) = startup_mesh {
             state.open_any(&path);
         }
@@ -460,6 +464,7 @@ impl App {
         self.state.bake_window(&ctx);
         self.state.text_window(&ctx);
         self.state.new_project_window(&ctx);
+        self.state.welcome_window(&ctx);
         self.state.settings_window(&ctx);
         let auto = self.state.settings.check_updates;
         self.state.updates.ui(&ctx, auto);
@@ -636,6 +641,9 @@ impl App {
             if ui.button("Check for updates").clicked() {
                 let ctx = ui.ctx().clone();
                 self.state.updates.check(&ctx, true);
+            }
+            if ui.button("Welcome screen").clicked() {
+                self.state.welcome.open = true;
             }
             if ui.button("About ReEtched").clicked() {
                 self.state.updates.about_open = true;
@@ -1022,6 +1030,8 @@ impl State {
 
     /// Shows `mesh` with `doc`, or a fresh document (one texture set per material).
     pub fn set_mesh(&mut self, mut mesh: Mesh, name: String, doc: Option<Document>) {
+        // Anything opened (project, mesh, import) replaces the welcome screen.
+        self.welcome.open = false;
         // UDIM tiles must be contiguous index ranges (projects from before UDIM support).
         mesh.sort_by_udim();
         self.bounds = mesh.bounds();
@@ -1703,6 +1713,21 @@ mod tests {
             self.frame(vec![ev(true)]);
             self.frame(vec![ev(false)]);
         }
+    }
+
+    #[test]
+    fn welcome_screen_closes_on_escape_and_when_something_opens() {
+        let Some(mut h) = Harness::new() else { return };
+        h.app.state.welcome.open = true;
+        h.frame(vec![]);
+        assert!(h.app.state.welcome.open);
+        h.key(egui::Key::Escape);
+        assert!(!h.app.state.welcome.open, "Esc closes it");
+        h.app.state.welcome.open = true;
+        h.frame(vec![]);
+        let sphere = reetched_io::Mesh::uv_sphere(1.0, 8, 4);
+        h.app.state.set_mesh(sphere, "Sphere".into(), None);
+        assert!(!h.app.state.welcome.open, "opening a mesh replaces it");
     }
 
     #[test]
