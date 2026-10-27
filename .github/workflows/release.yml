@@ -66,8 +66,19 @@ jobs:
             if [ -f "$f" ]; then cp "$f" target/release/bridge/; fi
           done
 
+      # Full paths: with -p, cargo-packager resolves relative ones from the
+      # crate's folder (crates/reetched-app), not the repository root.
       - name: Installers
-        run: cargo packager --release -p reetched-app --formats ${{ matrix.formats }} --binaries-dir target/release --out-dir dist
+        shell: bash
+        run: |
+          mkdir -p dist
+          cargo packager --release -p reetched-app --formats ${{ matrix.formats }} \
+            --binaries-dir "$GITHUB_WORKSPACE/target/release" --out-dir "$GITHUB_WORKSPACE/dist"
+          ls -la dist
+          if ! ls dist | grep -Eq '\.(exe|dmg|deb|AppImage)$'; then
+            echo "::error::cargo-packager produced no installers in dist/"
+            exit 1
+          fi
 
       # The portable copy ReLauncher installs: ReEtched-<version>-<platform>.zip
       - name: Portable archive
