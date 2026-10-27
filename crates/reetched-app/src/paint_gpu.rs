@@ -992,13 +992,7 @@ mod tests {
 
     fn gpu() -> Option<Gpu> {
         let turn = crate::gpu_test_lock();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .ok()?;
+        let (_, device, queue) = crate::test_gpu()?;
         let v = |u: f32, w: f32| Vertex {
             position: [u, w, 0.0],
             normal: [0.0, 0.0, 1.0],

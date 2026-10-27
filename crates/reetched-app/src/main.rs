@@ -42,6 +42,33 @@ mod viewport;
 
 /// GPU tests take turns: many devices at once, at low process priority,
 /// stall some drivers.
+/// The layer compositor binds this many textures per pass (above WebGPU's minimum of 16).
+pub const MIN_TEXTURES: u32 = 23;
+
+/// A device for GPU tests, or None (test skipped) without a GPU the app would run on:
+/// CI machines often only have a software OpenGL driver with the 16-texture minimum.
+/// `WGPU_BACKEND` picks the backend (e.g. `gl` to try that path on a desktop).
+#[cfg(test)]
+pub fn test_gpu() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    let textures = adapter.limits().max_sampled_textures_per_shader_stage;
+    if textures < MIN_TEXTURES {
+        eprintln!(
+            "skipping GPU test: {} binds only {textures} textures per stage",
+            adapter.get_info().name
+        );
+        return None;
+    }
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .ok()?;
+    Some((adapter, device, queue))
+}
+
 #[cfg(test)]
 pub fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -182,11 +209,10 @@ impl Gfx {
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?})", info.name, info.backend);
 
-        // The layer compositor binds 23 textures per pass (above WebGPU's minimum of 16).
         let textures = adapter.limits().max_sampled_textures_per_shader_stage;
-        if textures < 23 {
+        if textures < MIN_TEXTURES {
             anyhow::bail!(
-                "this GPU can bind only {textures} textures per shader stage; ReEtched needs 23"
+                "this GPU can bind only {textures} textures per shader stage; ReEtched needs {MIN_TEXTURES}"
             );
         }
         let wireframe = adapter

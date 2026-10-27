@@ -1431,13 +1431,7 @@ mod tests {
     const RES: u32 = 64;
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .ok()
+        crate::test_gpu().map(|(_, d, q)| (d, q))
     }
 
     /// The UV quad, with positions `pos(uv)` along X and Y.

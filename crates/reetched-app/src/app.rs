@@ -1601,15 +1601,7 @@ mod tests {
     impl Harness {
         fn new() -> Option<Self> {
             let turn = crate::gpu_test_lock();
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-            let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    required_limits: adapter.limits(),
-                    ..Default::default()
-                }))
-                .ok()?;
+            let (adapter, device, queue) = crate::test_gpu()?;
             let ctx = egui::Context::default();
             theme::apply(&ctx);
             let mut renderer = egui_wgpu::Renderer::new(

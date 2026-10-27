@@ -16,11 +16,21 @@ fn gpu_lock() -> MutexGuard<'static, ()> {
 }
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         eprintln!("no GPU adapter, skipping");
         return None;
     };
+    // Only GPUs the app runs on (it needs 23 textures per stage for its compositor);
+    // CI's software OpenGL drivers fall short, and the tracer's output is wrong there.
+    if adapter.limits().max_sampled_textures_per_shader_stage < 23 {
+        eprintln!(
+            "{} is below the app's minimum, skipping",
+            adapter.get_info().name
+        );
+        return None;
+    }
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: adapter.limits(),
         ..Default::default()
