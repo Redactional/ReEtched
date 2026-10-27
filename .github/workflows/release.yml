@@ -20,10 +20,13 @@ jobs:
         include:
           - os: windows-latest
             formats: nsis
+            platform: windows-x64
           - os: macos-latest
-            formats: dmg
+            formats: app,dmg
+            platform: macos-arm64
           - os: ubuntu-latest
             formats: deb,appimage
+            platform: linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,11 +40,30 @@ jobs:
         run: |
           mkdir -p target/release/bridge
           for f in target/release/reetched_python.dll target/release/libreetched_python.dylib target/release/libreetched_python.so; do
-            [ -f "$f" ] && cp "$f" target/release/bridge/
+            if [ -f "$f" ]; then cp "$f" target/release/bridge/; fi
           done
           ls target/release/bridge
       - name: Package
         run: cargo packager --release -p reetched-app --formats ${{ matrix.formats }} --binaries-dir target/release --out-dir dist
+      # The portable copy ReLauncher installs: ReEtched-<version>-<platform>.zip
+      # (ReLauncher picks the asset whose name ends with -<platform>.zip).
+      - name: Portable archive
+        shell: bash
+        run: |
+          name="ReEtched-${GITHUB_REF_NAME#v}-${{ matrix.platform }}.zip"
+          rm -rf portable && mkdir -p portable dist
+          case "${{ matrix.platform }}" in
+            windows-*)
+              cp target/release/reetched.exe target/release/bridge/* portable/
+              (cd portable && 7z a "../dist/$name" *) ;;
+            macos-*)
+              app=$(find dist -maxdepth 2 -name "*.app" | head -1)
+              ditto -c -k --keepParent "$app" "dist/$name" ;;
+            linux-*)
+              cp target/release/reetched target/release/bridge/* portable/
+              (cd portable && zip -r "../dist/$name" .) ;;
+          esac
+          ls -l dist
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
@@ -50,3 +72,4 @@ jobs:
             dist/*.dmg
             dist/*.deb
             dist/*.AppImage
+            dist/*.zip
