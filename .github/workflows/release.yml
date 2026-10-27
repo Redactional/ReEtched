@@ -23,7 +23,8 @@ jobs:
     name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      # Every platform finishes even if one fails; publishing still needs all three.
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -79,8 +80,16 @@ jobs:
               cp target/release/reetched.exe target/release/bridge/* portable/
               (cd portable && 7z a "../dist/$name" *) ;;
             macos-*)
-              app=$(find dist -maxdepth 2 -name "*.app" | head -1)
-              ditto -c -k --keepParent "$app" "dist/$name" ;;
+              # The .app from the disk image: the one users get, wherever the
+              # packager left its own copy.
+              ls -la dist
+              dmg=$(ls dist/*.dmg | head -1)
+              mnt=$(mktemp -d)
+              hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+              app=$(find "$mnt" -maxdepth 1 -name "*.app" | head -1)
+              if [ -z "$app" ]; then echo "::error::no .app in $dmg"; exit 1; fi
+              ditto -c -k --keepParent "$app" "dist/$name"
+              hdiutil detach "$mnt" ;;
             linux-*)
               cp target/release/reetched target/release/bridge/* portable/
               (cd portable && zip -r "../dist/$name" .) ;;
