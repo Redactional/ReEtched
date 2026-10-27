@@ -138,7 +138,22 @@ impl Scanner {
 struct RootEntry {
     name: String,
     path: PathBuf,
+    /// `path` with symlinks resolved: watchers may report that form instead
+    /// (macOS FSEvents gives /private/var/... for /var/...).
+    real: PathBuf,
     poll: bool,
+}
+
+impl RootEntry {
+    /// `p` (from an event, in either form) as a path under `self.path`, if it is inside.
+    fn local(&self, p: &Path) -> Option<PathBuf> {
+        if p.starts_with(&self.path) {
+            return Some(p.to_owned());
+        }
+        p.strip_prefix(&self.real)
+            .ok()
+            .map(|rel| self.path.join(rel))
+    }
 }
 
 fn run(cmds: Receiver<Cmd>, out: Sender<ScanResult>) {
@@ -162,7 +177,15 @@ fn run(cmds: Receiver<Cmd>, out: Sender<ScanResult>) {
         match cmds.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Cmd::Changed(p)) => touched(&mut pending, &mut std::iter::once(p)),
             Ok(Cmd::RescanAll) => touched(&mut pending, &mut roots.iter().map(|r| r.path.clone())),
-            Ok(Cmd::AddRoot { name, path, poll }) => roots.push(RootEntry { name, path, poll }),
+            Ok(Cmd::AddRoot { name, path, poll }) => {
+                let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                roots.push(RootEntry {
+                    name,
+                    path,
+                    real,
+                    poll,
+                })
+            }
             Ok(Cmd::RemoveRoot(name)) => roots.retain(|r| r.name != name),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -200,17 +223,17 @@ fn flush(roots: &[RootEntry], mut paths: Vec<PathBuf>, out: &Sender<ScanResult>)
     paths.dedup();
     let mut done: Vec<PathBuf> = Vec::new();
     for path in paths {
-        if done.iter().any(|d| path.starts_with(d)) {
-            continue;
-        }
         // Innermost root wins when roots nest.
-        let Some(root) = roots
+        let Some((root, path)) = roots
             .iter()
-            .filter(|r| path.starts_with(&r.path))
-            .max_by_key(|r| r.path.components().count())
+            .filter_map(|r| Some((r, r.local(&path)?)))
+            .max_by_key(|(r, _)| r.path.components().count())
         else {
             continue;
         };
+        if done.iter().any(|d| path.starts_with(d)) {
+            continue;
+        }
         let prefix = if path == root.path {
             String::new()
         } else {
@@ -233,4 +256,26 @@ fn flush(roots: &[RootEntry], mut paths: Vec<PathBuf>, out: &Sender<ScanResult>)
         done.push(path);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_under_the_resolved_root_map_back() {
+        let root = RootEntry {
+            name: "W".into(),
+            path: "/var/lib/w".into(),
+            real: "/private/var/lib/w".into(),
+            poll: false,
+        };
+        let want = Some(PathBuf::from("/var/lib/w/textures/new.png"));
+        assert_eq!(root.local(Path::new("/var/lib/w/textures/new.png")), want);
+        assert_eq!(
+            root.local(Path::new("/private/var/lib/w/textures/new.png")),
+            want
+        );
+        assert_eq!(root.local(Path::new("/elsewhere/new.png")), None);
+    }
 }
