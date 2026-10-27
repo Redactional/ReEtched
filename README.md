@@ -29,7 +29,7 @@ ReEtched is a full texturing app for game and film assets: a layer stack with ma
 
 ## Download
 
-**The easy way: [ReLauncher](https://github.com/Redactional/ReLauncher).** It installs ReEtched, keeps it up to date and sets up everything it needs.
+**The easy way: [ReLauncher](https://redactional.github.io/ReLauncher/).** It installs ReEtched, keeps it up to date and sets up everything it needs.
 
 Or grab an installer from the [latest release](https://github.com/Redactional/ReEtched/releases/latest):
 
