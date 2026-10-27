@@ -58,7 +58,7 @@ jiff = "0.2"
 image = { version = "0.25", default-features = false, features = ["hdr", "exr", "png", "jpeg", "tga", "tiff"] }
 rfd = "0.17"
 resvg = "0.48"
-dirs = "6"
+dirs = "7"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.12"
