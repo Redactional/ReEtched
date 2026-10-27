@@ -81,11 +81,12 @@ impl Report {
 }
 
 /// ACES output transforms: the 2.0 rendering is table-driven f32 math (hue/cusp tables built
-/// by bisection), so libm differences in powf/atan2 move results slightly; measured worst case
-/// is 6.7e-5 (HDR 1000 nit P3), the margin covers other platforms' libm. OCIO also bakes
-/// PQ/HLG and the ACES 1.x roll-offs into half-float LUTs that this crate evaluates
-/// analytically (measured below 2e-6).
-const TOL_ACES_OUTPUT: f64 = 2e-4;
+/// by bisection), so libm differences in powf/atan2 move results slightly. Worst cases
+/// measured: 6.7e-5 on Windows; 1.2e-3 on Linux (glibc), for an out-of-gamut input whose
+/// red output sits at zero (gamut compression amplifies the difference there). That is just
+/// over one 10-bit code value. OCIO also bakes PQ/HLG and the ACES 1.x roll-offs into
+/// half-float LUTs that this crate evaluates analytically (measured below 2e-6).
+const TOL_ACES_OUTPUT: f64 = 2e-3;
 
 fn view_tolerance(view: &str) -> (&'static str, f64) {
     if view.starts_with("ACES") {

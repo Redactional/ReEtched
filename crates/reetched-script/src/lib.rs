@@ -228,8 +228,8 @@ fn preload_python(install: &PythonInstall) -> Result<()> {
     #[cfg(unix)]
     {
         use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
-        // RTLD_GLOBAL so the bridge and C extension modules see Python's symbols.
-        // ponytail: only exercised on Windows so far.
+        // RTLD_GLOBAL so the bridge (which doesn't link libpython here) and C
+        // extension modules see Python's symbols.
         let lib = unsafe { Library::open(Some(&install.library), RTLD_NOW | RTLD_GLOBAL) }
             .with_context(|| format!("loading {}", install.library.display()))?;
         std::mem::forget(lib);
