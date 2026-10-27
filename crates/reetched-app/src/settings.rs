@@ -47,6 +47,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// Show the welcome screen at startup.
     pub show_welcome: bool,
+    /// Developer: show the console window with the debug log.
+    pub show_console: bool,
 }
 
 impl Default for Settings {
@@ -62,12 +64,13 @@ impl Default for Settings {
             ui_scale: 1.0,
             check_updates: true,
             show_welcome: true,
+            show_console: false,
         }
     }
 }
 
 impl Settings {
-    fn path() -> PathBuf {
+    pub fn path() -> PathBuf {
         config_dir().join("settings.json")
     }
 
@@ -84,7 +87,8 @@ impl Settings {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
+        log::debug!("settings saved to {}", path.display());
         Ok(())
     }
 

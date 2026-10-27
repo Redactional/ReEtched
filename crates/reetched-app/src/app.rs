@@ -351,6 +351,11 @@ impl App {
         }
         // Tests drive the UI directly, without the welcome screen in the way.
         state.welcome.open = state.settings.show_welcome && !cfg!(test);
+        if !cfg!(test) {
+            crate::console::set_visible(state.settings.show_console);
+            log::debug!("GPU: {}", state.adapter);
+            log::debug!("settings: {}", crate::settings::Settings::path().display());
+        }
         if let Some(path) = startup_mesh {
             state.open_any(&path);
         }
@@ -828,6 +833,7 @@ pub fn icon_button(
 impl State {
     /// Opens a project, mesh or environment, by extension.
     pub fn open_any(&mut self, path: &Path) {
+        log::debug!("opening {}", path.display());
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -869,7 +875,10 @@ impl State {
     }
 
     pub fn open_project(&mut self, path: &Path) {
-        match project::load(path) {
+        let start = Instant::now();
+        let loaded = project::load(path);
+        log::debug!("loaded {} in {:.2?}", path.display(), start.elapsed());
+        match loaded {
             Ok((doc, mesh, resources)) => {
                 let name = file_name(path);
                 if doc.texture_sets.len() != mesh.parts.len() {
@@ -910,7 +919,10 @@ impl State {
     /// Saves to `path`; true on success.
     pub fn save_to(&mut self, path: &Path) -> bool {
         self.notify_script("project_about_to_save", serde_json::json!({ "path": path }));
-        match project::save(path, &self.doc, &self.mesh, &self.resources) {
+        let start = Instant::now();
+        let saved = project::save(path, &self.doc, &self.mesh, &self.resources);
+        log::debug!("saved {} in {:.2?}", path.display(), start.elapsed());
+        match saved {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
                 self.project_path = Some(path.to_owned());
@@ -1037,6 +1049,13 @@ impl State {
         self.bounds = mesh.bounds();
         self.camera.frame(self.bounds);
         self.uv_camera.zoom = 0.0;
+        log::debug!(
+            "mesh {name}: {} vertices, {} triangles, {} texture set(s), UVs {}",
+            mesh.vertices.len(),
+            mesh.indices.len() / 3,
+            mesh.parts.len(),
+            if mesh.has_uvs { "yes" } else { "generated" }
+        );
         self.viewport.set_mesh(&self.device, &mesh);
         self.selected_part = 0;
         self.selected = None;

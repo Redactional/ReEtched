@@ -1,8 +1,9 @@
 //! ReEtched entry point: window, GPU setup, and the frame loop.
 //! Usage: `reetched [project.retx | mesh-file]`
 
-// Release builds are a normal GUI app on Windows (no console window).
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A normal GUI app on Windows, without a console window; Settings > Developer
+// opens one with the debug log (console.rs).
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
 mod bake_ui;
@@ -10,6 +11,7 @@ mod bridge_ui;
 mod brush;
 mod color_ui;
 mod compositor;
+mod console;
 mod dynamics;
 mod effects_ui;
 mod env;
@@ -93,9 +95,23 @@ use std::{
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
         // The Vulkan loader warns about third-party overlay layers (OBS, Medal…); not our problem.
-        "warn,wgpu_hal::vulkan::instance=error,reetched_app=info,reetched_io=info",
+        "warn,wgpu_hal::vulkan::instance=error,reetched=debug",
     ))
+    // Local time, so the log matches the clock (env_logger's own stamp is UTC).
+    .format(|buf, record| {
+        use std::io::Write;
+        writeln!(
+            buf,
+            "[{} {:5} {}] {}",
+            jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S"),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    })
     .init();
+    // Until Settings says otherwise (App::new): warnings only, no console.
+    log::set_max_level(log::LevelFilter::Warn);
     let event_loop = EventLoop::new()?;
     let mut runner = Runner {
         startup_mesh: std::env::args_os().nth(1).map(PathBuf::from),

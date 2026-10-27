@@ -183,6 +183,20 @@ impl State {
                 });
                 ui.add_space(8.0);
                 self.keymap_ui(ui);
+                ui.add_space(8.0);
+                ui.label(theme::header("DEVELOPER"));
+                let label = if cfg!(windows) {
+                    "Show the console window (debug log)"
+                } else {
+                    "Debug log (in the terminal ReEtched was started from)"
+                };
+                if ui
+                    .checkbox(&mut self.settings.show_console, label)
+                    .on_hover_text("Close it here again: closing the console window itself would quit ReEtched, so its close button is turned off.")
+                    .changed()
+                {
+                    crate::console::set_visible(self.settings.show_console);
+                }
             });
         if let Some(i) = remove_root {
             self.settings.library_roots.remove(i);

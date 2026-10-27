@@ -53,6 +53,8 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 half = { version = "2", features = ["bytemuck"] }
 env_logger = "0.11"
+# Local-time log timestamps (already used by env_logger, which stamps UTC).
+jiff = "0.2"
 image = { version = "0.25", default-features = false, features = ["hdr", "exr", "png", "jpeg", "tga", "tiff"] }
 rfd = "0.17"
 resvg = "0.48"
@@ -60,6 +62,10 @@ dirs = "6"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.12"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the tree through winit; the developer console (console.rs).
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 psd = "0.3"
