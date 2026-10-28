@@ -635,8 +635,9 @@ impl App {
         ui.menu_button("Help", |ui| {
             let repo = env!("CARGO_PKG_REPOSITORY");
             if ui.button("Documentation").clicked() {
-                ui.ctx()
-                    .open_url(egui::OpenUrl::new_tab(format!("{repo}#readme")));
+                ui.ctx().open_url(egui::OpenUrl::new_tab(
+                    "https://redactional.github.io/ReLauncher/docs.html?p=reetched",
+                ));
             }
             if ui.button("Report a problem").clicked() {
                 ui.ctx()

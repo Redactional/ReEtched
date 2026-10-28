@@ -1,0 +1,39 @@
+{
+  "title": "ReEtched manual",
+  "sections": [
+    {
+      "title": "Basics",
+      "pages": [
+        { "slug": "getting-started", "title": "Getting started" },
+        { "slug": "interface", "title": "The interface" },
+        { "slug": "projects-and-meshes", "title": "Projects and meshes" }
+      ]
+    },
+    {
+      "title": "Texturing",
+      "pages": [
+        { "slug": "painting", "title": "Painting" },
+        { "slug": "layers-and-masks", "title": "Layers and masks" },
+        { "slug": "fills-and-materials", "title": "Fills, images and materials" },
+        { "slug": "baking", "title": "Baking mesh maps" },
+        { "slug": "asset-library", "title": "Asset library" }
+      ]
+    },
+    {
+      "title": "Viewing and output",
+      "pages": [
+        { "slug": "viewport-and-color", "title": "Viewport, rendering and color" },
+        { "slug": "exporting", "title": "Exporting" }
+      ]
+    },
+    {
+      "title": "More",
+      "pages": [
+        { "slug": "painter-projects", "title": "Coming from Substance Painter" },
+        { "slug": "scripting", "title": "Python scripting" },
+        { "slug": "shortcuts", "title": "Keyboard and mouse" },
+        { "slug": "troubleshooting", "title": "Troubleshooting" }
+      ]
+    }
+  ]
+}

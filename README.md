@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#download">Download</a> ·
   <a href="#features">Features</a> ·
+  <a href="https://redactional.github.io/ReLauncher/docs.html?p=reetched">Documentation</a> ·
   <a href="docs/migrating-from-painter.md">Coming from Painter</a> ·
   <a href="https://github.com/Redactional/ReEtched/issues/new/choose">Report a bug</a>
 </p>

@@ -3,7 +3,7 @@
     from reetched import export
     result = export.export_project_textures({
         "exportPath": "C:/out",
-        "defaultExportPreset": "Unreal Engine",
+        "defaultExportPreset": "Unreal Engine (Packed)",
         "exportList": [{"rootPath": "Body"}],
         "exportParameters": [{"parameters": {"fileFormat": "png", "bitDepth": "8",
                                              "paddingAlgorithm": "infinite"}}],

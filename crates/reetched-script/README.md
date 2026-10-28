@@ -91,7 +91,7 @@ Export config (Painter style):
 ```python
 export.export_project_textures({
     "exportPath": "C:/out",
-    "defaultExportPreset": "Unreal Engine",          # a name from list_presets()
+    "defaultExportPreset": "Unreal Engine (Packed)",        # a name from list_presets()
     "exportList": [{"rootPath": "Body"}],             # omit for all texture sets
     "exportParameters": [{"parameters": {
         "fileFormat": "png", "bitDepth": "8",
