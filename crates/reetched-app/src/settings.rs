@@ -49,6 +49,13 @@ pub struct Settings {
     pub show_welcome: bool,
     /// Developer: show the console window with the debug log.
     pub show_console: bool,
+    /// Smart materials (.rsm) and Substance graphs (.sbs) imported into the
+    /// Assets panel, loaded again at startup.
+    pub imported_smart: Vec<PathBuf>,
+    pub imported_sbs: Vec<PathBuf>,
+    /// The panel layout (an `egui_tiles` tree), kept as JSON so a layout
+    /// that no longer parses only resets itself, not every setting.
+    pub layout: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -65,6 +72,9 @@ impl Default for Settings {
             check_updates: true,
             show_welcome: true,
             show_console: false,
+            imported_smart: Vec::new(),
+            imported_sbs: Vec::new(),
+            layout: None,
         }
     }
 }

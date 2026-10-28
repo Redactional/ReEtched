@@ -146,7 +146,7 @@ The Projection tool places an image over the 3D view and paints it onto the mode
 
 1. Select a paint layer (or a mask).
 2. Press **3** or choose the Projection tool.
-3. Click **Load image…** and choose an image, or click **Text…** to make an image from text.
+3. Click **Load image…** and choose an image, drag an image file onto the window, or click **Text…** to make an image from text.
 4. Adjust the image's placement:
    - **Size** — how large the image appears in the view.
    - **Rotation** — turns the image, from −180° to 180°.

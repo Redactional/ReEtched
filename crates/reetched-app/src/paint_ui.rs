@@ -668,15 +668,23 @@ impl State {
                             for (label, field, tip) in [
                                 ("Dabs", &mut d.count, "Dabs per stamp"),
                                 ("Along", &mut d.x, "Offset along the stroke, in brush radii"),
-                                ("Across", &mut d.y, "Offset across the stroke, in brush radii"),
+                                (
+                                    "Across",
+                                    &mut d.y,
+                                    "Offset across the stroke, in brush radii",
+                                ),
                                 ("Size", &mut d.size, "Size multiplier"),
                                 ("Angle", &mut d.angle, "Added rotation, degrees"),
                                 ("Flow", &mut d.flow, "Flow multiplier"),
                             ] {
                                 ui.label(label).on_hover_text(tip);
                                 if ui
-                                    .add(egui::TextEdit::singleline(field).code_editor().desired_width(160.0))
-                                    .on_hover_text("Inputs: i, n, t, s, p, r1..r4 (see the tooltip of Dynamic stroke)")
+                                    .add(
+                                        egui::TextEdit::singleline(field)
+                                            .code_editor()
+                                            .desired_width(160.0),
+                                    )
+                                    .on_hover_text(DYNAMICS_INPUTS)
                                     .changed()
                                 {
                                     d.name = "Custom".into();
@@ -835,3 +843,10 @@ fn symmetry_ui(ui: &mut Ui, s: &mut Symmetry) {
         }
     });
 }
+
+/// Tooltip for the dynamic stroke formula fields.
+const DYNAMICS_INPUTS: &str = "A formula. Inputs:\n\
+    i: this dab's number (from 0), n: number of dabs\n\
+    t: distance along the stroke, in brush diameters\n\
+    s: step number, p: pen pressure\n\
+    r1..r4: random numbers in 0..1, different for each dab";

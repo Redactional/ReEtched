@@ -416,22 +416,26 @@ impl State {
             AssetKind::SmartMask => self.apply_smart_mask(&path),
             AssetKind::Brush => self.load_brush_preset(&path),
             AssetKind::Mesh => {
-                self.new_project = Some(crate::templates::NewProject {
-                    mesh: path.display().to_string(),
-                    template: 0,
-                    resolution: 2048,
-                    custom: None,
-                });
+                self.confirm_discard(crate::app::Discard::NewProject(
+                    crate::templates::NewProject {
+                        mesh: path.display().to_string(),
+                        template: 0,
+                        resolution: 2048,
+                        custom: None,
+                    },
+                ));
             }
             AssetKind::ProjectTemplate => match crate::templates::Template::load(&path) {
                 Ok(t) => {
                     let resolution = t.resolution;
-                    self.new_project = Some(crate::templates::NewProject {
-                        mesh: String::new(),
-                        template: 0,
-                        resolution,
-                        custom: Some(t),
-                    });
+                    self.confirm_discard(crate::app::Discard::NewProject(
+                        crate::templates::NewProject {
+                            mesh: String::new(),
+                            template: 0,
+                            resolution,
+                            custom: Some(t),
+                        },
+                    ));
                 }
                 Err(e) => self.error(format!("Could not read {}: {e:#}", a.name)),
             },

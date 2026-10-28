@@ -101,7 +101,7 @@ Every panel sits in a tab. You can rearrange them to suit you:
 - **Bring a panel back:** open the **Window** menu and check the panel's name. The buttons on the right-hand strip open **Display settings** and **Log** directly.
 - **Start over:** choose **Window → Reset layout** to return every panel to where it started.
 
-ReEtched starts with the default layout each time you open it.
+ReEtched remembers your layout and restores it the next time you open it.
 
 ## Toolbar
 
@@ -178,6 +178,7 @@ You can drop files onto the ReEtched window instead of using the menus. ReEtched
 - an `.spp` file is converted from Substance 3D Painter
 - an `.hdr` or `.exr` image becomes the environment
 - an `.sbs` file is added as a procedural material
+- an image (PNG, JPEG, TGA, TIFF, SVG) is added as a fill layer with the image as its base color, or, with the Projection tool active, becomes the projection image
 
 ## The welcome screen
 

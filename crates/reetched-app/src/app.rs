@@ -31,7 +31,7 @@ pub const MESH_EXTENSIONS: &[&str] = &["fbx", "obj", "gltf", "glb", "usd", "usda
 pub const ENV_EXTENSIONS: &[&str] = &["hdr", "exr"];
 const THUMB_SIZE: usize = 96;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Pane {
     Assets,
     View3d,
@@ -72,7 +72,7 @@ impl Pane {
     }
 }
 
-/// Painting tools (shown now, working from Phase 2).
+/// Painting tools.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Paint,
@@ -81,12 +81,11 @@ pub enum Tool {
     PolygonFill,
     Smudge,
     Clone,
-    Picker,
     Path,
 }
 
 impl Tool {
-    const ALL: [(Tool, egui_material_icons::MaterialIcon, &'static str); 8] = [
+    const ALL: [(Tool, egui_material_icons::MaterialIcon, &'static str); 7] = [
         (Tool::Paint, ic::ICON_BRUSH, "Paint (1)"),
         (Tool::Eraser, ic::ICON_INK_ERASER, "Eraser (2)"),
         (
@@ -97,7 +96,6 @@ impl Tool {
         (Tool::PolygonFill, ic::ICON_PENTAGON, "Polygon fill (4)"),
         (Tool::Smudge, ic::ICON_GESTURE, "Smudge (5)"),
         (Tool::Clone, ic::ICON_CONTENT_COPY, "Clone (6)"),
-        (Tool::Picker, ic::ICON_COLORIZE, "Material picker (P)"),
         (Tool::Path, ic::ICON_POLYLINE, "Path (7)"),
     ];
 }
@@ -220,6 +218,16 @@ pub struct State {
     started: Instant,
     adapter: String,
     quit: bool,
+    /// Waits for an answer to "Save changes?" before running.
+    discard: Option<Discard>,
+}
+
+/// An action that throws away the open project.
+pub enum Discard {
+    Quit,
+    NewProject(crate::templates::NewProject),
+    /// A project, mesh or Painter import (see `State::open_document`).
+    Open(PathBuf),
 }
 
 /// A selected layer (or its mask).
@@ -343,6 +351,7 @@ impl App {
             started: Instant::now(),
             adapter: format!("{} ({:?})", adapter.name, adapter.backend),
             quit: false,
+            discard: None,
         };
         state.set_mesh(Mesh::uv_sphere(1.0, 64, 32), "Preview sphere".into(), None);
         // Tests start Python themselves (it costs a process launch).
@@ -356,11 +365,18 @@ impl App {
             log::debug!("GPU: {}", state.adapter);
             log::debug!("settings: {}", crate::settings::Settings::path().display());
         }
+        if !cfg!(test) {
+            state.reload_imports();
+        }
         if let Some(path) = startup_mesh {
             state.open_any(&path);
         }
+        // The layout as the last session left it (unless it no longer parses).
+        let saved = state.settings.layout.clone().filter(|_| !cfg!(test));
         Self {
-            tree: default_layout(),
+            tree: saved
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(default_layout),
             state,
         }
     }
@@ -369,11 +385,17 @@ impl App {
         self.state.quit
     }
 
+    /// The window's close button: quits, after asking to save changes.
+    pub fn request_quit(&mut self) {
+        self.state.confirm_discard(Discard::Quit);
+    }
+
     /// Clean exit: keep settings, drop this session's autosave.
     pub fn shutdown(&mut self) {
         let s = &mut self.state;
         s.notify_script("shutdown", serde_json::json!({}));
         s.flush_script_events();
+        s.settings.layout = serde_json::to_value(&self.tree).ok();
         if let Err(e) = s.settings.save() {
             log::warn!("could not save settings: {e:#}");
         }
@@ -409,7 +431,18 @@ impl App {
                 .collect()
         });
         for path in dropped {
-            self.state.open_any(&path);
+            if self.state.tool == Tool::Projection && crate::images::is_image_path(&path) {
+                match std::fs::read(&path) {
+                    Ok(bytes) => self
+                        .state
+                        .set_stencil(&ctx, &bytes, &path.display().to_string()),
+                    Err(e) => self
+                        .state
+                        .error(format!("Could not read {}: {e}", path.display())),
+                }
+            } else {
+                self.state.open_any(&path);
+            }
         }
         self.state.shortcuts(&ctx);
         self.state.paint_shortcuts(&ctx);
@@ -469,6 +502,7 @@ impl App {
         self.state.bake_window(&ctx);
         self.state.text_window(&ctx);
         self.state.new_project_window(&ctx);
+        self.state.discard_window(&ctx);
         self.state.welcome_window(&ctx);
         self.state.settings_window(&ctx);
         let auto = self.state.settings.check_updates;
@@ -547,7 +581,7 @@ impl App {
                             .on_hover_text(p.display().to_string())
                             .clicked()
                         {
-                            self.state.open_project(&p);
+                            self.state.open_any(&p);
                         }
                     }
                 });
@@ -603,7 +637,7 @@ impl App {
                 self.state.settings_open = true;
             }
             if ui.button("Quit").clicked() {
-                self.state.quit = true;
+                self.state.confirm_discard(Discard::Quit);
             }
         });
         ui.menu_button("Edit", |ui| {
@@ -690,10 +724,6 @@ impl App {
                 self.state.camera.frame(self.state.bounds);
                 self.state.uv_camera.zoom = 0.0;
             }
-            ui.add_enabled_ui(false, |ui| {
-                icon_button(ui, ic::ICON_FLIP, false, "Symmetry")
-                    .on_disabled_hover_text("Symmetry — arrives with painting in Phase 2");
-            });
         });
     }
 
@@ -815,6 +845,13 @@ fn default_layout() -> egui_tiles::Tree<Pane> {
     egui_tiles::Tree::new(egui::Id::unique("main_layout"), root, tiles)
 }
 
+/// Adds `path` to a list of remembered files, once.
+pub(crate) fn remember(list: &mut Vec<PathBuf>, path: &Path) {
+    if !list.iter().any(|p| p == path) {
+        list.push(path.to_owned());
+    }
+}
+
 /// Square, frameless icon button that lights up when `selected`.
 pub fn icon_button(
     ui: &mut egui::Ui,
@@ -832,7 +869,8 @@ pub fn icon_button(
 }
 
 impl State {
-    /// Opens a project, mesh or environment, by extension.
+    /// Opens a project, mesh, environment, image and so on, by extension.
+    /// Anything that replaces the project asks to save changes first.
     pub fn open_any(&mut self, path: &Path) {
         log::debug!("opening {}", path.display());
         let ext = path
@@ -842,8 +880,8 @@ impl State {
             .to_ascii_lowercase();
         if ENV_EXTENSIONS.contains(&ext.as_str()) {
             self.load_environment(path);
-        } else if ext == project::EXTENSION {
-            self.open_project(path);
+        } else if crate::images::is_image_path(path) {
+            self.add_image_fill(path);
         } else if ext == "glsl" {
             self.load_custom_shader_file(path);
         } else if ext == "ocio" {
@@ -857,7 +895,17 @@ impl State {
             }
         } else if ext == "sbs" {
             self.import_sbs(path);
-        } else if ext == "spp" {
+        } else {
+            self.confirm_discard(Discard::Open(path.to_owned()));
+        }
+    }
+
+    /// Replaces the project with a project, Painter import or mesh.
+    fn open_document(&mut self, path: &Path) {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case(project::EXTENSION) {
+            self.open_project(path);
+        } else if ext.eq_ignore_ascii_case("spp") {
             self.import_spp(path);
         } else if path.is_dir() || file_name(path) == reetched_substance::bridge::MANIFEST {
             self.import_bridge(path);
@@ -866,12 +914,82 @@ impl State {
         }
     }
 
+    /// Adds a fill layer with the image file as its base color.
+    fn add_image_fill(&mut self, path: &Path) {
+        if self.stack().is_none() {
+            self.warn("Open a mesh before adding an image".into());
+            return;
+        }
+        let Some(id) = self.import_resource(path) else {
+            return;
+        };
+        let mut fill = reetched_doc::Fill::new([1.0; 3], 0.0, 0.5);
+        if let Some(c) = fill.channels.get_mut(&Channel::BaseColor) {
+            c.bitmap = Some(id);
+        }
+        let name = path
+            .file_stem()
+            .map_or_else(|| "Image".into(), |s| s.to_string_lossy().into_owned());
+        let node = self.doc.new_fill(name, fill);
+        self.add_node(node);
+    }
+
+    /// Runs `action`, first asking to save the project if it has unsaved changes.
+    pub fn confirm_discard(&mut self, action: Discard) {
+        if self.session.is_dirty(&self.doc, self.history.can_undo()) {
+            self.discard = Some(action);
+        } else {
+            self.run_discard(action);
+        }
+    }
+
+    fn run_discard(&mut self, action: Discard) {
+        match action {
+            Discard::Quit => self.quit = true,
+            Discard::NewProject(np) => self.new_project = Some(np),
+            Discard::Open(path) => self.open_document(&path),
+        }
+    }
+
+    /// The "Save changes?" dialog, while an action waits for it.
+    pub fn discard_window(&mut self, ctx: &egui::Context) {
+        if self.discard.is_none() {
+            return;
+        }
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        let name = self.project_name();
+        let modal = egui::Modal::new(egui::Id::unique("save_changes")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(RichText::new(format!("Save changes to {name}?")).strong());
+            ui.label("Your changes are lost if you don't save them.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                save = ui.button("Save").clicked();
+                discard = ui.button("Don't save").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel || modal.should_close() {
+            self.discard = None;
+        } else if save {
+            self.save(false);
+            // Still dirty: the save failed or its file dialog was cancelled.
+            if !self.session.is_dirty(&self.doc, self.history.can_undo())
+                && let Some(action) = self.discard.take()
+            {
+                self.run_discard(action);
+            }
+        } else if discard && let Some(action) = self.discard.take() {
+            self.run_discard(action);
+        }
+    }
+
     pub fn pick_project(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("ReEtched project", &[project::EXTENSION])
             .pick_file()
         {
-            self.open_project(&path);
+            self.open_any(&path);
         }
     }
 
@@ -948,12 +1066,12 @@ impl State {
     }
 
     pub fn open_new_project(&mut self) {
-        self.new_project = Some(crate::templates::NewProject {
+        self.confirm_discard(Discard::NewProject(crate::templates::NewProject {
             mesh: String::new(),
             template: 0,
             resolution: 2048,
             custom: None,
-        });
+        }));
     }
 
     pub fn project_name(&self) -> String {
@@ -1088,6 +1206,7 @@ impl State {
         }
         self.resources = Resources::default();
         self.history = History::new(&self.doc);
+        self.session.mark_new();
         self.stroke = None;
         self.topology = None;
         self.clone_source = None;
@@ -1355,16 +1474,39 @@ impl State {
             return;
         };
         for path in paths {
-            match reetched_doc::smart::load(&path) {
-                Ok(item) => {
-                    self.info(format!("Imported smart material {}", item.0.name));
-                    self.smart_imports.push(item);
-                }
-                Err(e) => self.error(format!("Could not import {}: {e:#}", file_name(&path))),
+            self.load_smart_import(&path);
+        }
+        self.asset_category = AssetCategory::SmartMaterials;
+    }
+
+    /// Adds a smart material file to the Assets panel, and remembers it for next time.
+    fn load_smart_import(&mut self, path: &Path) -> bool {
+        match reetched_doc::smart::load(path) {
+            Ok(item) => {
+                self.info(format!("Imported smart material {}", item.0.name));
+                self.smart_imports.push(item);
+                remember(&mut self.settings.imported_smart, path);
+                self.thumbs.clear(); // rebuild thumbnails, including the new ones
+                true
+            }
+            Err(e) => {
+                self.error(format!("Could not import {}: {e:#}", file_name(path)));
+                false
             }
         }
-        self.thumbs.clear(); // rebuild thumbnails, including the new ones
-        self.asset_category = AssetCategory::SmartMaterials;
+    }
+
+    /// Imports the smart materials and .sbs files of earlier sessions again.
+    /// Files that can no longer be read are forgotten.
+    fn reload_imports(&mut self) {
+        let category = self.asset_category;
+        for path in std::mem::take(&mut self.settings.imported_smart) {
+            self.load_smart_import(&path);
+        }
+        for path in std::mem::take(&mut self.settings.imported_sbs) {
+            self.import_sbs(&path);
+        }
+        self.asset_category = category;
     }
 
     fn push_log(&mut self, text: String, error: bool) {
@@ -1403,13 +1545,7 @@ impl State {
     fn tool_strip_ui(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             for (tool, icon, name) in Tool::ALL {
-                let tip = match tool {
-                    Tool::Picker => {
-                        format!("{name} — arrives in a later phase")
-                    }
-                    _ => name.to_string(),
-                };
-                if icon_button(ui, icon, self.tool == tool, &tip).clicked() {
+                if icon_button(ui, icon, self.tool == tool, name).clicked() {
                     self.tool = tool;
                     self.properties_tool = true;
                 }
@@ -1748,6 +1884,42 @@ mod tests {
         let sphere = reetched_io::Mesh::uv_sphere(1.0, 8, 4);
         h.app.state.set_mesh(sphere, "Sphere".into(), None);
         assert!(!h.app.state.welcome.open, "opening a mesh replaces it");
+    }
+
+    #[test]
+    fn layout_round_trips_through_settings() {
+        let tree = default_layout();
+        let json = serde_json::to_value(&tree).unwrap();
+        let back: egui_tiles::Tree<Pane> = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tiles.len(), tree.tiles.len());
+    }
+
+    #[test]
+    fn dropped_image_adds_a_fill_and_unsaved_work_asks_before_quitting() {
+        let Some(mut h) = Harness::new() else { return };
+        h.frame(vec![]);
+        h.app.request_quit();
+        assert!(h.app.wants_quit(), "nothing to save: quits at once");
+        h.app.state.quit = false;
+
+        let png = std::env::temp_dir().join("reetched-drop-test.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let layers = |h: &Harness| h.app.state.stack().map_or(0, |s| s.len());
+        let before = layers(&h);
+        h.app.state.open_any(&png);
+        assert_eq!(layers(&h), before + 1, "an image becomes a fill layer");
+        h.frame(vec![]);
+
+        h.app.request_quit();
+        assert!(!h.app.wants_quit(), "unsaved changes: asks first");
+        assert!(h.app.state.discard.is_some());
+        h.app.state.discard = None; // Cancel
+        h.app.state.open_new_project();
+        assert!(
+            h.app.state.new_project.is_none(),
+            "asks before a new project too"
+        );
+        let _ = std::fs::remove_file(png);
     }
 
     #[test]

@@ -499,6 +499,7 @@ impl State {
                     return;
                 }
                 self.info(format!("Imported {name} ({graphs} graph(s))"));
+                crate::app::remember(&mut self.settings.imported_sbs, path);
                 self.procedural.imports.push(SbsImport {
                     name,
                     bytes,

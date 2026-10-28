@@ -77,7 +77,7 @@ There's much more to painting. See [Painting](painting.md) and [Layers and masks
 
 After the first save, **Ctrl+S** saves to the same file. Use **File → Save as…** (**Ctrl+Shift+S**) to save a copy under a new name.
 
-ReEtched also autosaves your work every few minutes so it can recover it after a crash. Autosave doesn't replace saving: ReEtched doesn't ask about unsaved changes when you close it, so save before you quit. See [Projects and meshes](projects-and-meshes.md#autosave-and-crash-recovery).
+ReEtched also autosaves your work every few minutes so it can recover it after a crash. Autosave doesn't replace saving. If you quit, start a new project or open another one with unsaved changes, ReEtched asks whether to save them first. See [Projects and meshes](projects-and-meshes.md#autosave-and-crash-recovery).
 
 ## Export your textures
 

@@ -13,6 +13,13 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "tga", "tif", "tiff", "exr", "hdr", "svg",
 ];
 
+/// Has an image file extension (`IMAGE_EXTENSIONS`).
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 /// Decodes a raster image, or renders an SVG at `SVG_SIZE`.
 pub fn decode(bytes: &[u8]) -> Result<image::DynamicImage> {
     if is_svg(bytes) {

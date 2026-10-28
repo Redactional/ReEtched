@@ -126,10 +126,6 @@ impl State {
                     let node = self.doc.new_paint(format!("Layer {n}"));
                     self.add_node(node);
                 }
-                ui.add_enabled_ui(false, |ui| {
-                    icon_button(ui, ic::ICON_AUTO_FIX_HIGH, false, "Add effect")
-                        .on_disabled_hover_text("Effects arrive in Phase 3");
-                });
             });
         });
         ui.separator();
@@ -389,7 +385,7 @@ impl State {
     }
 
     pub fn properties_ui(&mut self, ui: &mut Ui) {
-        if self.properties_tool && self.tool != crate::app::Tool::Picker {
+        if self.properties_tool {
             self.brush_ui(ui);
             return;
         }

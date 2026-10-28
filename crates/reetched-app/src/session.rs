@@ -144,6 +144,11 @@ impl Session {
         self.write_lock(project);
     }
 
+    /// A new document that was never saved: dirty once edited.
+    pub fn mark_new(&mut self) {
+        self.saved = None;
+    }
+
     /// Clean exit: nothing to recover.
     pub fn end(&mut self) {
         if let Some(job) = self.job.take() {

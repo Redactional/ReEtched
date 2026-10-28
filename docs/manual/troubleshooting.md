@@ -4,9 +4,9 @@ This page covers the most common problems: ReEtched not starting on your graphic
 
 ## ReEtched closes as soon as it starts
 
-ReEtched needs a graphics card that supports **Vulkan**, **Metal** or **DirectX 12**, and that can use enough textures at once. If your GPU or its driver falls short, ReEtched closes right after it starts.
+ReEtched needs a graphics card that supports **Vulkan**, **Metal** or **DirectX 12**, and that can use enough textures at once. If your GPU or its driver falls short, ReEtched shows an error message saying why, then closes.
 
-If you start ReEtched from a terminal on macOS or Linux, it prints the reason. The two messages you're most likely to see are:
+The two messages you're most likely to see are:
 
 - `no compatible GPU found`: ReEtched couldn't find a graphics card it can use.
 - `this GPU can bind only N textures per shader stage; ReEtched needs 23`: your graphics card is too old or too basic for ReEtched's layer compositing.

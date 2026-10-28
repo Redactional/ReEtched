@@ -30,7 +30,7 @@ The image's name replaces the value. Click **×** (**Remove image**) to go back 
 
 You can also double-click a texture in the **Textures** category of the **Assets** panel. It goes into the selected fill layer's channel that is currently chosen in the **Layers** panel's channel list, or into the selected mask. See [Asset library](asset-library.md).
 
-> Dragging an image file from your computer onto the ReEtched window does not add it to a layer. Use **Use an image…** or the asset library instead.
+You can also drag an image file from your computer onto the ReEtched window. It's added as a new fill layer with the image as its base color. (With the Projection tool active, the image becomes the projection image instead; see [Painting](painting.md#projection-3).)
 
 ### Color space
 
@@ -156,7 +156,7 @@ Files that the `.sbs` uses from its own folder are stored in your project when y
 
 Many graphs use nodes from Substance Designer's own library (paths starting with `sbs://`). To load those, Substance 3D Designer must be installed in its standard location. If it isn't, ReEtched lists what it couldn't load in the **Log**, and the material may come out incomplete.
 
-Imported graphs stay in the list until you close ReEtched. Layers that already use one are saved with the project.
+Imported graphs stay in the list, and ReEtched imports them again the next time it starts (as long as the files are still where they were). Layers that already use one are saved with the project.
 
 ## Smart materials
 
@@ -188,4 +188,4 @@ The file holds the layer or folder with its masks, effects, paint and the images
 1. Click **Smart materials** in the **Assets** panel.
 2. Click **Import smart material…** and choose one or more `.rsm` files.
 
-They're added to the **Smart materials** list until you close ReEtched. To keep smart materials at hand between sessions, put the `.rsm` files in a library folder; they then appear under **All library files** in the **Assets** panel, and double-clicking one adds it to the stack. See [Asset library](asset-library.md).
+They're added to the **Smart materials** list, and ReEtched loads them again the next time it starts (as long as the files are still where they were). You can also put `.rsm` files in a library folder; they then appear under **All library files** in the **Assets** panel, and double-clicking one adds it to the stack. See [Asset library](asset-library.md).

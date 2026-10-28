@@ -122,6 +122,13 @@ impl Shortcut {
         s + self.key.name()
     }
 
+    /// Like `text`, but with symbols for punctuation ("Ctrl+[" not
+    /// "Ctrl+OpenBracket"). For display only: `parse` reads `text`.
+    pub fn label(&self) -> String {
+        let name = self.text();
+        name[..name.len() - self.key.name().len()].to_owned() + self.key.symbol_or_name()
+    }
+
     pub fn parse(text: &str) -> Option<Self> {
         let mut parts: Vec<&str> = text.split('+').collect();
         let key = Key::from_name(parts.pop()?)?;
@@ -244,7 +251,7 @@ impl Keymap {
     pub fn text(&self, a: Action) -> String {
         self.shortcuts(a)
             .first()
-            .map(Shortcut::text)
+            .map(Shortcut::label)
             .unwrap_or_default()
     }
 
@@ -320,6 +327,8 @@ mod tests {
         assert_eq!(s.text(), "Ctrl+Shift+S");
         assert_eq!(Shortcut::parse("Ctrl+Shift+S"), Some(s));
         assert_eq!(Shortcut::parse("Hyper+S"), None);
+        assert_eq!(Shortcut::ctrl(Key::OpenBracket).label(), "Ctrl+[");
+        assert_eq!(Shortcut::new(Key::Period).label(), ".");
         let mut settings = KeymapSettings::default();
         let k = Keymap::new(&settings);
         assert_eq!(k.text(Action::FrameView), "F");

@@ -65,7 +65,7 @@ impl State {
                                 "press a key…".to_owned()
                             } else {
                                 let t: Vec<String> =
-                                    self.keymap.shortcuts(a).iter().map(|s| s.text()).collect();
+                                    self.keymap.shortcuts(a).iter().map(|s| s.label()).collect();
                                 if t.is_empty() {
                                     "—".to_owned()
                                 } else {

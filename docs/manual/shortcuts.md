@@ -97,8 +97,6 @@ You can change the shortcut for any action in the list above.
 
 The new shortcut replaces all the shortcuts that action had. It applies right away and is saved when you close Settings.
 
-Some keys are listed by name in Settings: for example **[** shows as **OpenBracket**, **]** as **CloseBracket**, and **.** as **Period**.
-
 Your changes are kept on top of the preset, so they stay when you switch between **Substance Painter** and **Blender**. To go back to the preset's own shortcuts, click **Reset changes** next to the preset. This button only appears once you've changed something.
 
 Mouse navigation follows the preset and can't be rebound.

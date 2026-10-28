@@ -119,6 +119,14 @@ fn main() -> Result<()> {
         error: None,
     };
     event_loop.run_app(&mut runner)?;
+    if let Some(e) = &runner.error {
+        // The Windows build has no console, so say it where it can be seen.
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("ReEtched can't start")
+            .set_description(format!("{e:#}"))
+            .show();
+    }
     runner.error.map_or(Ok(()), Err)
 }
 
@@ -183,8 +191,9 @@ impl ApplicationHandler for Runner {
         let response = g.egui_state.on_window_event(&g.window, &event);
         match event {
             WindowEvent::CloseRequested => {
-                g.app.shutdown();
-                event_loop.exit();
+                // Quits on the next frame, unless "Save changes?" is answered with Cancel.
+                g.app.request_quit();
+                g.window.request_redraw();
             }
             WindowEvent::Resized(size) => g.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {

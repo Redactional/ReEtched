@@ -92,7 +92,7 @@ ReEtched projects are `.retx` files. A project file holds the mesh, the layers a
 
 **Open recent** keeps your last 10 projects.
 
-ReEtched doesn't ask about unsaved changes when you quit or open another project. Save first.
+If the project has unsaved changes when you quit, start a new project or open another one, ReEtched asks **Save changes to *name*?**. Click **Save** to save first, **Don't save** to throw the changes away, or **Cancel** to go back to your project.
 
 ### Save and compact
 
