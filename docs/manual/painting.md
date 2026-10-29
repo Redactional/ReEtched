@@ -41,6 +41,10 @@ You can change these keys in **File > Settings…** (see [Shortcuts](shortcuts.m
 
 ## Brush settings
 
+The brush settings are grouped into sections: **TOOL** (only for tools with their own options), **BRUSH**, **STROKE** and **MATERIAL**. Click a section's header to fold it away; it stays folded until you open it again.
+
+The **BRUSH** section holds the brush itself:
+
 | Setting | What it does |
 |---------|--------------|
 | **Size** | The brush radius on screen, from 1 to 400 pt. Press **[** and **]** to make the brush smaller or bigger. |
@@ -49,16 +53,21 @@ You can change these keys in **File > Settings…** (see [Shortcuts](shortcuts.m
 | **Spacing** | Distance between dabs, as a fraction of the brush's diameter. Small values give smooth strokes; large values give a dotted line. |
 | **Hardness** | How sharp the brush edge is. 0 is very soft, 1 is a hard edge. |
 | **Angle** | Rotates the brush shape, from −180° to 180°. Most noticeable with an image or text brush shape. |
+| **Shape** | The brush shape. See [Brush shapes](#brush-shapes). |
+
+The **STROKE** section controls how strokes are laid down:
+
+| Setting | What it does |
+|---------|--------------|
 | **Lazy mouse** | Makes the brush trail behind the cursor by this distance (0 to 200 pt) for smoother lines. 0 turns it off. |
 | **Pen pressure** | With a pressure-sensitive pen, **Size** and **Flow** can follow pen pressure. Size is on by default. |
 | **Backface culling** | When ticked, the brush skips surfaces that face away from you by more than the angle you set (1° to 180°, 85° by default). This stops paint leaking onto the back of thin parts. |
-| **Alpha** | The brush shape. See [Brush shapes](#brush-shapes). |
 | **Symmetry** | Mirrors or repeats every dab around the model. See [Symmetry](#symmetry). |
 | **Dynamic stroke** | Turns each dab into several varied dabs. See [Dynamic strokes](#dynamic-strokes). |
 
 ### Brush shapes
 
-By default the brush is **Round**. Next to **Alpha** you can:
+By default the brush is **Round**. Next to **Shape** you can:
 
 - Click the image icon (**Use a greyscale image as the brush shape…**) and choose an image file. White areas of the image paint; black areas don't.
 - Click the text icon (**Use text as the brush shape…**) to type some text and use it as the brush. The **Text** window is described in [Fills, images and materials](fills-and-materials.md#text).

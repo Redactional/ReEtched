@@ -456,11 +456,10 @@ impl State {
             .show(ui, |ui| {
                 if sel.mask {
                     let Some(mask) = &mut node.mask else { return };
-                    ui.label(theme::header("MASK"));
-                    egui::Grid::new("mask")
-                        .num_columns(2)
-                        .spacing(vec2(12.0, 6.0))
-                        .show(ui, |ui| {
+                    ui.label(RichText::new(format!("Mask of “{}”", node.name)).strong().size(14.0));
+                    ui.add_space(6.0);
+                    theme::section(ui, "Mask", |_| {}, |ui| {
+                        theme::grid(ui, "mask", |ui| {
                             ui.label("Enabled");
                             ui.checkbox(&mut mask.enabled, "");
                             ui.end_row();
@@ -471,56 +470,56 @@ impl State {
                                     MaskBackground::Black => "Black",
                                 })
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut mask.background,
-                                        MaskBackground::White,
-                                        "White",
-                                    );
-                                    ui.selectable_value(
-                                        &mut mask.background,
-                                        MaskBackground::Black,
-                                        "Black",
-                                    );
+                                    ui.selectable_value(&mut mask.background, MaskBackground::White, "White");
+                                    ui.selectable_value(&mut mask.background, MaskBackground::Black, "Black");
                                 });
                             ui.end_row();
                             ui.label("Invert");
                             ui.checkbox(&mut mask.invert, "");
                             ui.end_row();
-                            ui.label("Bitmap");
-                            bitmap_buttons(
-                                ui,
-                                resource_name(&mask.bitmap),
-                                BitmapSlot::Mask,
-                                &mut pick,
-                                &mut clear,
-                                &mut text,
-                            );
+                            ui.label("Image");
+                            ui.horizontal(|ui| {
+                                bitmap_buttons(
+                                    ui,
+                                    resource_name(&mask.bitmap),
+                                    BitmapSlot::Mask,
+                                    &mut pick,
+                                    &mut clear,
+                                    &mut text,
+                                );
+                            });
                             ui.end_row();
                         });
+                    });
                     if mask.bitmap.is_some() {
-                        ui.add_space(8.0);
-                        projection_ui(ui, &mut mask.projection, "mask_proj");
+                        theme::section(ui, "Projection", |_| {}, |ui| {
+                            projection_ui(ui, &mut mask.projection, "mask_proj");
+                        });
                     }
-                    ui.add_space(8.0);
-                    effect_req = crate::effects_ui::mask_effects_ui(ui, mask, &maps);
-                    ui.add_space(8.0);
-                    if ui.button("Save as smart mask…").clicked() {
+                    theme::section(ui, "Effects", |_| {}, |ui| {
+                        effect_req = crate::effects_ui::mask_effects_ui(ui, mask, &maps);
+                    });
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized([ui.available_width(), 24.0], egui::Button::new("Save as smart mask…"))
+                        .clicked()
+                    {
                         save_mask = true;
                     }
                     return;
                 }
 
-                ui.label(theme::header(match node.kind {
-                    NodeKind::Fill(_) => "FILL",
-                    NodeKind::Paint(_) => "PAINT",
-                    NodeKind::Folder { .. } => "FOLDER",
-                }));
-                egui::Grid::new("layer")
-                    .num_columns(2)
-                    .spacing(vec2(12.0, 6.0))
-                    .show(ui, |ui| {
+                let kind = match node.kind {
+                    NodeKind::Fill(_) => "Fill layer",
+                    NodeKind::Paint(_) => "Paint layer",
+                    NodeKind::Folder { .. } => "Folder",
+                };
+                ui.label(RichText::new(kind).strong().size(14.0));
+                ui.add_space(6.0);
+                theme::section(ui, "Layer", |_| {}, |ui| {
+                    theme::grid(ui, "layer", |ui| {
                         ui.label("Name");
-                        ui.text_edit_singleline(&mut node.name);
+                        ui.add(egui::TextEdit::singleline(&mut node.name).desired_width(f32::INFINITY));
                         ui.end_row();
                         if tiles.len() > 1 {
                             ui.label("UDIM tiles")
@@ -546,57 +545,85 @@ impl State {
                             ui.end_row();
                         }
                     });
+                    if !matches!(node.kind, NodeKind::Fill(_)) {
+                        ui.add_space(4.0);
+                        theme::hint(ui, "Blend mode and opacity per channel are set in the layer stack.");
+                    }
+                });
                 let NodeKind::Fill(fill) = &mut node.kind else {
-                    let hint = if matches!(node.kind, NodeKind::Paint(_)) {
-                        "Paint on this layer with the Paint tool (1) and erase with the Eraser (2), in the 3D or 2D view. Blend mode and opacity per channel are in the layer stack."
-                    } else {
-                        "Set a folder's blend mode and opacity per channel in the layer stack."
-                    };
-                    ui.label(RichText::new(hint).color(theme::WEAK));
-                    if matches!(node.kind, NodeKind::Paint(_)) && ui.button("Brush settings").clicked() {
-                        show_brush = true;
+                    if matches!(node.kind, NodeKind::Paint(_)) {
+                        theme::section(ui, "Painting", |_| {}, |ui| {
+                            theme::hint(
+                                ui,
+                                "Paint on this layer with the Paint tool (1) and erase with the Eraser (2), in the 3D or 2D view.",
+                            );
+                            ui.add_space(4.0);
+                            if ui
+                                .add_sized([ui.available_width(), 24.0], egui::Button::new("Brush settings"))
+                                .clicked()
+                            {
+                                show_brush = true;
+                            }
+                        });
                     }
                     return;
                 };
-                ui.add_space(8.0);
                 if let (Some(p), Some((pkg, warnings, pending))) = (&mut fill.procedural, &proc_view) {
                     let graph = pkg.as_ref().ok().and_then(|pk| pk.graph(&p.graph));
                     let status = match pkg {
                         Ok(_) => Ok(warnings.as_slice()),
                         Err(e) => Err(e.as_str()),
                     };
-                    if crate::procedural::procedural_ui(ui, p, graph, status, *pending) {
+                    let mut detach = false;
+                    theme::section(
+                        ui,
+                        "Procedural material",
+                        |ui| {
+                            if ui
+                                .small_button("Detach")
+                                .on_hover_text("Turn into a plain fill layer")
+                                .clicked()
+                            {
+                                detach = true;
+                            }
+                            if *pending {
+                                ui.spinner();
+                            }
+                        },
+                        |ui| crate::procedural::procedural_ui(ui, p, graph, status),
+                    );
+                    if detach {
                         fill.procedural = None;
                     }
-                    ui.add_space(8.0);
                 }
-                projection_ui(ui, &mut fill.projection, "fill_proj");
-                ui.add_space(8.0);
-                ui.label(theme::header("MATERIAL"));
-                ui.horizontal_wrapped(|ui| {
+                theme::section(ui, "Projection", |_| {}, |ui| {
+                    projection_ui(ui, &mut fill.projection, "fill_proj");
+                });
+                theme::section(ui, "Material", |_| {}, |ui| {
                     for &c in &channels {
-                        let src = fill.channels.entry(c).or_insert_with(|| ChannelSource {
+                        fill.channels.entry(c).or_insert_with(|| ChannelSource {
                             enabled: false,
                             value: c.empty_value(),
                             bitmap: None,
                             color_space: Default::default(),
                             ocio: None,
                         });
-                        ui.toggle_value(&mut src.enabled, c.label());
                     }
-                });
-                ui.add_space(4.0);
-                if fill.procedural.is_some() {
-                    ui.label(
-                        RichText::new("Channel values come from the procedural material.")
-                            .color(theme::WEAK),
+                    theme::chips(
+                        ui,
+                        fill.channels
+                            .iter_mut()
+                            .filter(|(c, _)| channels.contains(c))
+                            .map(|(c, src)| (c.label(), &mut src.enabled)),
                     );
-                    return;
-                }
-                egui::Grid::new("channels")
-                    .num_columns(2)
-                    .spacing(vec2(12.0, 6.0))
-                    .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    if fill.procedural.is_some() {
+                        theme::hint(ui, "Channel values come from the procedural material.");
+                        return;
+                    }
+                    // Room for the image and text buttons after each value.
+                    ui.spacing_mut().slider_width -= 60.0;
+                    theme::grid(ui, "channels", |ui| {
                         for &c in &channels {
                             let Some(src) = fill.channels.get_mut(&c).filter(|s| s.enabled) else {
                                 continue;
@@ -646,6 +673,7 @@ impl State {
                             ui.end_row();
                         }
                     });
+                });
             });
 
         if save_mask {
@@ -1564,101 +1592,97 @@ fn bitmap_buttons(
 }
 
 fn projection_ui(ui: &mut Ui, p: &mut Projection, id: &str) {
-    ui.label(theme::header("PROJECTION"));
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing(vec2(12.0, 6.0))
-        .show(ui, |ui| {
-            ui.label("Projection");
-            ComboBox::from_id_salt((id, "mode"))
-                .selected_text(p.mode.label())
-                .show_ui(ui, |ui| {
-                    for m in ProjectionMode::ALL {
-                        ui.selectable_value(&mut p.mode, m, m.label());
-                    }
-                });
-            ui.end_row();
-            ui.label("Scale");
-            ui.horizontal(|ui| {
-                ui.add(
-                    DragValue::new(&mut p.scale[0])
-                        .speed(0.01)
-                        .range(0.001..=1000.0),
-                );
-                ui.add(
-                    DragValue::new(&mut p.scale[1])
-                        .speed(0.01)
-                        .range(0.001..=1000.0),
-                );
+    theme::grid(ui, id, |ui| {
+        ui.label("Projection");
+        ComboBox::from_id_salt((id, "mode"))
+            .selected_text(p.mode.label())
+            .show_ui(ui, |ui| {
+                for m in ProjectionMode::ALL {
+                    ui.selectable_value(&mut p.mode, m, m.label());
+                }
             });
-            ui.end_row();
-            ui.label("Rotation");
-            ui.add(Slider::new(&mut p.rotation_deg, -180.0..=180.0).suffix("°"));
-            ui.end_row();
-            ui.label("Offset");
-            ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut p.offset[0]).speed(0.005));
-                ui.add(DragValue::new(&mut p.offset[1]).speed(0.005));
-            });
-            ui.end_row();
-            ui.label("Repeat");
-            ui.checkbox(&mut p.repeat, "")
-                .on_hover_text("Off: the image appears once; the fill covers nothing outside it");
-            ui.end_row();
-            if p.mode == ProjectionMode::Planar {
-                ui.label("Front faces only");
-                ui.checkbox(&mut p.front_only, "")
-                    .on_hover_text("Skip surfaces facing away from the projector");
-                ui.end_row();
-            }
-            if !p.mode.is_uv() {
-                ui.label("Size");
-                ui.add(
-                    DragValue::new(&mut p.size)
-                        .speed(0.01)
-                        .range(0.001..=10_000.0),
-                )
-                .on_hover_text("World units covered by one repeat of the image");
-                ui.end_row();
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    for v in &mut p.position {
-                        ui.add(DragValue::new(v).speed(0.01));
-                    }
-                });
-                ui.end_row();
-                ui.label("Rotation 3D");
-                ui.horizontal(|ui| {
-                    for v in &mut p.rotation3d_deg {
-                        ui.add(DragValue::new(v).speed(0.5).suffix("°"));
-                    }
-                });
-                ui.end_row();
-            }
-            if !p.mode.is_uv() {
-                ui.label("Symmetry");
-                ui.horizontal(|ui| {
-                    for (m, axis) in p.mirror.iter_mut().zip(["X", "Y", "Z"]) {
-                        ui.toggle_value(m, axis)
-                            .on_hover_text(format!("Mirror the projection across {axis} = 0"));
-                    }
-                });
-                ui.end_row();
-            }
-            if p.mode == ProjectionMode::Triplanar {
-                ui.label("Hardness");
-                ui.add(Slider::new(&mut p.hardness, 0.0..=1.0));
-                ui.end_row();
-            }
-            if p.mode == ProjectionMode::Warp {
-                ui.label("Warp grid");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Drag its points in the 2D view").color(theme::WEAK));
-                    if ui.small_button("Reset").clicked() {
-                        p.warp = reetched_doc::warp_identity();
-                    }
-                });
-                ui.end_row();
-            }
+        ui.end_row();
+        ui.label("Scale");
+        ui.horizontal(|ui| {
+            ui.add(
+                DragValue::new(&mut p.scale[0])
+                    .speed(0.01)
+                    .range(0.001..=1000.0),
+            );
+            ui.add(
+                DragValue::new(&mut p.scale[1])
+                    .speed(0.01)
+                    .range(0.001..=1000.0),
+            );
         });
+        ui.end_row();
+        ui.label("Rotation");
+        ui.add(Slider::new(&mut p.rotation_deg, -180.0..=180.0).suffix("°"));
+        ui.end_row();
+        ui.label("Offset");
+        ui.horizontal(|ui| {
+            ui.add(DragValue::new(&mut p.offset[0]).speed(0.005));
+            ui.add(DragValue::new(&mut p.offset[1]).speed(0.005));
+        });
+        ui.end_row();
+        ui.label("Repeat");
+        ui.checkbox(&mut p.repeat, "")
+            .on_hover_text("Off: the image appears once; the fill covers nothing outside it");
+        ui.end_row();
+        if p.mode == ProjectionMode::Planar {
+            ui.label("Front faces only");
+            ui.checkbox(&mut p.front_only, "")
+                .on_hover_text("Skip surfaces facing away from the projector");
+            ui.end_row();
+        }
+        if !p.mode.is_uv() {
+            ui.label("Size");
+            ui.add(
+                DragValue::new(&mut p.size)
+                    .speed(0.01)
+                    .range(0.001..=10_000.0),
+            )
+            .on_hover_text("World units covered by one repeat of the image");
+            ui.end_row();
+            ui.label("Position");
+            ui.horizontal(|ui| {
+                for v in &mut p.position {
+                    ui.add(DragValue::new(v).speed(0.01));
+                }
+            });
+            ui.end_row();
+            ui.label("Rotation 3D");
+            ui.horizontal(|ui| {
+                for v in &mut p.rotation3d_deg {
+                    ui.add(DragValue::new(v).speed(0.5).suffix("°"));
+                }
+            });
+            ui.end_row();
+        }
+        if !p.mode.is_uv() {
+            ui.label("Symmetry");
+            ui.horizontal(|ui| {
+                for (m, axis) in p.mirror.iter_mut().zip(["X", "Y", "Z"]) {
+                    ui.toggle_value(m, axis)
+                        .on_hover_text(format!("Mirror the projection across {axis} = 0"));
+                }
+            });
+            ui.end_row();
+        }
+        if p.mode == ProjectionMode::Triplanar {
+            ui.label("Hardness");
+            ui.add(Slider::new(&mut p.hardness, 0.0..=1.0));
+            ui.end_row();
+        }
+        if p.mode == ProjectionMode::Warp {
+            ui.label("Warp grid");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Drag its points in the 2D view").color(theme::WEAK));
+                if ui.small_button("Reset").clicked() {
+                    p.warp = reetched_doc::warp_identity();
+                }
+            });
+            ui.end_row();
+        }
+    });
 }

@@ -96,3 +96,101 @@ pub fn apply(ctx: &egui::Context) {
 pub fn header(text: &str) -> egui::RichText {
     egui::RichText::new(text).size(11.0).strong()
 }
+
+/// Label column width of every Properties grid, so rows line up across sections.
+pub const LABEL_W: f32 = 104.0;
+
+/// A collapsible Properties section: a full-width header band, then `body`.
+/// `extra` draws small buttons at the header's right end. Open state persists.
+pub fn section(
+    ui: &mut egui::Ui,
+    title: &str,
+    extra: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    use egui::{Align, Layout, Sense, UiBuilder, collapsing_header::CollapsingState};
+    use egui_material_icons::icons as ic;
+    let id = ui.make_persistent_id(("section", title));
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let hot = resp.hovered();
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(2),
+        if hot {
+            STRIP.gamma_multiply(1.3)
+        } else {
+            HEADER
+        },
+    );
+    let icon = if state.is_open() {
+        ic::ICON_EXPAND_MORE
+    } else {
+        ic::ICON_CHEVRON_RIGHT
+    };
+    ui.painter().text(
+        rect.left_center() + vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon.codepoint,
+        FontId::new(16.0, icon.font_family()),
+        WEAK,
+    );
+    ui.painter().text(
+        rect.left_center() + vec2(26.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title.to_uppercase(),
+        FontId::new(11.0, FontFamily::Proportional),
+        if hot { Color32::WHITE } else { TEXT },
+    );
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(vec2(6.0, 0.0)))
+            .layout(Layout::right_to_left(Align::Center)),
+        extra,
+    );
+    if resp.clicked() {
+        state.toggle(ui);
+    }
+    state.show_body_unindented(ui, |ui| {
+        ui.add_space(6.0);
+        // Sliders fill the row after the label column and the value box.
+        ui.spacing_mut().slider_width = (ui.available_width() - LABEL_W - 76.0).clamp(60.0, 240.0);
+        body(ui);
+        ui.add_space(8.0);
+    });
+    ui.add_space(4.0);
+}
+
+/// Two-column label/value grid with the shared label width.
+pub fn grid(ui: &mut egui::Ui, id: impl egui::AsIdSalt, rows: impl FnOnce(&mut egui::Ui)) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing(vec2(8.0, 6.0))
+        .min_col_width(LABEL_W)
+        .show(ui, rows);
+}
+
+/// Equal-width toggle buttons, three per row (channel pickers and the like).
+pub fn chips<'a>(ui: &mut egui::Ui, items: impl IntoIterator<Item = (&'a str, &'a mut bool)>) {
+    let gap = ui.spacing().item_spacing.x;
+    let w = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+    ui.horizontal_wrapped(|ui| {
+        for (label, on) in items {
+            if ui
+                .add(
+                    egui::Button::new(label)
+                        .selected(*on)
+                        .min_size(vec2(w, 22.0)),
+                )
+                .clicked()
+            {
+                *on = !*on;
+            }
+        }
+    });
+}
+
+/// Small grey explanatory text.
+pub fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(egui::RichText::new(text.into()).color(WEAK).size(11.5));
+}

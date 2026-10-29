@@ -8,7 +8,7 @@ use crate::{
     paint_gpu::{BrushShape, Camera, Dab, StrokeMode, StrokeTarget},
     theme,
 };
-use egui::{Color32, ComboBox, Rect, RichText, Slider, Stroke, Ui, vec2};
+use egui::{Color32, ComboBox, Rect, RichText, Slider, Stroke, Ui};
 use egui_material_icons::icons as ic;
 use glam::{Mat4, Vec2};
 use reetched_doc::{Channel, NodeId, NodeKind, TileMap, find_node, find_node_mut};
@@ -549,180 +549,213 @@ impl State {
             .map_or_else(|| Channel::CORE.to_vec(), |s| s.channels());
         let mut pick_alpha = false;
         let mut text_alpha = false;
-        ui.label(theme::header(match self.tool {
-            Tool::Eraser => "ERASER",
-            Tool::PolygonFill => "POLYGON FILL",
-            Tool::Smudge => "SMUDGE",
-            Tool::Clone => "CLONE",
-            Tool::Path => "PATH",
-            Tool::Projection => "PROJECTION",
-            _ => "PAINT",
-        }));
-        ui.label(RichText::new(target).color(theme::WEAK));
-        self.tool_options_ui(ui);
-        ui.add_space(4.0);
-        let b = &mut self.brush;
+        let tool_name = match self.tool {
+            Tool::Eraser => "Eraser",
+            Tool::PolygonFill => "Polygon fill",
+            Tool::Smudge => "Smudge",
+            Tool::Clone => "Clone",
+            Tool::Path => "Path",
+            Tool::Projection => "Projection",
+            _ => "Paint",
+        };
+        ui.label(RichText::new(tool_name).strong().size(14.0));
+        theme::hint(ui, target);
+        ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                egui::Grid::new("brush")
-                    .num_columns(2)
-                    .spacing(vec2(12.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.label("Size");
-                        ui.add(
-                            Slider::new(&mut b.size, 1.0..=400.0)
-                                .logarithmic(true)
-                                .suffix(" pt"),
-                        );
-                        ui.end_row();
-                        ui.label("Flow");
-                        ui.add(Slider::new(&mut b.flow, 0.0..=1.0));
-                        ui.end_row();
-                        ui.label("Stroke opacity");
-                        ui.add(Slider::new(&mut b.opacity, 0.0..=1.0));
-                        ui.end_row();
-                        ui.label("Spacing");
-                        ui.add(Slider::new(&mut b.spacing, 0.01..=2.0).logarithmic(true));
-                        ui.end_row();
-                        ui.label("Hardness");
-                        ui.add(Slider::new(&mut b.hardness, 0.0..=1.0));
-                        ui.end_row();
-                        ui.label("Angle");
-                        ui.add(Slider::new(&mut b.angle_deg, -180.0..=180.0).suffix("°"));
-                        ui.end_row();
-                        ui.label("Lazy mouse");
-                        ui.add(Slider::new(&mut b.lazy, 0.0..=200.0).suffix(" pt"));
-                        ui.end_row();
-                        ui.label("Pen pressure");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut b.pressure_size, "Size");
-                            ui.checkbox(&mut b.pressure_flow, "Flow");
-                        });
-                        ui.end_row();
-                        ui.label("Backface culling");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut b.backface_culling, "");
-                            ui.add_enabled(
-                                b.backface_culling,
-                                Slider::new(&mut b.backface_deg, 1.0..=180.0).suffix("°"),
+                if matches!(
+                    self.tool,
+                    Tool::PolygonFill | Tool::Smudge | Tool::Projection | Tool::Clone | Tool::Path
+                ) {
+                    theme::section(ui, "Tool", |_| {}, |ui| self.tool_options_ui(ui));
+                }
+                let b = &mut self.brush;
+                theme::section(
+                    ui,
+                    "Brush",
+                    |_| {},
+                    |ui| {
+                        theme::grid(ui, "brush", |ui| {
+                            ui.label("Size");
+                            ui.add(
+                                Slider::new(&mut b.size, 1.0..=400.0)
+                                    .logarithmic(true)
+                                    .suffix(" pt"),
                             );
-                        });
-                        ui.end_row();
-                        ui.label("Alpha");
-                        ui.horizontal(|ui| match &b.alpha {
-                            Some(id) => {
-                                ui.label(
-                                    names.get(id).map_or("(missing image)", |r| r.name.as_str()),
-                                );
-                                if icon_button(ui, ic::ICON_CLOSE, false, "Use a round brush")
+                            ui.end_row();
+                            ui.label("Flow");
+                            ui.add(Slider::new(&mut b.flow, 0.0..=1.0));
+                            ui.end_row();
+                            ui.label("Stroke opacity");
+                            ui.add(Slider::new(&mut b.opacity, 0.0..=1.0));
+                            ui.end_row();
+                            ui.label("Hardness");
+                            ui.add(Slider::new(&mut b.hardness, 0.0..=1.0));
+                            ui.end_row();
+                            ui.label("Angle");
+                            ui.add(Slider::new(&mut b.angle_deg, -180.0..=180.0).suffix("°"));
+                            ui.end_row();
+                            ui.label("Spacing");
+                            ui.add(Slider::new(&mut b.spacing, 0.01..=2.0).logarithmic(true));
+                            ui.end_row();
+                            ui.label("Shape");
+                            ui.horizontal(|ui| match &b.alpha {
+                                Some(id) => {
+                                    ui.label(
+                                        names
+                                            .get(id)
+                                            .map_or("(missing image)", |r| r.name.as_str()),
+                                    );
+                                    if icon_button(ui, ic::ICON_CLOSE, false, "Use a round brush")
+                                        .clicked()
+                                    {
+                                        b.alpha = None;
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new("Round").color(theme::WEAK));
+                                    if icon_button(
+                                        ui,
+                                        ic::ICON_IMAGE,
+                                        false,
+                                        "Use a greyscale image as the brush shape…",
+                                    )
                                     .clicked()
-                                {
-                                    b.alpha = None;
-                                }
-                            }
-                            None => {
-                                ui.label(RichText::new("Round").color(theme::WEAK));
-                                if icon_button(
-                                    ui,
-                                    ic::ICON_IMAGE,
-                                    false,
-                                    "Use a greyscale image as the brush shape…",
-                                )
-                                .clicked()
-                                {
-                                    pick_alpha = true;
-                                }
-                                if icon_button(
-                                    ui,
-                                    ic::ICON_TEXT_FIELDS,
-                                    false,
-                                    "Use text as the brush shape…",
-                                )
-                                .clicked()
-                                {
-                                    text_alpha = true;
-                                }
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("Symmetry");
-                        symmetry_ui(ui, &mut b.symmetry);
-                        ui.end_row();
-                        ui.label("Dynamic stroke");
-                        ComboBox::from_id_salt("dynamics")
-                            .selected_text(b.dynamics.as_ref().map_or("Off", |d| d.name.as_str()))
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(b.dynamics.is_none(), "Off").clicked() {
-                                    b.dynamics = None;
-                                }
-                                for d in crate::dynamics::Dynamics::presets() {
-                                    let on = b.dynamics.as_ref().is_some_and(|x| x.name == d.name);
-                                    if ui.selectable_label(on, &d.name).clicked() {
-                                        b.dynamics = Some(d);
+                                    {
+                                        pick_alpha = true;
+                                    }
+                                    if icon_button(
+                                        ui,
+                                        ic::ICON_TEXT_FIELDS,
+                                        false,
+                                        "Use text as the brush shape…",
+                                    )
+                                    .clicked()
+                                    {
+                                        text_alpha = true;
                                     }
                                 }
                             });
-                        ui.end_row();
+                            ui.end_row();
+                        });
+                    },
+                );
+                theme::section(
+                    ui,
+                    "Stroke",
+                    |_| {},
+                    |ui| {
+                        theme::grid(ui, "stroke", |ui| {
+                            ui.label("Lazy mouse");
+                            ui.add(Slider::new(&mut b.lazy, 0.0..=200.0).suffix(" pt"));
+                            ui.end_row();
+                            ui.label("Pen pressure");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut b.pressure_size, "Size");
+                                ui.checkbox(&mut b.pressure_flow, "Flow");
+                            });
+                            ui.end_row();
+                            ui.label("Backface culling").on_hover_text(
+                                "Skip surfaces turned away from the view by more than this angle",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut b.backface_culling, "");
+                                ui.spacing_mut().slider_width -= 26.0;
+                                ui.add_enabled(
+                                    b.backface_culling,
+                                    Slider::new(&mut b.backface_deg, 1.0..=180.0).suffix("°"),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("Symmetry");
+                            symmetry_ui(ui, &mut b.symmetry);
+                            ui.end_row();
+                            ui.label("Dynamic stroke");
+                            ComboBox::from_id_salt("dynamics")
+                                .selected_text(
+                                    b.dynamics.as_ref().map_or("Off", |d| d.name.as_str()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(b.dynamics.is_none(), "Off").clicked() {
+                                        b.dynamics = None;
+                                    }
+                                    for d in crate::dynamics::Dynamics::presets() {
+                                        let on =
+                                            b.dynamics.as_ref().is_some_and(|x| x.name == d.name);
+                                        if ui.selectable_label(on, &d.name).clicked() {
+                                            b.dynamics = Some(d);
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                        });
                         if let Some(d) = &mut b.dynamics {
-                            for (label, field, tip) in [
-                                ("Dabs", &mut d.count, "Dabs per stamp"),
-                                ("Along", &mut d.x, "Offset along the stroke, in brush radii"),
-                                (
-                                    "Across",
-                                    &mut d.y,
-                                    "Offset across the stroke, in brush radii",
-                                ),
-                                ("Size", &mut d.size, "Size multiplier"),
-                                ("Angle", &mut d.angle, "Added rotation, degrees"),
-                                ("Flow", &mut d.flow, "Flow multiplier"),
-                            ] {
-                                ui.label(label).on_hover_text(tip);
-                                if ui
-                                    .add(
-                                        egui::TextEdit::singleline(field)
-                                            .code_editor()
-                                            .desired_width(160.0),
-                                    )
-                                    .on_hover_text(DYNAMICS_INPUTS)
-                                    .changed()
-                                {
-                                    d.name = "Custom".into();
+                            ui.add_space(4.0);
+                            theme::hint(
+                                ui,
+                                "Dynamic stroke formulas (hover a field for the inputs)",
+                            );
+                            theme::grid(ui, "dynamics_fields", |ui| {
+                                for (label, field, tip) in [
+                                    ("Dabs", &mut d.count, "Dabs per stamp"),
+                                    ("Along", &mut d.x, "Offset along the stroke, in brush radii"),
+                                    (
+                                        "Across",
+                                        &mut d.y,
+                                        "Offset across the stroke, in brush radii",
+                                    ),
+                                    ("Size", &mut d.size, "Size multiplier"),
+                                    ("Angle", &mut d.angle, "Added rotation, degrees"),
+                                    ("Flow", &mut d.flow, "Flow multiplier"),
+                                ] {
+                                    ui.label(label).on_hover_text(tip);
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(field)
+                                                .code_editor()
+                                                .desired_width(f32::INFINITY),
+                                        )
+                                        .on_hover_text(DYNAMICS_INPUTS)
+                                        .changed()
+                                    {
+                                        d.name = "Custom".into();
+                                    }
+                                    ui.end_row();
                                 }
-                                ui.end_row();
-                            }
+                            });
                             if let Err(e) = d.compile() {
-                                ui.label("");
                                 ui.label(RichText::new(e.to_string()).color(theme::ERROR));
-                                ui.end_row();
                             }
                         }
-                    });
+                    },
+                );
 
                 if matches!(self.tool, Tool::Paint | Tool::PolygonFill | Tool::Path) {
-                    ui.add_space(8.0);
-                    ui.label(theme::header("MATERIAL"));
-                    if self.selected.is_some_and(|s| s.mask) {
-                        egui::Grid::new("mask_brush")
-                            .num_columns(2)
-                            .spacing(vec2(12.0, 6.0))
-                            .show(ui, |ui| {
-                                ui.label("Mask value");
-                                ui.add(Slider::new(&mut b.mask_value, 0.0..=1.0))
-                                    .on_hover_text("1 = white (show), 0 = black (hide)");
-                                ui.end_row();
-                            });
-                    } else {
-                        ui.horizontal_wrapped(|ui| {
-                            for &c in &channels {
-                                let ch = b.channels.get_mut(&c).unwrap();
-                                ui.toggle_value(&mut ch.enabled, c.label());
+                    let on_mask = self.selected.is_some_and(|s| s.mask);
+                    theme::section(
+                        ui,
+                        "Material",
+                        |_| {},
+                        |ui| {
+                            if on_mask {
+                                theme::grid(ui, "mask_brush", |ui| {
+                                    ui.label("Mask value");
+                                    ui.add(Slider::new(&mut b.mask_value, 0.0..=1.0))
+                                        .on_hover_text("1 = white (show), 0 = black (hide)");
+                                    ui.end_row();
+                                });
+                                return;
                             }
-                        });
-                        egui::Grid::new("brush_channels")
-                            .num_columns(2)
-                            .spacing(vec2(12.0, 6.0))
-                            .show(ui, |ui| {
+                            theme::chips(
+                                ui,
+                                b.channels
+                                    .iter_mut()
+                                    .filter(|(c, _)| channels.contains(c))
+                                    .map(|(c, ch)| (c.label(), &mut ch.enabled)),
+                            );
+                            ui.add_space(4.0);
+                            theme::grid(ui, "brush_channels", |ui| {
                                 for &c in &channels {
                                     let ch = b.channels.get_mut(&c).unwrap();
                                     if !ch.enabled {
@@ -733,12 +766,13 @@ impl State {
                                     ui.end_row();
                                 }
                             });
-                    }
+                        },
+                    );
                 }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("[ and ] change the size. Shift+click draws a straight line.")
-                        .color(theme::WEAK),
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "[ and ] change the size. Shift+click draws a straight line.",
                 );
             });
         if text_alpha {

@@ -110,7 +110,7 @@ Select a mask by clicking its thumbnail. The **Properties** panel shows:
 | **Enabled** | Turns the mask on or off. You can also **Shift+click** the mask thumbnail. A turned-off mask is drawn dimmed. |
 | **Background** | **White** or **Black** — the mask's starting value before paint, images or effects. |
 | **Invert** | Swaps white and black. |
-| **Bitmap** | Fills the mask with a greyscale image (**Use an image…**) or with text (**Use text…**). Click **×** (**Remove image**) to take it out. When a bitmap is set, a **PROJECTION** section lets you place it; see [Projections](fills-and-materials.md#projections). |
+| **Image** | Fills the mask with a greyscale image (**Use an image…**) or with text (**Use text…**). Click **×** (**Remove image**) to take it out. When an image is set, a **PROJECTION** section lets you place it; see [Projections](fills-and-materials.md#projections). |
 
 ### Painting a mask
 

@@ -573,11 +573,14 @@ impl State {
         };
         match self.tool {
             Tool::PolygonFill => {
-                ui.horizontal(|ui| {
+                theme::grid(ui, "polygon_mode", |ui| {
                     ui.label("Select");
-                    for m in Selection::ALL {
-                        ui.selectable_value(&mut self.polygon_mode, m, m.label());
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for m in Selection::ALL {
+                            ui.selectable_value(&mut self.polygon_mode, m, m.label());
+                        }
+                    });
+                    ui.end_row();
                 });
                 hint(
                     ui,
@@ -605,7 +608,7 @@ impl State {
                     }
                 });
                 if self.stencil.image.is_some() {
-                    egui::Grid::new("stencil").num_columns(2).show(ui, |ui| {
+                    theme::grid(ui, "stencil", |ui| {
                         ui.label("Size");
                         ui.add(
                             egui::Slider::new(&mut self.stencil.size, 0.02..=4.0).logarithmic(true),

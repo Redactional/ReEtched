@@ -57,7 +57,7 @@ The text becomes white letters on a transparent background, and it stays sharp a
 
 ## Projections
 
-The **PROJECTION** section of a fill layer (or of a mask that uses a bitmap) controls how its images are wrapped around the model. Choose a mode in the **Projection** list:
+The **PROJECTION** section of a fill layer (or of a mask that uses an image) controls how its images are wrapped around the model. Choose a mode in the **Projection** list:
 
 | Mode | How images are placed |
 |------|-----------------------|

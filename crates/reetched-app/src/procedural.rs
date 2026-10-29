@@ -520,24 +520,7 @@ pub fn procedural_ui(
     p: &mut Procedural,
     graph: Option<&Graph>,
     status: Result<&[String], &str>,
-    pending: bool,
-) -> bool {
-    let mut remove = false;
-    ui.horizontal(|ui| {
-        ui.label(theme::header("PROCEDURAL MATERIAL"));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("Detach")
-                .on_hover_text("Turn into a plain fill layer")
-                .clicked()
-            {
-                remove = true;
-            }
-            if pending {
-                ui.spinner();
-            }
-        });
-    });
+) {
     ui.label(RichText::new(&p.label).strong());
     match status {
         Err(e) => {
@@ -549,35 +532,31 @@ pub fn procedural_ui(
             }
         }
     }
-    egui::Grid::new("proc_common")
-        .num_columns(2)
-        .spacing(egui::vec2(12.0, 6.0))
-        .show(ui, |ui| {
-            ui.label("Resolution");
-            let label = |v: u8| match v {
-                0 => "Texture set".to_string(),
-                v => format!("{}", 1u32 << v),
-            };
-            egui::ComboBox::from_id_salt("proc_res")
-                .selected_text(label(p.resolution_log2))
-                .show_ui(ui, |ui| {
-                    for v in [0, 8, 9, 10, 11, 12] {
-                        ui.selectable_value(&mut p.resolution_log2, v, label(v));
-                    }
-                });
-            ui.end_row();
-            ui.label("Random seed");
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut p.seed));
-                if ui.small_button("Random").clicked() {
-                    p.seed =
-                        (p.seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 8) & 0xffff;
+    theme::grid(ui, "proc_common", |ui| {
+        ui.label("Resolution");
+        let label = |v: u8| match v {
+            0 => "Texture set".to_string(),
+            v => format!("{}", 1u32 << v),
+        };
+        egui::ComboBox::from_id_salt("proc_res")
+            .selected_text(label(p.resolution_log2))
+            .show_ui(ui, |ui| {
+                for v in [0, 8, 9, 10, 11, 12] {
+                    ui.selectable_value(&mut p.resolution_log2, v, label(v));
                 }
             });
-            ui.end_row();
+        ui.end_row();
+        ui.label("Random seed");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut p.seed));
+            if ui.small_button("Random").clicked() {
+                p.seed = (p.seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 8) & 0xffff;
+            }
         });
+        ui.end_row();
+    });
     let Some(graph) = graph else {
-        return remove;
+        return;
     };
     // Inputs in their groups, in file order.
     let mut groups: Vec<&str> = Vec::new();
@@ -591,11 +570,9 @@ pub fn procedural_ui(
         }
     }
     for group in groups {
-        let mut body = |ui: &mut Ui| {
-            egui::Grid::new(("proc_inputs", group))
-                .num_columns(2)
-                .spacing(egui::vec2(12.0, 6.0))
-                .show(ui, |ui| {
+        let mut body =
+            |ui: &mut Ui| {
+                theme::grid(ui, ("proc_inputs", group), |ui| {
                     for def in graph.inputs.iter().filter(|i| {
                         i.kind == InputKind::Value && !i.is_builtin() && i.group == group
                     }) {
@@ -610,7 +587,7 @@ pub fn procedural_ui(
                         }
                     }
                 });
-        };
+            };
         if group.is_empty() {
             body(ui);
         } else {
@@ -622,7 +599,6 @@ pub fn procedural_ui(
     if !p.params.is_empty() && ui.button("Reset to defaults").clicked() {
         p.params.clear();
     }
-    remove
 }
 
 fn input_widget(ui: &mut Ui, def: &reetched_graph::InputDef, x: &mut [f32; 4]) {

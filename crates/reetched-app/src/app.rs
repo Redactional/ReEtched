@@ -1570,6 +1570,12 @@ impl egui_tiles::Behavior<Pane> for State {
             Pane::View3d => self.view3d_ui(ui),
             Pane::View2d => self.view2d_ui(ui),
             pane => {
+                #[cfg(test)]
+                if *pane == Pane::Properties {
+                    let r = ui.max_rect();
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(egui::Id::unique("properties_rect"), r));
+                }
                 Frame::new().inner_margin(6.0).show(ui, |ui| match pane {
                     Pane::Assets => self.assets_ui(ui),
                     Pane::TextureSets => self.texture_sets_ui(ui),
@@ -1761,6 +1767,7 @@ mod tests {
         ctx: egui::Context,
         renderer: egui_wgpu::Renderer,
         app: App,
+        size: egui::Vec2,
         _turn: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1789,16 +1796,14 @@ mod tests {
                 ctx,
                 renderer,
                 app,
+                size: vec2(1600.0, 900.0),
                 _turn: turn,
             })
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) {
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    vec2(1600.0, 900.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                 events,
                 ..Default::default()
             };
@@ -1869,6 +1874,195 @@ mod tests {
             self.frame(vec![ev(true)]);
             self.frame(vec![ev(false)]);
         }
+
+        fn props(&self) -> Option<egui::Rect> {
+            self.ctx
+                .data(|d| d.get_temp(egui::Id::unique("properties_rect")))
+        }
+
+        /// Renders one frame and saves it as a PNG, cropped to `crop` (points).
+        fn shot(&mut self, path: &std::path::Path, crop: Option<egui::Rect>) -> image::RgbaImage {
+            let (w, h) = (self.size.x as u32, self.size.y as u32);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(w as f32, h as f32),
+                )),
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let mut out = self.ctx.run_ui(input, |ui| app.ui(ui));
+            for (id, deltas) in out.textures_delta.set.drain() {
+                for d in &deltas {
+                    self.renderer
+                        .update_texture(&self.device, &self.queue, id, d);
+                }
+            }
+            let jobs = self.ctx.tessellate(out.shapes, out.pixels_per_point);
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [w, h],
+                pixels_per_point: out.pixels_per_point,
+            };
+            let target = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shot"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&Default::default());
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            self.app.render_viewport(&mut self.renderer, &mut enc);
+            let extra =
+                self.renderer
+                    .update_buffers(&self.device, &self.queue, &mut enc, &jobs, &screen);
+            {
+                let mut pass = enc
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                self.renderer.render(&mut pass, &jobs, &screen);
+            }
+            self.queue.submit(extra.into_iter().chain([enc.finish()]));
+            let r = crop.unwrap_or(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(w as f32, h as f32),
+            ));
+            let (x, y) = (r.min.x.max(0.0) as u32, r.min.y.max(0.0) as u32);
+            let (cw, ch) = (
+                (r.width() as u32).min(w - x),
+                (r.height() as u32).min(h - y),
+            );
+            let px =
+                crate::paint_gpu::read_region(&self.device, &self.queue, &target, x, y, cw, ch, 4)
+                    .unwrap();
+            let img = image::RgbaImage::from_raw(cw, ch, px).unwrap();
+            img.save(path).unwrap();
+            img
+        }
+    }
+
+    /// Saves Properties panel screenshots for each kind of selection.
+    /// Run: REETCHED_SHOTS=<dir> cargo test -p reetched-app properties_screenshots -- --ignored
+    #[test]
+    #[ignore]
+    fn properties_screenshots() {
+        let Some(dir) = std::env::var_os("REETCHED_SHOTS").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Some(mut h) = Harness::new() else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+        h.size = vec2(1600.0, 2400.0); // tall, so the whole panel fits
+        h.app.state.set_mesh(
+            reetched_io::Mesh::uv_sphere(1.0, 32, 16),
+            "Sphere".into(),
+            None,
+        );
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let settle = |h: &mut Harness| (0..3).for_each(|_| h.frame(vec![]));
+        let mut panels = Vec::new();
+        h.app.state.properties_tool = true;
+        settle(&mut h);
+        h.shot(&dir.join("full.png"), None);
+        panels.push(h.shot(&dir.join("brush.png"), h.props()));
+        h.app.state.properties_tool = false;
+        h.app.state.apply_preset(0);
+        settle(&mut h);
+        panels.push(h.shot(&dir.join("fill.png"), h.props()));
+        let fill = h.app.state.selected.unwrap().node;
+        let stack = h.app.state.stack_mut().unwrap();
+        reetched_doc::find_node_mut(stack, fill).unwrap().mask =
+            Some(reetched_doc::Mask::new(reetched_doc::MaskBackground::White));
+        h.app.state.selected = Some(Selected {
+            node: fill,
+            mask: true,
+        });
+        settle(&mut h);
+        panels.push(h.shot(&dir.join("mask.png"), h.props()));
+        let paint = h.app.state.doc.texture_sets[0].stack.last().unwrap().id;
+        h.app.state.selected = Some(Selected {
+            node: paint,
+            mask: false,
+        });
+        settle(&mut h);
+        panels.push(h.shot(&dir.join("paint.png"), h.props()));
+        sheet(&panels).save(dir.join("sheet.png")).unwrap();
+
+        // Tools with their own options, dynamics on, and a mask with an effect.
+        let mut more = Vec::new();
+        h.app.state.properties_tool = true;
+        h.app.state.tool = Tool::Projection;
+        settle(&mut h);
+        more.push(h.shot(&dir.join("projection.png"), h.props()));
+        h.app.state.tool = Tool::PolygonFill;
+        h.app.state.brush.dynamics = crate::dynamics::Dynamics::presets().into_iter().next();
+        settle(&mut h);
+        more.push(h.shot(&dir.join("polygon.png"), h.props()));
+        h.app.state.properties_tool = false;
+        let stack = h.app.state.stack_mut().unwrap();
+        reetched_doc::find_node_mut(stack, fill)
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap()
+            .effects
+            .push(reetched_doc::MaskEffect::new(
+                reetched_doc::MaskEffectKind::Levels {
+                    in_min: 0.0,
+                    in_max: 1.0,
+                    gamma: 1.0,
+                    out_min: 0.0,
+                    out_max: 1.0,
+                },
+            ));
+        h.app.state.selected = Some(Selected {
+            node: fill,
+            mask: true,
+        });
+        settle(&mut h);
+        more.push(h.shot(&dir.join("effects.png"), h.props()));
+        sheet(&more).save(dir.join("sheet2.png")).unwrap();
+    }
+
+    /// Puts panels side by side, each trimmed of empty space at the bottom.
+    fn sheet(panels: &[image::RgbaImage]) -> image::RgbaImage {
+        let used = |p: &image::RgbaImage| {
+            let bg = *p.get_pixel(p.width() - 2, p.height() - 2);
+            (0..p.height())
+                .rev()
+                .find(|&y| (4..p.width() - 4).any(|x| *p.get_pixel(x, y) != bg))
+                .map_or(p.height(), |y| (y + 16).min(p.height()))
+        };
+        let pad = 16;
+        let w = panels.iter().map(|p| p.width() + pad).sum::<u32>() + pad;
+        let h = panels.iter().map(used).max().unwrap_or(0) + 2 * pad;
+        let mut out = image::RgbaImage::from_pixel(w, h, image::Rgba([23, 23, 23, 255]));
+        let mut x = pad;
+        for p in panels {
+            let sub = image::imageops::crop_imm(p, 0, 0, p.width(), used(p)).to_image();
+            image::imageops::replace(&mut out, &sub, x as i64, pad as i64);
+            x += p.width() + pad;
+        }
+        out
     }
 
     #[test]

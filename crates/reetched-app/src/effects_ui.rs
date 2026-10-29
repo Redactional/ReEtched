@@ -24,7 +24,6 @@ pub fn mask_effects_ui(
 ) -> EffectRequests {
     let mut req = EffectRequests::default();
     ui.horizontal(|ui| {
-        ui.label(theme::header("EFFECTS"));
         let full = mask.effects.len() >= MAX_MASK_EFFECTS;
         ui.add_enabled_ui(!full, |ui| {
             ui.menu_button("Add effect", |ui| {
@@ -60,8 +59,10 @@ pub fn mask_effects_ui(
     });
     if mask.effects.is_empty() {
         ui.label(
-            RichText::new("No effects. Generators read the baked mesh maps (edge wear, dirt, …).")
-                .color(theme::WEAK),
+            RichText::new(
+                "No effects yet. Generators read the baked mesh maps (edge wear, dirt, …).",
+            )
+            .color(theme::WEAK),
         );
     }
 
