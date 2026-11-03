@@ -3203,7 +3203,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rayon",
- "roxmltree 0.20.0",
+ "roxmltree 0.21.1",
  "serde_json",
  "serde_yaml",
 ]
@@ -3311,7 +3311,7 @@ dependencies = [
  "reetched-doc",
  "reetched-graph",
  "reetched-io",
- "roxmltree 0.20.0",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
 ]

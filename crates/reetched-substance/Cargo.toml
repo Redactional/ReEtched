@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 reetched-graph.workspace = true
 anyhow.workspace = true
-roxmltree = "0.20"
+roxmltree = "0.21"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "tiff", "exr"] }
 reetched-doc.workspace = true
 reetched-io.workspace = true
