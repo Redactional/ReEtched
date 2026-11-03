@@ -15,6 +15,6 @@ anyhow.workspace = true
 glam.workspace = true
 log.workspace = true
 hdf5-pure = "0.47"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "exr"] }
