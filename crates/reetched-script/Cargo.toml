@@ -10,6 +10,6 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 # Python is loaded at runtime, never linked: the app must start without it.
-libloading = "0.8"
+libloading = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
